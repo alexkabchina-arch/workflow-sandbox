@@ -25,9 +25,17 @@ python3.12 -m venv .venv
 
 | Workflow | Job    | Что делает                            |
 | -------- | ------ | ------------------------------------- |
-| `CI`     | `test` | `ruff check`, `ruff format --check`, `pytest` на Python 3.12 |
+| `CI`     | `test` | `check_lock` (`.canon.lock`), `ruff check`, `ruff format --check`, `pytest` на Python 3.12 |
 
 Запускается на `pull_request` и на push в `main`. Обязательная проверка для мёржа — `test`.
+
+## Канон
+
+Файлы канона `alexkabchina-arch/workflow` (`scripts/canon/`, `.claude/settings.base.json`,
+`.claude/settings.json`) вендорятся через `canon-sync` и записаны в `.canon.lock`: руками не правятся,
+шаг `check_lock` в CI это ловит. Проектные добавки к настройкам Claude Code — в
+`.claude/settings.project.json` (могут только дополнять базу канона); после их правки —
+`canon-sync` той же версии.
 
 ## Критичные зоны
 
