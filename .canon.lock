@@ -1,0 +1,10 @@
+{
+  "canon": "alexkabchina-arch/workflow",
+  "version": "409937858c92a3ecb2f459c3a18adf3ca676b000",
+  "commit": "409937858c92a3ecb2f459c3a18adf3ca676b000",
+  "files": {
+    ".claude/settings.base.json": "sha256:da36bff8f0f5c20b411c704e917adf832018b0ce9a6b257a54c312ab2dcd6bfc",
+    ".claude/settings.json": "sha256:da36bff8f0f5c20b411c704e917adf832018b0ce9a6b257a54c312ab2dcd6bfc",
+    "scripts/canon/check_lock.py": "sha256:a31c03c155df8377e54b2e6f173fbdd9eea56efba766ee8e947a18c04c1de015"
+  }
+}
