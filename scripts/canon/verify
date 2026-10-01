@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""verify — проверка изменения ветки встроенным `/verify` (шаг 4 `/ship`).
+
+    scripts/canon/verify <отчёт.json> --criteria-file <файл> [--base origin/main] [--max-budget-usd 10]
+
+Из корня проекта, на закоммиченной ветке. Встроенный `/verify` из сессии не вызвать — только
+дочерним процессом, поэтому скрипт запускает его обычным вызовом, не в фоне:
+
+    claude -p --model claude-opus-5-5 --max-budget-usd <предел> --output-format json \\
+        --permission-mode auto "/verify Проверь изменение ветки: дифф git diff <база>...HEAD. …"
+
+Диапазон диффа — всегда явный: без него скилл берёт `@{u}..` или `origin/HEAD...` и на ветке без
+upstream проверит не тот код. Критерии тикета — из `--criteria-file` как есть: в задание они
+попадают аргументом, без оболочки, поэтому обратные кавычки и `$` в них безопасны.
+В `<отчёт.json>` — сырой результат (`modelUsage`, стоимость), рядом `<отчёт>.md` — итог проверки
+(что проверено и вердикт PASS / FAIL — его читает сессия).
+
+До запуска: в проекте нет своего `.claude/skills/verify/` (он подменил бы встроенный `/verify`)
+и нет незакоммиченных правок отслеживаемых файлов (проверка шла бы не по коду ветки). Пустой дифф
+(например, повторный `/ship` после слияния) — проверка пропускается, как у `review`. После
+прогона — список того, что `/verify` оставил в рабочем дереве (рецепт `.claude/skills/run-*`,
+свой `.claude/skills/verify/`, тестовые файлы): разбирает сессия.
+
+Код выхода 0 — проверка состоялась (строка `verify: … PASS|FAIL`, полный итог — в `.md`) или
+пропущена (`verify: пропущено`); 1 — не состоялась (сбой `claude`, выход по бюджету, ошибка,
+пустой `modelUsage` или `result`, не та модель, нет итоговой строки PASS / FAIL), причина в stderr;
+2 — ошибка аргументов или git (нет базы, нет или пуст файл критериев, свой `verify` в проекте,
+незакоммиченные правки).
+Вызывающему нужен таймаут Bash больше времени проверки (`BASH_MAX_TIMEOUT_MS` в настройках канона).
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+import types
+from pathlib import Path
+
+
+def load_claude_run():
+    """Общий модуль канона рядом со скриптом — без правки `sys.path` и без `__pycache__`
+    в вендоренном `scripts/canon/` (его закоммитили бы на путь-ограничитель)."""
+    path = Path(__file__).resolve().parent / "claude_run.py"
+    module = types.ModuleType("canon_claude_run")
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    return module
+
+
+claude_run = load_claude_run()  # общий запуск дочернего `claude -p` с `review`
+
+# Спросить по ходу некого: дочерний процесс без человека.
+PERMISSION_MODE = "auto"
+# Проектный скилл с этим именем выключает встроенный `/verify`.
+PROJECT_VERIFY = Path(".claude/skills/verify")
+UsageError = claude_run.UsageError
+
+TASK = """/verify Проверь изменение ветки: дифф git diff {base}...HEAD.
+Критерии:
+{criteria}
+Запуск — по рецепту из раздела профиля «Рецепт запуска для /verify». Ничего не ставить; без фоновых
+средств харнеса; тестовые записи откатить; приложение погасить после.
+В конце — что проверено (шаги, пробы мимо счастливого пути) и последней строкой итог:
+«Итог: PASS» или «Итог: FAIL».
+"""
+# Последняя строка — только итог: «PASS», «Итог: FAIL», «**Итог: PASS**»; не фраза с этим словом.
+VERDICT_LINE = re.compile(r"(?:[^:]{1,20}:\s*)?(PASS|FAIL)\.?")
+
+
+def git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8")
+
+
+def has_diff(base: str) -> bool:
+    result = git("diff", "--quiet", f"{base}...HEAD")
+    if result.returncode not in (0, 1):
+        raise UsageError(f"git diff {base}...HEAD: {result.stderr.strip()}")
+    return result.returncode == 1
+
+
+def tree_state() -> set[str]:
+    result = git("status", "--porcelain", "--untracked-files=all")
+    if result.returncode != 0:
+        raise UsageError(f"git status: {result.stderr.strip()}")
+    return set(result.stdout.splitlines())
+
+
+def check_tree(state: set[str]) -> None:
+    if PROJECT_VERIFY.exists():
+        raise UsageError(
+            f"в проекте есть {PROJECT_VERIFY}/ — он подменил бы встроенный /verify: удалить"
+        )
+    dirty = sorted(line for line in state if not line.startswith("??"))
+    if dirty:
+        raise UsageError(
+            "незакоммиченные правки — проверка шла бы не по коду ветки: " + "; ".join(dirty)
+        )
+
+
+def read_criteria(path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise UsageError(f"файл критериев {path}: {exc}") from None
+    if not text.strip():
+        raise UsageError(f"файл критериев {path} пуст")
+    return text.strip()
+
+
+def task(base: str, criteria: str) -> str:
+    return TASK.format(base=base, criteria=criteria)
+
+
+def verdict(text: str) -> str | None:
+    """PASS или FAIL из последней непустой строки итога; иначе None."""
+    lines = [line.strip(" \t*_#>`") for line in text.splitlines() if line.strip()]
+    match = VERDICT_LINE.fullmatch(lines[-1]) if lines else None
+    return match.group(1) if match else None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = claude_run.parser("verify", __doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--criteria-file", type=Path, required=True, help="критерии тикета для проверки"
+    )
+    args = parser.parse_args(argv)
+    findings = args.report.with_suffix(".md")
+    try:
+        criteria = read_criteria(args.criteria_file)
+        if not has_diff(args.base):
+            print(f"verify: пропущено — в {args.base}...HEAD нет изменений")
+            return 0
+        before = tree_state()
+        check_tree(before)
+        data = claude_run.run_claude(
+            ["--permission-mode", PERMISSION_MODE, task(args.base, criteria)],
+            args.report,
+            args.max_budget_usd,
+        )
+        result = verdict(data["result"])
+        if result is None:
+            findings.unlink(missing_ok=True)
+            raise claude_run.ChildError(
+                "в конце итога нет строки PASS или FAIL — проверка не завершена "
+                f"(например, /verify задал вопрос); сырой результат — {args.report}"
+            )
+        left = sorted(tree_state() - before)
+    except UsageError as exc:
+        print(f"verify: {exc}", file=sys.stderr)
+        return 2
+    except claude_run.ChildError as exc:
+        print(f"verify: {exc}", file=sys.stderr)
+        return 1
+    cost = data.get("total_cost_usd")
+    cost_text = f"{cost:.2f}" if isinstance(cost, (int, float)) else "?"
+    print(
+        f"verify: /verify на {claude_run.MODEL} — {result} ({cost_text} USD); "
+        f"что проверено — {findings}"
+    )
+    if left:
+        print("verify: /verify оставил в рабочем дереве: " + "; ".join(left))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
