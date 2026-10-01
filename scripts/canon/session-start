@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""session-start — старт сессии тикета: уборка, PR автора первыми, тикет, worktree, зависимости.
+
+    scripts/canon/session-start <номер тикета> [--json]
+
+Из любого worktree проекта. Сессию не запускает: готовит место и печатает, что запускать, —
+поэтому годится и первым шагом внутри уже открытой сессии. Запуск `claude` — `session-run`.
+По порядку:
+
+1. Уборка: `git worktree prune`; для worktree из реестра сессий, которых больше нет, —
+   проектная команда `scripts/session/cleanup <путь worktree>` из главного worktree. Успех —
+   запись уходит из реестра; сбой — запись остаётся до следующего старта, старт продолжается,
+   но заново занять этот путь нельзя, пока ресурсы не убраны. Нет команды — запись просто уходит.
+   Реестр — `canon-sessions.json` в общем каталоге git, правится под блокировкой.
+2. PR автора (`gh pr list --author @me`) на ветках сессий (`ticket-N`, `ticket-N-*`; ручные PR
+   владельца на других ветках не трогаются), кроме черновиков: красный CI на head (провал
+   `restricted-paths` не в счёт — это ожидание владельца) или нет отметки ревью (статус `review`)
+   на head. Есть такие — берётся первый (красные раньше), тикет откладывается. Красный CI —
+   возврат: комментарий «возврат k/2 … на <sha>»; на тот же head второй раз не пишется. Третий
+   возврат не делается: метка `ready-for-human` и комментарий-форма (вопрос, логи, варианты,
+   рекомендация), PR пропускается, пока метка стоит. Владелец снял метку — ответ дан: счёт
+   возвратов начинается заново. PR без отметки — дозапуск `/ship`, возвратом не считается.
+3. Тикет: открыт, не назначен другому; метка `in-progress` и исполнитель — я.
+4. Worktree и ветка: уже есть worktree на ветке — он; иначе рядом с главным
+   `../<проект>-ticket-N` (`../<проект>-pr-M`) на ветке `ticket-N` от `origin/main` (на ветке PR).
+   Ветка тикета `ticket-N` или `ticket-N-*` уже есть локально или на сервере — берётся она (две
+   с суффиксом — стоп, выбрать вручную). Ветка PR подтягивается к серверу fast-forward;
+   разошлась — стоп. Потом проектная `scripts/session/setup` в корне worktree, если есть.
+
+Итог — путь worktree, метка сессии `CANON_SESSION` (её читает Stop-хук) и промпт; с `--json` —
+последней строкой JSON. Код выхода 0 — готово; 1 — сбой git, `gh` или `scripts/session/setup`;
+2 — ошибка аргументов, тикет закрыт или занят другим, неоднозначная ветка тикета.
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REGISTRY = "canon-sessions.json"
+SETUP = "scripts/session/setup"
+CLEANUP = "scripts/session/cleanup"
+REVIEW = "review"
+WAITING = "ready-for-human"
+IN_PROGRESS = "in-progress"
+OWNER_CHECKS = {"restricted-paths"}
+RED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+MAX_RETURNS = 2
+SESSION_BRANCH = re.compile(r"^ticket-\d+(-.+)?$")
+RETURN_RE = re.compile(r"^возврат (\d+)/\d+: красный CI на ([0-9a-f]{7})")
+FORM_MARK = f"{WAITING}: третий возврат не делается"
+PR_FIELDS = "number,title,url,headRefName,headRefOid,isDraft,labels,statusCheckRollup"
+PR_LIMIT = "200"
+
+
+class StartError(Exception):
+    """Сбой git, gh или проектной команды (код выхода 1)."""
+
+
+class UsageError(Exception):
+    """Ошибка аргументов или состояния тикета (код выхода 2)."""
+
+
+def run(*cmd: str, cwd: Path | None = None) -> str:
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise StartError(f"{' '.join(cmd[:3])}: {(result.stderr or result.stdout).strip()}")
+    return result.stdout.strip()
+
+
+def project_command(cmd: list[str], cwd: Path) -> tuple[int, str]:
+    """Проектный скрипт: (код, вывод); не запустился (нет +x, shebang) — код -1."""
+    try:
+        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return -1, f"не запускается: {exc}"
+    return result.returncode, (result.stderr or result.stdout).strip()
+
+
+def note(text: str) -> None:
+    print(f"session-start: {text}", file=sys.stderr)
+
+
+# --- git ---
+
+
+def worktrees() -> list[dict]:
+    """`git worktree list --porcelain`: [{path, branch}], первый — главный."""
+    found, current = [], {}
+    for line in run("git", "worktree", "list", "--porcelain").splitlines() + [""]:
+        if not line:
+            if current:
+                found.append(current)
+            current = {}
+        elif line.startswith("worktree "):
+            current["path"] = str(Path(line[len("worktree ") :]).resolve())
+        elif line.startswith("branch refs/heads/"):
+            current["branch"] = line[len("branch refs/heads/") :]
+    return found
+
+
+def has_ref(ref: str) -> bool:
+    return subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", ref], capture_output=True
+    ).returncode == 0
+
+
+def is_ancestor(older: str, newer: str, cwd: Path) -> bool:
+    return subprocess.run(
+        ["git", "merge-base", "--is-ancestor", older, newer], cwd=cwd, capture_output=True
+    ).returncode == 0
+
+
+# --- реестр и уборка ---
+
+
+def common_dir() -> Path:
+    return Path(run("git", "rev-parse", "--path-format=absolute", "--git-common-dir"))
+
+
+@contextlib.contextmanager
+def registry_lock():
+    """Параллельные старты правят реестр по очереди."""
+    with open(common_dir() / (REGISTRY + ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def read_registry() -> dict:
+    path = common_dir() / REGISTRY
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def write_registry(entries: dict) -> None:
+    path = common_dir() / REGISTRY
+    text = json.dumps(entries, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, encoding="utf-8") as tmp:
+        tmp.write(text)
+    os.replace(tmp.name, path)
+
+
+def cleanup(main: Path) -> set[str]:
+    """Уборка исчезнувших worktree; итог — пути, чьи ресурсы убрать не удалось."""
+    run("git", "worktree", "prune")
+    alive = {w["path"] for w in worktrees()}
+    entries = read_registry()
+    command = main / CLEANUP
+    pending = set()
+    for path in sorted(set(entries) - alive):
+        if command.is_file():
+            code, output = project_command([str(command), path], main)
+            if code != 0:
+                note(f"уборка {path} не удалась ({CLEANUP}): {output}; повтор при следующем старте")
+                pending.add(path)
+                continue
+            note(f"убраны ресурсы исчезнувшего worktree {path}")
+        del entries[path]
+    write_registry(entries)
+    return pending
+
+
+# --- PR автора ---
+
+
+def is_red(item: dict) -> bool:
+    name = item.get("name") or item.get("context")
+    state = item.get("conclusion") or item.get("state")
+    return name not in OWNER_CHECKS and state in RED
+
+
+def failed_checks(pr: dict) -> list[str]:
+    return [
+        f"{item.get('name') or item.get('context')}="
+        f"{item.get('conclusion') or item.get('state')}"
+        + (f" ({url})" if (url := item.get("detailsUrl") or item.get("targetUrl")) else "")
+        for item in pr.get("statusCheckRollup") or []
+        if is_red(item)
+    ]
+
+
+def is_marked(pr: dict) -> bool:
+    return any(
+        item.get("context") == REVIEW and item.get("state") == "SUCCESS"
+        for item in pr.get("statusCheckRollup") or []
+    )
+
+
+def attention() -> list[tuple[dict, bool]]:
+    """PR сессий автора, требующие внимания: [(pr, красный)], красные первыми, по номеру."""
+    prs = json.loads(run("gh", "pr", "list", "--author", "@me", "--state", "open",
+                         "--limit", PR_LIMIT, "--json", PR_FIELDS))
+    found = []
+    for pr in prs:
+        if pr.get("isDraft") or not SESSION_BRANCH.match(pr["headRefName"]):
+            continue
+        red = bool(failed_checks(pr))
+        if red or not is_marked(pr):
+            found.append((pr, red))
+    return sorted(found, key=lambda item: (not item[1], item[0]["number"]))
+
+
+def since_last_form(pr: dict) -> tuple[bool, list[str]]:
+    """(форма уже была, комментарии после последней формы)."""
+    comments = json.loads(run("gh", "pr", "view", str(pr["number"]), "--json", "comments"))
+    bodies = [c["body"] for c in comments["comments"]]
+    forms = [i for i, body in enumerate(bodies) if body.startswith(FORM_MARK)]
+    return bool(forms), bodies[forms[-1] + 1 :] if forms else bodies
+
+
+def waits_owner(pr: dict, had_form: bool, recent: list[str]) -> bool:
+    """Метка стоит и после формы возвратов не было — PR ждёт ответа владельца.
+
+    Метка без формы (перерасход ревью у `ship-finish`, сбой между меткой и формой) — не ожидание.
+    """
+    labeled = any(lb["name"] == WAITING for lb in pr.get("labels") or [])
+    return labeled and had_form and not any(RETURN_RE.match(b) for b in recent)
+
+
+def count_return(pr: dict, recent: list[str]) -> int | None:
+    """Номер возврата для красного head; None — возвраты исчерпаны, PR ушёл владельцу."""
+    number, sha = str(pr["number"]), pr["headRefOid"][:7]
+    seen = {}
+    for body in recent:
+        if m := RETURN_RE.match(body):
+            seen[m.group(2)] = int(m.group(1))
+    if sha in seen:
+        return seen[sha]
+    k = max(seen.values(), default=0) + 1
+    checks = failed_checks(pr)
+    if k > MAX_RETURNS:
+        run("gh", "pr", "edit", number, "--add-label", WAITING)
+        run("gh", "pr", "comment", number, "--body", human_form(pr, checks))
+        note(f"PR #{number}: возвраты исчерпаны — {WAITING}, сессия не запускается")
+        return None
+    body = f"возврат {k}/{MAX_RETURNS}: красный CI на {sha} — {', '.join(checks)}. "
+    body += "Сессия автора берёт PR в работу (session-start)."
+    run("gh", "pr", "comment", number, "--body", body)
+    return k
+
+
+def human_form(pr: dict, checks: list[str]) -> str:
+    lines = [
+        f"{FORM_MARK} — CI снова красный на {pr['headRefOid'][:7]} после {MAX_RETURNS} возвратов.",
+        "",
+        "**Вопрос:** как довести PR, если две сессии подряд не сделали CI зелёным?",
+        "",
+        "**Упавшие проверки (логи):**",
+        *(f"- {c}" for c in checks),
+        "",
+        "**Варианты:**",
+        "1. Разобрать причину и ответить комментарием здесь (гипотеза, куда смотреть), затем снять "
+        f"`{WAITING}` — следующий старт сессии возьмёт PR с ответом, счёт возвратов начнётся заново.",
+        "2. Закрыть PR и переписать тикет: задача поставлена неверно или слишком велика.",
+        "3. Довести PR руками.",
+        "",
+        "**Сделано по умолчанию:** PR оставлен как есть, новая сессия на него не запущена; "
+        "стартовая команда пропускает PR, пока стоит метка.",
+        "",
+        "**Рекомендация:** вариант 1 — две неудачи подряд обычно означают, что сессии не хватает "
+        "знания о проекте или окружении, а не усилий; новая попытка без ответа повторит сбой.",
+    ]
+    return "\n".join(lines)
+
+
+def pick_pr() -> dict | None:
+    for pr, red in attention():
+        had_form, recent = since_last_form(pr)
+        if waits_owner(pr, had_form, recent):
+            continue
+        k = count_return(pr, recent) if red else 0
+        if k is None:
+            continue
+        sha, branch = pr["headRefOid"][:7], pr["headRefName"]
+        answered = " Владелец ответил в PR после третьей неудачи — прочитай ответ." if had_form else ""
+        if red:
+            prompt = (
+                f"PR #{pr['number']} (ветка {branch}): красный CI на {sha} — "
+                f"{', '.join(failed_checks(pr))}; возврат {k}/{MAX_RETURNS}.{answered} "
+                "Найди причину, исправь в этой ветке, затем /ship."
+            )
+        else:
+            prompt = (
+                f"PR #{pr['number']} (ветка {branch}): нет отметки review на {sha} — сессия "
+                f"оборвалась до конца /ship.{answered} Доведи /ship."
+            )
+        return {"kind": "pr", "pr": pr["number"], "url": pr["url"], "branch": branch,
+                "session": f"pr-{pr['number']}", "prompt": prompt}
+    return None
+
+
+# --- тикет ---
+
+
+def take_ticket(number: int) -> None:
+    fields = "number,state,labels,assignees"
+    issue = json.loads(run("gh", "issue", "view", str(number), "--json", fields))
+    if issue["state"] != "OPEN":
+        raise UsageError(f"тикет #{number} закрыт")
+    me = run("gh", "api", "user", "--jq", ".login")
+    labels = {lb["name"] for lb in issue.get("labels") or []}
+    assignees = {a["login"] for a in issue.get("assignees") or []}
+    if assignees and me not in assignees:
+        raise UsageError(f"тикет #{number} уже в работе: {', '.join(sorted(assignees))}")
+    if IN_PROGRESS not in labels or me not in assignees:
+        run("gh", "issue", "edit", str(number), "--add-label", IN_PROGRESS, "--add-assignee", "@me")
+
+
+# --- worktree ---
+
+
+def ticket_branch(number: int) -> str:
+    """Ветка тикета: `ticket-N`, иначе единственная `ticket-N-*` локально или на сервере."""
+    exact = f"ticket-{number}"
+    names = {w.get("branch") for w in worktrees()}
+    names |= set(run("git", "for-each-ref", "--format=%(refname:short)", "refs/heads/").split())
+    remote = run("git", "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/")
+    names |= {r[len("origin/") :] for r in remote.split()}
+    if exact in names:
+        return exact
+    suffixed = sorted(n for n in names if n and n.startswith(exact + "-"))
+    if len(suffixed) > 1:
+        raise UsageError(f"у тикета #{number} несколько веток: {', '.join(suffixed)}; "
+                         "лишние удалите или переименуйте")
+    return suffixed[0] if suffixed else exact
+
+
+def ensure_worktree(main: Path, branch: str, name: str, pending: set[str]) -> Path:
+    """Worktree на ветке: существующий, иначе новый `../<проект>-<name>`."""
+    for w in worktrees():
+        if w.get("branch") == branch:
+            return Path(w["path"])
+    path = (main.parent / f"{main.name}-{name}").resolve()
+    if str(path) in pending:
+        raise StartError(f"ресурсы прежнего worktree {path} не убраны ({CLEANUP}): "
+                         "сначала уборка, иначе новая сессия унаследует старые")
+    if has_ref(f"refs/heads/{branch}"):
+        run("git", "worktree", "add", "-q", str(path), branch)
+    elif has_ref(f"refs/remotes/origin/{branch}"):
+        run("git", "worktree", "add", "-q", "-b", branch, str(path), f"origin/{branch}")
+    else:
+        run("git", "worktree", "add", "-q", "--no-track", "-b", branch, str(path), "origin/main")
+    return path
+
+
+def sync_pr_branch(worktree: Path, branch: str) -> None:
+    """Ветка PR — не старее сервера: fast-forward; разошлась — стоп."""
+    remote = f"origin/{branch}"
+    if is_ancestor(remote, "HEAD", worktree):
+        return
+    if not is_ancestor("HEAD", remote, worktree):
+        raise StartError(f"ветка {branch} в {worktree} разошлась с {remote}: свести вручную")
+    run("git", "merge", "-q", "--ff-only", remote, cwd=worktree)
+
+
+def setup(worktree: Path) -> None:
+    command = worktree / SETUP
+    if not command.is_file():
+        return
+    code, output = project_command([str(command)], worktree)
+    if code != 0:
+        raise StartError(f"{SETUP} в {worktree}: код {code}: {output}")
+
+
+# --- сборка ---
+
+
+def start(number: int) -> dict:
+    main = Path(worktrees()[0]["path"])
+    os.chdir(main)
+    with registry_lock():
+        pending = cleanup(main)
+        run("git", "fetch", "-q", "origin")
+        plan = pick_pr()
+        if plan is None:
+            take_ticket(number)
+            branch = ticket_branch(number)
+            plan = {"kind": "ticket", "ticket": number, "branch": branch,
+                    "session": f"ticket-{number}", "prompt": f"/implement #{number}, затем /ship"}
+            worktree = ensure_worktree(main, branch, plan["session"], pending)
+        else:
+            plan["postponed"] = number
+            worktree = ensure_worktree(main, plan["branch"], plan["session"], pending)
+            sync_pr_branch(worktree, plan["branch"])
+        plan["branch"] = run("git", "-C", str(worktree), "symbolic-ref", "--short", "HEAD")
+        plan["worktree"] = str(worktree)
+        entries = read_registry()
+        entries[str(worktree)] = {"session": plan["session"], "branch": plan["branch"]}
+        write_registry(entries)
+    setup(worktree)
+    return plan
+
+
+def report(plan: dict) -> str:
+    if plan["kind"] == "pr":
+        head = f"PR автора требует внимания: {plan['url']} — тикет #{plan['postponed']} отложен"
+    else:
+        head = f"тикет #{plan['ticket']}: метка {IN_PROGRESS}"
+    return "\n".join([
+        f"session-start: {head}",
+        f"  worktree  {plan['worktree']} (ветка {plan['branch']})",
+        f"  сессия    CANON_SESSION={plan['session']}",
+        f"  промпт    {plan['prompt']}",
+        f"Запуск: cd {shlex.quote(plan['worktree'])} && CANON_SESSION={plan['session']} "
+        f"claude -- {shlex.quote(plan['prompt'])}",
+    ])
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="session-start", description=__doc__.split("\n\n")[0])
+    parser.add_argument("ticket", help="номер тикета")
+    parser.add_argument("--json", action="store_true", help="итог последней строкой JSON")
+    args = parser.parse_args(argv)
+    try:
+        if not args.ticket.lstrip("#").isdigit():
+            raise UsageError(f"номер тикета — число, а не {args.ticket!r}")
+        plan = start(int(args.ticket.lstrip("#")))
+    except UsageError as exc:
+        note(str(exc))
+        return 2
+    except StartError as exc:
+        note(str(exc))
+        return 1
+    print(report(plan))
+    if args.json:
+        print(json.dumps(plan, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

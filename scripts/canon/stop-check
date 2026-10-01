@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""stop-check — Stop-хук сессии тикета: не даёт ей закончиться, пока работа не доведена до PR.
+
+Регистрируется в `.claude/settings.base.json` (хук `Stop`), вход — JSON хука на stdin.
+Действует только в headless-сессии тикета: `session-run --headless` ставит `CANON_SESSION`
+(`ticket-N` или `pr-M`) и `CANON_ENFORCE_STOP=1`. Хук `Stop` срабатывает в конце каждого хода,
+поэтому интерактивную сессию (владелец рядом, агент может спросить и ждать ответа) и свободную
+сессию он не держит и `gh` в них не вызывает.
+
+Репозиторий — `CLAUDE_PROJECT_DIR` (каталог, где запущена сессия, — worktree тикета), а не
+текущий каталог агента. Сессия заканчивается, если для ветки worktree верно одно из:
+
+- открытый PR ветки с head = локальный HEAD, отметкой ревью (статус `review` = success) на head,
+  без красного CI и с авто-мёржем, незакоммиченных правок отслеживаемых файлов нет — конец `/ship`;
+- слитый PR ветки с head = локальный HEAD, незакоммиченных правок нет;
+- отчёт об остановке **этой** сессии: метка `ready-for-human` и комментарий, первая строка
+  которого — «Отчёт об остановке…» (или «ready-for-human: не подтверждено…» от `ship-finish
+  --unconfirmed`), созданный после начала сессии (первая запись транскрипта). Где: открытый PR
+  ветки — на нём, и он черновик (иначе `session-start` возьмёт его дозапуском `/ship`); PR нет —
+  на тикете N (`ticket-N`) или на PR M (`pr-M`).
+
+Иначе — `{"decision": "block", "reason": …}`: что не так и два законных выхода с командами. Так
+ловится и обрыв между push и отметкой. `stop_hook_active` не отпускает: страховка от бесконечной
+сессии — встроенный предел Claude Code (9 блокировок подряд, `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`),
+предел объёма `--max-budget-usd` и прерывание человеком.
+
+Собственная ошибка хука (не git-репозиторий, `gh` недоступен, неверная метка сессии, нет
+транскрипта для сверки времени отчёта, любое исключение) сессию **не держит**: код 0 и
+`systemMessage` с причиной — пользователь видит, что проверка не состоялась.
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+
+REVIEW = "review"
+WAITING = "ready-for-human"
+ENFORCE = "CANON_ENFORCE_STOP"
+REPORT_MARKS = ("Отчёт об остановке", f"{WAITING}: не подтверждено")
+OWNER_CHECKS = {"restricted-paths"}
+RED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+SESSION = re.compile(r"^(ticket|pr)-(\d+)$")
+PR_FIELDS = "number,url,headRefOid,state,isDraft,labels,autoMergeRequest,statusCheckRollup"
+TIMEOUT = 30
+
+
+class CheckError(Exception):
+    """Проверка не состоялась — сессию не держим."""
+
+
+def run(cwd: str, *cmd: str) -> str:
+    try:
+        result = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, check=False, timeout=TIMEOUT
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CheckError(f"{' '.join(cmd[:3])}: {exc}") from None
+    if result.returncode != 0:
+        raise CheckError(f"{' '.join(cmd[:3])}: {(result.stderr or result.stdout).strip()}")
+    return result.stdout.strip()
+
+
+def moment(text: str) -> datetime:
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def session_started(transcript: str | None) -> datetime:
+    """Начало сессии — время первой записи транскрипта."""
+    try:
+        with open(transcript or "", encoding="utf-8") as lines:
+            for line in lines:
+                try:
+                    stamp = json.loads(line).get("timestamp")
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+                if stamp:
+                    return moment(stamp)
+    except (OSError, ValueError) as exc:
+        raise CheckError(f"начало сессии по транскрипту {transcript!r}: {exc}") from None
+    raise CheckError(f"начало сессии по транскрипту {transcript!r}: записей со временем нет")
+
+
+def labels(item: dict) -> set[str]:
+    return {label["name"] for label in item.get("labels") or []}
+
+
+def is_marked(pr: dict) -> bool:
+    return any(
+        item.get("context") == REVIEW and item.get("state") == "SUCCESS"
+        for item in pr.get("statusCheckRollup") or []
+    )
+
+
+def red_checks(pr: dict) -> list[str]:
+    return [
+        name
+        for item in pr.get("statusCheckRollup") or []
+        if (name := item.get("name") or item.get("context")) not in OWNER_CHECKS
+        and (item.get("conclusion") or item.get("state")) in RED
+    ]
+
+
+class Session:
+    def __init__(self, label: str, cwd: str, transcript: str | None):
+        match = SESSION.match(label)
+        if not match:
+            raise CheckError(f"CANON_SESSION={label!r}: ожидается ticket-N или pr-M")
+        self.label, self.cwd, self.transcript = label, cwd, transcript
+        self.kind, self.number = match.groups()
+
+    def has_report(self, kind: str, number: str) -> bool:
+        """Метка ready-for-human и комментарий-отчёт этой сессии на issue или PR."""
+        item = json.loads(run(self.cwd, "gh", kind, "view", number, "--json", "labels,comments"))
+        if WAITING not in labels(item):
+            return False
+        reports = [
+            c for c in item.get("comments") or []
+            if (c.get("body") or "").lstrip().startswith(REPORT_MARKS)
+        ]
+        if not reports:
+            return False
+        started = session_started(self.transcript)
+        return any(moment(c["createdAt"]) >= started for c in reports)
+
+    def problem(self) -> str | None:
+        """Почему сессия не закончена; None — закончена законно."""
+        head = run(self.cwd, "git", "rev-parse", "HEAD")
+        dirty = bool(run(self.cwd, "git", "status", "--porcelain", "--untracked-files=no"))
+        try:
+            branch = run(self.cwd, "git", "symbolic-ref", "--short", "HEAD")
+        except CheckError:
+            branch = None
+        prs = []
+        if branch:
+            prs = json.loads(run(self.cwd, "gh", "pr", "list", "--head", branch,
+                                 "--state", "all", "--json", PR_FIELDS))
+        pr = next((p for p in prs if p["state"] == "OPEN"), None)
+        if pr is not None:
+            return self.open_pr_problem(pr, head, dirty)
+        if any(p["state"] == "MERGED" and p["headRefOid"] == head for p in prs):
+            return "PR слит, но есть незакоммиченные правки отслеживаемых файлов" if dirty else None
+        target = ("issue", self.number) if self.kind == "ticket" else ("pr", self.number)
+        if self.has_report(*target):
+            return None
+        if branch is None:
+            return "HEAD не на ветке (detached) — PR искать не по чему"
+        return f"у ветки {branch} открытого PR нет"
+
+    def open_pr_problem(self, pr: dict, head: str, dirty: bool) -> str | None:
+        ref = f"PR #{pr['number']} ({pr['url']})"
+        if pr["isDraft"]:
+            if self.has_report("pr", str(pr["number"])):
+                return None
+            return f"{ref} — черновик без отчёта об остановке этой сессии"
+        if pr["headRefOid"] != head:
+            return (
+                f"{ref}: head {pr['headRefOid'][:7]}, локально {head[:7]} — "
+                "коммит не запушен или отметка стоит на старом коммите"
+            )
+        if not is_marked(pr):
+            return f"{ref}: нет отметки {REVIEW} на head {head[:7]}"
+        if red := red_checks(pr):
+            return f"{ref}: красный CI на head {head[:7]}: {', '.join(red)}"
+        if not pr.get("autoMergeRequest"):
+            return f"{ref}: авто-мёрж не включён"
+        if dirty:
+            return f"{ref}: есть незакоммиченные правки отслеживаемых файлов"
+        return None
+
+    def reason(self, problem: str) -> str:
+        ship = "scripts/canon/ship-finish --title \"<заголовок>\" --body-file <тело PR.md>"
+        where = (
+            "есть открытый PR — на нём, черновиком: "
+            f"`{ship} --unconfirmed \"Отчёт об остановке: …\"`; если и это не проходит (push "
+            "отклонён) — вручную `gh pr ready <PR> --undo`, `gh pr edit <PR> --add-label "
+            f"{WAITING}`, `gh pr comment <PR> --body-file <отчёт.md>`; "
+        )
+        if self.kind == "ticket":
+            where += (
+                f"PR нет — в тикете: `gh issue comment {self.number} --body-file <отчёт.md>` и "
+                f"`gh issue edit {self.number} --add-label {WAITING}`"
+            )
+        else:
+            where += (
+                f"на PR {self.number}: `gh pr comment {self.number} --body-file <отчёт.md>` и "
+                f"`gh pr edit {self.number} --add-label {WAITING}`"
+            )
+        return (
+            f"Сессия {self.label} не закончена: {problem}. Законный конец — одно из двух. "
+            f"(1) Довести /ship: `{ship}` — открытый PR ветки с отметкой review на запушенном "
+            "head, без красного CI и с авто-мёржем; после любой правки — коммит и ship-finish "
+            "заново. (2) Если довести нельзя — отчёт об остановке этой сессии: комментарий, "
+            "первая строка которого «Отчёт об остановке», дальше причина, доказательства, "
+            f"варианты, рекомендация — понятно владельцу без сессии; плюс метка {WAITING}. "
+            f"Где: {where}."
+        )
+
+
+def main() -> int:
+    label = os.environ.get("CANON_SESSION")
+    if not label or os.environ.get(ENFORCE) != "1":
+        return 0
+    try:
+        hook = json.loads(sys.stdin.read() or "{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        hook = {}
+    hook = hook if isinstance(hook, dict) else {}
+    cwd = os.environ.get("CLAUDE_PROJECT_DIR") or hook.get("cwd") or os.getcwd()
+    try:
+        session = Session(label, cwd, hook.get("transcript_path"))
+        problem = session.problem()
+        text = session.reason(problem) if problem else None
+    except Exception as exc:  # noqa: BLE001 — сбой хука не должен держать сессию
+        message = f"stop-check: проверка конца сессии {label} не состоялась, сессия не держится: {exc}"
+        print(json.dumps({"systemMessage": message}, ensure_ascii=False))
+        return 0
+    if text:
+        print(json.dumps({"decision": "block", "reason": text}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

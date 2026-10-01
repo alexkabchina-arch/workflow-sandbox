@@ -13,5 +13,18 @@
       "Bash(gh api graphql *BranchProtectionRule*)",
       "Bash(gh api graphql *RepositoryRuleset*)"
     ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/canon/stop-check",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
   }
 }

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -39,6 +40,7 @@ from pathlib import Path, PurePosixPath
 MODEL = "claude-opus-5-5"
 LEVEL = "xhigh"
 DEFAULT_BASE = "origin/main"
+SESSION_VARS = {"CANON_SESSION", "CANON_ENFORCE_STOP"}
 # Ревью Opus xhigh в разведке workflow#2 стоили 0,82–3,67 USD (в среднем 1,89); уточнить на пилоте.
 DEFAULT_BUDGET_USD = "10"
 
@@ -98,11 +100,17 @@ def budget_verdict(cost, budget: str) -> dict:
     }
 
 
+def child_env() -> dict:
+    """Окружение ревью без меток сессии тикета: Stop-хук не должен держать дочерний процесс."""
+    return {k: v for k, v in os.environ.items() if k not in SESSION_VARS}
+
+
 def run_review(report: Path, base: str, budget: str) -> dict:
     """Запускает ревью и сохраняет результат; возвращает вердикт по бюджету (budget_verdict)."""
     try:
         proc = subprocess.run(
-            claude_command(base, budget), stdin=subprocess.DEVNULL, capture_output=True, text=True
+            claude_command(base, budget), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            env=child_env(),
         )
     except FileNotFoundError:
         raise ReviewError("не найден `claude` на PATH") from None
