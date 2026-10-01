@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""run-log — долгая команда с полным выводом в файл, хвостом на экране и честным кодом выхода.
+
+    scripts/canon/run-log [-n N] [-l метка] -- <команда> [аргументы…]
+
+Замена пайпа `команда | tail`: у пайпа код выхода берётся от `tail` (всегда 0), и красные тесты
+читаются как зелёные. Обёртка исполняет команду (без оболочки: нужна оболочка — `sh -c '…'`, но
+пайп и внутри неё теряет код), пишет весь её вывод (stdout и stderr вместе) в лог, по завершении
+печатает последние N строк лога (по умолчанию 30) и строку
+`run-log: завершено с кодом <код> · лог: <файл>` и **возвращает код выхода самой команды**.
+Как в оболочке: убита сигналом — 128 + номер сигнала, не найдена — 127, не запускается — 126.
+
+Лог — новый файл `run-log-<метка>-XXXXXXXX.log` во временном каталоге пользователя (`TMPDIR`),
+создаётся исключительно и только для владельца: параллельные прогоны, в том числе с одной меткой,
+друг друга не затирают, чужой файл или симлинк по тому же пути не перезаписываются. Путь —
+в итоговой строке. Метка — только читаемая часть имени, по умолчанию имя команды; символы вне
+`[A-Za-z0-9._-]` заменяются на `-`.
+
+Команда идёт в своей сессии (без управляющего терминала, stdin пуст): Ctrl-C, SIGTERM и SIGHUP
+получает обёртка и пересылает всей группе команды, затем ждёт её и печатает итог как обычно.
+Ошибка аргументов самой обёртки — код 2 и сообщение `run-log:` в stderr, команда не запускается.
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+TAIL = 30
+BLOCK = 64 * 1024
+FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def parse(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="run-log",
+        description="Команда с выводом в файл, хвостом на экране и её кодом выхода.",
+    )
+    parser.add_argument("-n", type=int, default=TAIL, metavar="N", help="строк хвоста (30)")
+    parser.add_argument("-l", dest="label", metavar="метка", help="часть имени лога")
+    parser.add_argument("command", nargs=argparse.REMAINDER, help="-- команда и аргументы")
+    args = parser.parse_args(argv)
+    if args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    if not args.command:
+        parser.error("не задана команда: run-log [-n N] [-l метка] -- <команда>")
+    if args.n < 0:
+        parser.error("-n — неотрицательное число строк")
+    explicit = args.label is not None
+    args.label = UNSAFE.sub("-", args.label if explicit else Path(args.command[0]).name).strip("-.")
+    if not args.label:
+        if explicit:
+            parser.error("пустая метка лога")
+        args.label = "command"
+    return args
+
+
+def execute(command: list[str], out: int) -> int:
+    """Исполняет команду с выводом в `out`; код выхода — как его вернула бы оболочка."""
+    try:
+        proc = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True
+        )
+    except OSError as exc:
+        os.write(out, f"run-log: не удалось запустить {command[0]}: {exc}\n".encode())
+        return 127 if exc.errno == errno.ENOENT else 126
+
+    def forward(signum, _frame):
+        try:
+            os.killpg(proc.pid, signum)
+        except ProcessLookupError:
+            pass
+
+    for signum in FORWARDED:
+        signal.signal(signum, forward)
+    code = proc.wait()
+    return 128 - code if code < 0 else code
+
+
+def tail(out: int, count: int) -> str:
+    """Последние `count` строк лога: читает блоками с конца, не весь файл."""
+    if count == 0:
+        return ""
+    pos = os.lseek(out, 0, os.SEEK_END)
+    data = b""
+    while pos > 0 and data.count(b"\n", 0, len(data) - 1) < count:
+        step = min(BLOCK, pos)
+        pos -= step
+        data = os.pread(out, step, pos) + data
+    return b"".join(data.splitlines(keepends=True)[-count:]).decode("utf-8", errors="replace")
+
+
+def main(argv: list[str]) -> int:
+    args = parse(argv)
+    try:
+        out, log = tempfile.mkstemp(prefix=f"run-log-{args.label}-", suffix=".log")
+    except OSError as exc:
+        print(f"run-log: не создать лог: {exc}", file=sys.stderr)
+        return 2
+    try:
+        code = execute(args.command, out)
+        try:
+            shown = tail(out, args.n)
+        except OSError as exc:
+            shown = f"run-log: хвост лога не прочитан: {exc}\n"
+    finally:
+        os.close(out)
+    sys.stdout.write(shown)
+    if shown and not shown.endswith("\n"):
+        sys.stdout.write("\n")
+    print(f"run-log: завершено с кодом {code} · лог: {log}")
+    sys.stdout.flush()
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

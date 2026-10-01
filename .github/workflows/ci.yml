@@ -14,6 +14,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python scripts/canon/check_lock.py
+      - run: python3 scripts/canon/claude_md_length.py
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
