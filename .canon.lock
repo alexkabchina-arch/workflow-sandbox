@@ -1,11 +1,12 @@
 {
   "canon": "alexkabchina-arch/workflow",
-  "version": "v2026.10.01.4",
-  "commit": "0c994df9c56a7d197c8cd55ecf6f684519031c8b",
+  "version": "12c31c3",
+  "commit": "12c31c349f0a9bb4e9c23475c109692925647b97",
   "files": {
     ".claude/settings.base.json": "sha256:4f856507d20b275448fc211a529aae780c5384cb92d833352b681dd8a84f0023",
     ".claude/settings.json": "sha256:4f856507d20b275448fc211a529aae780c5384cb92d833352b681dd8a84f0023",
     ".claude/skills/ship/SKILL.md": "sha256:0110c6eb1e67aa10e54162bf63704cad8d9ec37fbea052d2ce8a0f0cb5330546",
+    ".github/workflows/dependabot-review.yml": "sha256:e635bddc5536087dfaa3066f39a958914f06f6f7135f95d497c56e6683e60b36",
     ".github/workflows/restricted-paths.yml": "sha256:09160e46bb0bdeee4d7ae0d14db116be9fa700676b36fc739d5b1885985b3561",
     "scripts/canon/check_lock.py": "sha256:a31c03c155df8377e54b2e6f173fbdd9eea56efba766ee8e947a18c04c1de015",
     "scripts/canon/restricted_paths.py": "sha256:b7d8c3609efe321d8f376c2ed51b88e11ea0f4480e1614e0389f0f4e5f143aaa",
