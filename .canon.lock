@@ -1,15 +1,15 @@
 {
   "canon": "alexkabchina-arch/workflow",
-  "version": "v2026.10.01.3",
-  "commit": "0c8369ec676a1ddf41e74330f6970b55f04b06d7",
+  "version": "v2026.10.01.4",
+  "commit": "0c994df9c56a7d197c8cd55ecf6f684519031c8b",
   "files": {
     ".claude/settings.base.json": "sha256:4f856507d20b275448fc211a529aae780c5384cb92d833352b681dd8a84f0023",
     ".claude/settings.json": "sha256:4f856507d20b275448fc211a529aae780c5384cb92d833352b681dd8a84f0023",
-    ".claude/skills/ship/SKILL.md": "sha256:528e56097bc60366b3834ff7ded865b6324fd51e83bca92aefb02392acab3dbc",
+    ".claude/skills/ship/SKILL.md": "sha256:0110c6eb1e67aa10e54162bf63704cad8d9ec37fbea052d2ce8a0f0cb5330546",
     ".github/workflows/restricted-paths.yml": "sha256:09160e46bb0bdeee4d7ae0d14db116be9fa700676b36fc739d5b1885985b3561",
     "scripts/canon/check_lock.py": "sha256:a31c03c155df8377e54b2e6f173fbdd9eea56efba766ee8e947a18c04c1de015",
     "scripts/canon/restricted_paths.py": "sha256:b7d8c3609efe321d8f376c2ed51b88e11ea0f4480e1614e0389f0f4e5f143aaa",
     "scripts/canon/review": "sha256:41a8a038da56bfbb837d9cc8c880cd52d4989b62153327ff89a045e23d6015bb",
-    "scripts/canon/ship-finish": "sha256:a34754165920dfe6def9f6fd533423bc0db67823280baa530520379ebb47483b"
+    "scripts/canon/ship-finish": "sha256:3de15eb6b03d25d70777706ca95847c68f8928291ac8621b0faa5dce11097887"
   }
 }
