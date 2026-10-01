@@ -10,7 +10,9 @@
         "/review xhigh origin/main...HEAD" < /dev/null
 
 Уровень и модель одни для любого диффа (итог разведки workflow#2). Дифф только из документов
-(`docs/**`, `*.md`) — ревью пропускается; конфиги, CI и настройки Claude Code ревьюятся.
+(`docs/**`, `*.md`) — ревью пропускается; конфиги, CI и всё под `.claude/` на любой глубине
+(настройки, скиллы, агенты, правила — инструкции агенту с командами, хоть и `*.md`) ревьюятся,
+в каноне — и `owner/` (личный слой: агенты, скиллы, хуки).
 В `<отчёт.json>` — сырой результат (`modelUsage`, стоимость), рядом `<отчёт>.md` — текст
 находок.
 
@@ -46,6 +48,9 @@ DEFAULT_BUDGET_USD = "10"
 
 DOC_SUFFIXES = {".md"}
 DOC_DIRS = {"docs"}
+# Инструкции агенту с командами: ревьюятся как код, хоть и `*.md`.
+AGENT_DIR = ".claude"
+OWNER_DIR = "owner"
 
 
 class ReviewError(Exception):
@@ -58,14 +63,19 @@ class UsageError(Exception):
 
 def is_docs(path: str) -> bool:
     p = PurePosixPath(path)
+    if AGENT_DIR in p.parts[:-1] or (p.parts and p.parts[0] == OWNER_DIR):
+        return False
     if p.parts and p.parts[0] in DOC_DIRS:
         return True
     return p.suffix.lower() in DOC_SUFFIXES
 
 
 def changed_files(base: str) -> list[str]:
+    # Без распознавания переименований: перенос скилла в `docs/` — это и удаление скилла.
     result = subprocess.run(
-        ["git", "diff", "--name-only", "-z", f"{base}...HEAD"], capture_output=True, text=True
+        ["git", "diff", "--name-only", "--no-renames", "-z", f"{base}...HEAD"],
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         raise UsageError(f"git diff {base}...HEAD: {result.stderr.strip()}")
