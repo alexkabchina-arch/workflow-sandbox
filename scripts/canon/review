@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""review — ревью ошибок ветки встроенным `/review` (шаг `/ship`).
+
+    scripts/canon/review <отчёт.json> [--base origin/main] [--max-budget-usd 10]
+
+Из корня проекта, на закоммиченной ветке. Агент сам не может вызвать скилл `review` — только
+набранной командой, поэтому скрипт запускает дочерний процесс обычным вызовом, не в фоне:
+
+    claude -p --model claude-opus-5-5 --max-budget-usd <предел> --output-format json \\
+        "/review xhigh origin/main...HEAD" < /dev/null
+
+Уровень и модель одни для любого диффа (итог разведки workflow#2). Дифф только из документов
+(`docs/**`, `*.md`) — ревью пропускается; конфиги, CI и настройки Claude Code ревьюятся.
+В `<отчёт.json>` — сырой результат (`modelUsage`, стоимость), рядом `<отчёт>.md` — текст
+находок.
+
+Код выхода 0 — ревью готово или пропущено; 1 — ревью не состоялось или неполное (сбой `claude`,
+пустой `modelUsage`, не та модель), причина в stderr; 2 — ошибка аргументов или git.
+
+`--max-budget-usd` на `/review` не срабатывает: это локальная команда вне цикла ходов
+(`num_turns` 0), а предел проверяется между ходами (проверено вживую 01.10.2026). Остановить ревью
+на лету нельзя, поэтому дороже предела — не ошибка, а предупреждение по итоговой стоимости
+(решение владельца): строка `review: предупреждение: …` для тела PR, при перерасходе вдвое и
+больше — ещё строка `review: ready-for-human: …` (её разбирает `/ship`). То же — в блоке
+`canon_review` отчёта.json.
+Вызывающему нужен таймаут Bash больше времени ревью (`BASH_MAX_TIMEOUT_MS` в настройках канона).
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path, PurePosixPath
+
+MODEL = "claude-opus-5-5"
+LEVEL = "xhigh"
+DEFAULT_BASE = "origin/main"
+# Ревью Opus xhigh в разведке workflow#2 стоили 0,82–3,67 USD (в среднем 1,89); уточнить на пилоте.
+DEFAULT_BUDGET_USD = "10"
+
+DOC_SUFFIXES = {".md"}
+DOC_DIRS = {"docs"}
+
+
+class ReviewError(Exception):
+    """Ревью не состоялось или неполное (код выхода 1)."""
+
+
+class UsageError(Exception):
+    """Ошибка аргументов или git (код выхода 2)."""
+
+
+def is_docs(path: str) -> bool:
+    p = PurePosixPath(path)
+    if p.parts and p.parts[0] in DOC_DIRS:
+        return True
+    return p.suffix.lower() in DOC_SUFFIXES
+
+
+def changed_files(base: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "-z", f"{base}...HEAD"], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise UsageError(f"git diff {base}...HEAD: {result.stderr.strip()}")
+    return [p for p in result.stdout.split("\0") if p]
+
+
+def claude_command(base: str, budget: str) -> list[str]:
+    return [
+        "claude",
+        "-p",
+        "--model",
+        MODEL,
+        "--max-budget-usd",
+        budget,
+        "--output-format",
+        "json",
+        f"/review {LEVEL} {base}...HEAD",
+    ]
+
+
+def budget_verdict(cost, budget: str) -> dict:
+    """Перерасход по итоговой стоимости: предупреждение и признак ready-for-human."""
+    limit = float(budget)
+    known = isinstance(cost, (int, float))
+    over = known and cost > limit
+    return {
+        "cost_usd": cost if known else None,
+        "budget_usd": limit,
+        "over_budget": over,
+        "ready_for_human": known and cost >= 2 * limit,
+        "warning": f"ревью стоило {cost:.2f} USD при пределе {budget} USD" if over else None,
+    }
+
+
+def run_review(report: Path, base: str, budget: str) -> dict:
+    """Запускает ревью и сохраняет результат; возвращает вердикт по бюджету (budget_verdict)."""
+    try:
+        proc = subprocess.run(
+            claude_command(base, budget), stdin=subprocess.DEVNULL, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        raise ReviewError("не найден `claude` на PATH") from None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        tail = (proc.stderr or proc.stdout).strip()[-2000:]
+        raise ReviewError(f"claude вышел с кодом {proc.returncode} без JSON-результата: {tail}")
+
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    cost = data.get("total_cost_usd", "?")
+    subtype = data.get("subtype")
+    if subtype == "error_max_budget_usd":
+        raise ReviewError(
+            f"ревью упёрлось в предел --max-budget-usd {budget} (потрачено {cost} USD, "
+            "subtype error_max_budget_usd): отчёт неполный, находок нет. "
+            f"Сырой результат — {report}. "
+            "Дифф слишком велик для предела: разбить ветку или поднять предел решением владельца."
+        )
+    if subtype != "success" or data.get("is_error"):
+        raise ReviewError(
+            f"ревью завершилось ошибкой (subtype {subtype}, is_error {data.get('is_error')}, "
+            f"код {proc.returncode}); сырой результат — {report}"
+        )
+    text = data.get("result") or ""
+    models = sorted(data.get("modelUsage") or {})
+    if not models:
+        # `/review` — локальная команда: сбой до модели (например, протухшая авторизация)
+        # приходит как subtype success с пустым modelUsage и текстом ошибки в result.
+        raise ReviewError(
+            f"ревью не дошло до модели (modelUsage пуст): {text.strip()[:500] or 'без текста'}; "
+            f"сырой результат — {report}"
+        )
+    if MODEL not in models:
+        raise ReviewError(
+            f"ревью шло не на {MODEL}: modelUsage — {', '.join(models)}; сырой результат — {report}"
+        )
+    if not text.strip():
+        raise ReviewError(f"ревью вернуло пустой текст; сырой результат — {report}")
+    findings = report.with_suffix(".md")
+    findings.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    verdict = budget_verdict(cost, budget)
+    data["canon_review"] = verdict
+    report.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return verdict
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="review", description=__doc__.split("\n\n")[0])
+    parser.add_argument("report", type=Path, help="файл сырого результата (.json); рядом — .md")
+    parser.add_argument(
+        "--base", default=DEFAULT_BASE, help=f"база диффа (по умолчанию {DEFAULT_BASE})"
+    )
+    parser.add_argument(
+        "--max-budget-usd",
+        default=DEFAULT_BUDGET_USD,
+        help=f"предел объёма ревью в USD по прайсу API (по умолчанию {DEFAULT_BUDGET_USD})",
+    )
+    args = parser.parse_args(argv)
+    try:
+        files = changed_files(args.base)
+        code = [p for p in files if not is_docs(p)]
+        if not code:
+            print(
+                f"review: пропущено — в {args.base}...HEAD только документы (файлов: {len(files)})"
+            )
+            return 0
+        verdict = run_review(args.report, args.base, args.max_budget_usd)
+    except UsageError as exc:
+        print(f"review: {exc}", file=sys.stderr)
+        return 2
+    except ReviewError as exc:
+        print(f"review: {exc}", file=sys.stderr)
+        return 1
+    cost = verdict["cost_usd"]
+    print(
+        f"review: /review {LEVEL} на {MODEL} готово (файлов кода: {len(code)}, "
+        f"{'?' if cost is None else f'{cost:.2f}'} USD); находки — {args.report.with_suffix('.md')}"
+    )
+    if verdict["over_budget"]:
+        print(f"review: предупреждение: {verdict['warning']}")
+    if verdict["ready_for_human"]:
+        print(
+            f"review: ready-for-human: {verdict['warning']} — перерасход вдвое и больше, "
+            "сессии тикета поставить ready-for-human с этой строкой"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
