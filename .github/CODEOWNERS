@@ -1,0 +1,21 @@
+# Пути-ограничители канона (decisions.md, вопрос 17; ADR-0004): PR, задевающий их, сливается
+# только с одобрением владельца. Свой такой PR владелец сливает сам как администратор (обход
+# набора правил «канон: main» — только через PR); авто-мёрж его не сольёт.
+#
+# Шаблон копируется в проект один раз (`.github/CODEOWNERS`) и дальше принадлежит проекту.
+# Работает вместе с `protect-main` канона: набор правил требует одобрения CODEOWNERS.
+# Порядок важен: последнее совпавшее правило побеждает — проектные строки дописывать в конец.
+
+# Вендоренные файлы канона: `scripts/canon/`; настройки Claude Code — база канона, склейка
+# и проектные добавки (`.claude/settings.project.json`). Прочие вендоренные файлы ловит
+# `.canon.lock` в CI; рецепты `/verify` (`.claude/skills/run-*`) правит сам `/verify`.
+/scripts/canon/                 @alexkabchina-arch
+/.claude/settings*.json         @alexkabchina-arch
+/.canon.lock                    @alexkabchina-arch
+
+# Workflow CI и сам этот файл.
+/.github/                       @alexkabchina-arch
+
+# Профиль проекта: критичные зоны и ожидаемые job CI. CODEOWNERS не различает разделы
+# файла — под одобрением весь профиль.
+/docs/agents/profile.md         @alexkabchina-arch
