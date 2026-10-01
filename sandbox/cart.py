@@ -10,8 +10,8 @@ class Item:
 
 
 def parse_item(spec: str) -> Item:
-    """«3x100» → 3 штуки по 100 ₽ (цена хранится в копейках)."""
-    qty_s, sep, price_s = spec.partition("x")
+    """«3x100» или «3X100» → 3 штуки по 100 ₽ (цена хранится в копейках)."""
+    qty_s, sep, price_s = spec.lower().partition("x")
     if not sep:
         raise ValueError(f"ожидался формат КОЛxЦЕНА, получено {spec!r}")
     qty = int(qty_s)
