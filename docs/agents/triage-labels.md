@@ -10,7 +10,7 @@
 | `ready-for-human`        | `ready-for-human` | Нужен человек: решение или действие владельца         |
 | `wontfix`                | `wontfix`         | Делать не будем                                       |
 
-`ready-for-human` — это и **очередь решений** ([GLOSSARY.md](https://github.com/alexkabchina-arch/workflow/blob/main/GLOSSARY.md)): вопрос, варианты, последствия, что сделано по умолчанию, рекомендация. Ответ владельца — комментарий и метка `ready-for-agent`.
+`ready-for-human` — это и **очередь решений** ([GLOSSARY.md](https://github.com/alexkabchina-arch/workflow/blob/v2026.10.01.12/GLOSSARY.md)): вопрос, варианты, последствия, что сделано по умолчанию, рекомендация. Ответ владельца — комментарий и метка `ready-for-agent`.
 
 ## Вне пяти канонических
 
