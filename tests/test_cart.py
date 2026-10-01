@@ -1,3 +1,5 @@
+from decimal import localcontext
+
 import pytest
 
 from sandbox.cart import Item, parse_item
@@ -35,3 +37,27 @@ def test_parse_item_uppercase_separator():
 def test_parse_item_rejects(spec):
     with pytest.raises(ValueError):
         parse_item(spec)
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        ("1x-0.004", "точнее копейки"),
+        ("1x-0.01", "отрицательной"),
+        ("1x0.285", "точнее копейки"),
+        ("1x1.0000000000000000000000000001", "точнее копейки"),
+        ("1x1e-1000030", "точнее копейки"),
+        ("1x123456789012345678901234567.89", "до 15 цифр"),
+        ("1x1e999999", "до 15 цифр"),
+        ("1xNaN", "'NaN'"),
+    ],
+)
+def test_parse_item_price_errors(spec, message):
+    with pytest.raises(ValueError, match=message):
+        parse_item(spec)
+
+
+def test_parse_item_price_ignores_global_decimal_context():
+    with localcontext() as ctx:
+        ctx.prec = 3
+        assert parse_item("1x12345.67") == Item(qty=1, price_kop=1234567)
