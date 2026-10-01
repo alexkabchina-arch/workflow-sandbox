@@ -11,3 +11,4 @@ python -m sandbox 3x100 1x49.90 --discount 10
 ```
 
 Команды, CI и критичные зоны — в профиле [docs/agents/](docs/agents/).
+
