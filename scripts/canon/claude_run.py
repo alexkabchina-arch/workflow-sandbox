@@ -53,7 +53,9 @@ def budget_usd(value: str) -> str:
 def parser(prog: str, description: str) -> argparse.ArgumentParser:
     """Общие аргументы: `<отчёт.json> [--base] [--max-budget-usd]`."""
     result = argparse.ArgumentParser(prog=prog, description=description)
-    result.add_argument("report", type=report_path, help="файл сырого результата (.json); рядом — .md")
+    result.add_argument(
+        "report", type=report_path, help="файл сырого результата (.json); рядом — .md"
+    )
     result.add_argument(
         "--base", default=DEFAULT_BASE, help=f"база диффа (по умолчанию {DEFAULT_BASE})"
     )
@@ -82,15 +84,27 @@ def run_claude(args: list[str], report: Path, budget: str) -> dict:
     возвращает разобранный JSON. Не состоялось — `ChildError`.
     """
     command = [
-        "claude", "-p", "--model", MODEL, "--max-budget-usd", budget,
-        "--output-format", "json", *args,
+        "claude",
+        "-p",
+        "--model",
+        MODEL,
+        "--max-budget-usd",
+        budget,
+        "--output-format",
+        "json",
+        *args,
     ]
     # Итог прошлого прогона не должен пережить неудачный новый.
     report.with_suffix(".md").unlink(missing_ok=True)
     try:
         proc = subprocess.run(
-            command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", env=child_env(),
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=child_env(),
         )
     except FileNotFoundError:
         raise ChildError("не найден `claude` на PATH") from None
@@ -98,7 +112,9 @@ def run_claude(args: list[str], report: Path, budget: str) -> dict:
         data = json.loads(proc.stdout)
     except json.JSONDecodeError:
         tail = (proc.stderr or proc.stdout).strip()[-2000:]
-        raise ChildError(f"claude вышел с кодом {proc.returncode} без JSON-результата: {tail}")
+        raise ChildError(
+            f"claude вышел с кодом {proc.returncode} без JSON-результата: {tail}"
+        ) from None
     if not isinstance(data, dict):
         raise ChildError(f"claude вернул не объект JSON (код {proc.returncode})")
 

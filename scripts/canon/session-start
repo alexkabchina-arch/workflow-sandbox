@@ -111,15 +111,21 @@ def worktrees() -> list[dict]:
 
 
 def has_ref(ref: str) -> bool:
-    return subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", ref], capture_output=True
-    ).returncode == 0
+    return (
+        subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", ref], capture_output=True
+        ).returncode
+        == 0
+    )
 
 
 def is_ancestor(older: str, newer: str, cwd: Path) -> bool:
-    return subprocess.run(
-        ["git", "merge-base", "--is-ancestor", older, newer], cwd=cwd, capture_output=True
-    ).returncode == 0
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", older, newer], cwd=cwd, capture_output=True
+        ).returncode
+        == 0
+    )
 
 
 # --- реестр и уборка ---
@@ -198,8 +204,21 @@ def is_marked(pr: dict) -> bool:
 
 def attention() -> list[tuple[dict, bool]]:
     """PR сессий автора, требующие внимания: [(pr, красный)], красные первыми, по номеру."""
-    prs = json.loads(run("gh", "pr", "list", "--author", "@me", "--state", "open",
-                         "--limit", PR_LIMIT, "--json", PR_FIELDS))
+    prs = json.loads(
+        run(
+            "gh",
+            "pr",
+            "list",
+            "--author",
+            "@me",
+            "--state",
+            "open",
+            "--limit",
+            PR_LIMIT,
+            "--json",
+            PR_FIELDS,
+        )
+    )
     found = []
     for pr in prs:
         if pr.get("isDraft") or not SESSION_BRANCH.match(pr["headRefName"]):
@@ -259,8 +278,9 @@ def human_form(pr: dict, checks: list[str]) -> str:
         *(f"- {c}" for c in checks),
         "",
         "**Варианты:**",
-        "1. Разобрать причину и ответить комментарием здесь (гипотеза, куда смотреть), затем снять "
-        f"`{WAITING}` — следующий старт сессии возьмёт PR с ответом, счёт возвратов начнётся заново.",
+        "1. Разобрать причину и ответить комментарием здесь (гипотеза, куда смотреть), "
+        f"затем снять `{WAITING}` — следующий старт сессии возьмёт PR с ответом, "
+        "счёт возвратов начнётся заново.",
         "2. Закрыть PR и переписать тикет: задача поставлена неверно или слишком велика.",
         "3. Довести PR руками.",
         "",
@@ -282,7 +302,9 @@ def pick_pr() -> dict | None:
         if k is None:
             continue
         sha, branch = pr["headRefOid"][:7], pr["headRefName"]
-        answered = " Владелец ответил в PR после третьей неудачи — прочитай ответ." if had_form else ""
+        answered = (
+            " Владелец ответил в PR после третьей неудачи — прочитай ответ." if had_form else ""
+        )
         if red:
             prompt = (
                 f"PR #{pr['number']} (ветка {branch}): красный CI на {sha} — "
@@ -294,8 +316,14 @@ def pick_pr() -> dict | None:
                 f"PR #{pr['number']} (ветка {branch}): нет отметки review на {sha} — сессия "
                 f"оборвалась до конца /ship.{answered} Доведи /ship."
             )
-        return {"kind": "pr", "pr": pr["number"], "url": pr["url"], "branch": branch,
-                "session": f"pr-{pr['number']}", "prompt": prompt}
+        return {
+            "kind": "pr",
+            "pr": pr["number"],
+            "url": pr["url"],
+            "branch": branch,
+            "session": f"pr-{pr['number']}",
+            "prompt": prompt,
+        }
     return None
 
 
@@ -330,8 +358,10 @@ def ticket_branch(number: int) -> str:
         return exact
     suffixed = sorted(n for n in names if n and n.startswith(exact + "-"))
     if len(suffixed) > 1:
-        raise UsageError(f"у тикета #{number} несколько веток: {', '.join(suffixed)}; "
-                         "лишние удалите или переименуйте")
+        raise UsageError(
+            f"у тикета #{number} несколько веток: {', '.join(suffixed)}; "
+            "лишние удалите или переименуйте"
+        )
     return suffixed[0] if suffixed else exact
 
 
@@ -342,8 +372,10 @@ def ensure_worktree(main: Path, branch: str, name: str, pending: set[str]) -> Pa
             return Path(w["path"])
     path = (main.parent / f"{main.name}-{name}").resolve()
     if str(path) in pending:
-        raise StartError(f"ресурсы прежнего worktree {path} не убраны ({CLEANUP}): "
-                         "сначала уборка, иначе новая сессия унаследует старые")
+        raise StartError(
+            f"ресурсы прежнего worktree {path} не убраны ({CLEANUP}): "
+            "сначала уборка, иначе новая сессия унаследует старые"
+        )
     if has_ref(f"refs/heads/{branch}"):
         run("git", "worktree", "add", "-q", str(path), branch)
     elif has_ref(f"refs/remotes/origin/{branch}"):
@@ -385,8 +417,13 @@ def start(number: int) -> dict:
         if plan is None:
             take_ticket(number)
             branch = ticket_branch(number)
-            plan = {"kind": "ticket", "ticket": number, "branch": branch,
-                    "session": f"ticket-{number}", "prompt": f"/implement #{number}, затем /ship"}
+            plan = {
+                "kind": "ticket",
+                "ticket": number,
+                "branch": branch,
+                "session": f"ticket-{number}",
+                "prompt": f"/implement #{number}, затем /ship",
+            }
             worktree = ensure_worktree(main, branch, plan["session"], pending)
         else:
             plan["postponed"] = number
@@ -406,14 +443,16 @@ def report(plan: dict) -> str:
         head = f"PR автора требует внимания: {plan['url']} — тикет #{plan['postponed']} отложен"
     else:
         head = f"тикет #{plan['ticket']}: метка {IN_PROGRESS}"
-    return "\n".join([
-        f"session-start: {head}",
-        f"  worktree  {plan['worktree']} (ветка {plan['branch']})",
-        f"  сессия    CANON_SESSION={plan['session']}",
-        f"  промпт    {plan['prompt']}",
-        f"Запуск: cd {shlex.quote(plan['worktree'])} && CANON_SESSION={plan['session']} "
-        f"claude -- {shlex.quote(plan['prompt'])}",
-    ])
+    return "\n".join(
+        [
+            f"session-start: {head}",
+            f"  worktree  {plan['worktree']} (ветка {plan['branch']})",
+            f"  сессия    CANON_SESSION={plan['session']}",
+            f"  промпт    {plan['prompt']}",
+            f"Запуск: cd {shlex.quote(plan['worktree'])} && CANON_SESSION={plan['session']} "
+            f"claude -- {shlex.quote(plan['prompt'])}",
+        ]
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """verify — проверка изменения ветки встроенным `/verify` (шаг 4 `/ship`).
 
-    scripts/canon/verify <отчёт.json> --criteria-file <файл> [--base origin/main] [--max-budget-usd 10]
+    scripts/canon/verify <отчёт.json> --criteria-file <файл> \\
+        [--base origin/main] [--max-budget-usd 10]
 
 Из корня проекта, на закоммиченной ветке. Встроенный `/verify` из сессии не вызвать — только
 дочерним процессом, поэтому скрипт запускает его обычным вызовом, не в фоне:

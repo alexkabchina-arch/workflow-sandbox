@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """session-run — стартовая команда сессии тикета: `session-start`, затем `claude` в worktree.
 
-    scripts/canon/session-run <номер тикета> [--headless [--max-budget-usd USD]] [-- <аргументы claude>]
+    scripts/canon/session-run <номер тикета> [--headless [--max-budget-usd USD]] \\
+        [-- <аргументы claude>]
 
 Тонкая оболочка: вся стартовая логика — в `session-start` (его можно вызвать и сам, первым шагом
 уже открытой сессии). Здесь только способ запуска: `claude` прямо в каталоге worktree (иначе
@@ -11,8 +12,8 @@
 - По умолчанию — интерактивно, без предела объёма: `--max-budget-usd` работает только с `-p`.
 - `--headless` — `claude -p --max-budget-usd <USD>` (по умолчанию 30 — около трёх медиан
   тикета) и `--permission-mode auto`: спросить по ходу некого. Плюс `CANON_ENFORCE_STOP=1`:
-  Stop-хук `stop-check` держит сессию до PR или отчёта об остановке только здесь. Аргументы после `--` уходят в
-  `claude` как есть; свой `--permission-mode` там заменяет режим по умолчанию.
+  Stop-хук `stop-check` держит сессию до PR или отчёта об остановке только здесь. Аргументы
+  после `--` уходят в `claude` как есть; свой `--permission-mode` там заменяет режим по умолчанию.
 
 Код выхода — код `session-start`, если он не 0; иначе — код `claude`.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
@@ -42,10 +43,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="session-run", description=__doc__.split("\n\n")[0])
     parser.add_argument("ticket", help="номер тикета")
     parser.add_argument("--headless", action="store_true", help="claude -p с пределом объёма")
-    parser.add_argument("--max-budget-usd", metavar="USD", help=f"предел (по умолчанию {DEFAULT_BUDGET})")
+    parser.add_argument(
+        "--max-budget-usd", metavar="USD", help=f"предел (по умолчанию {DEFAULT_BUDGET})"
+    )
     args = parser.parse_args(argv)
     if args.max_budget_usd and not args.headless:
-        print("session-run: --max-budget-usd работает только с --headless (claude -p)", file=sys.stderr)
+        print(
+            "session-run: --max-budget-usd работает только с --headless (claude -p)",
+            file=sys.stderr,
+        )
         return 2
 
     result = subprocess.run(
