@@ -121,7 +121,8 @@ class Session:
         if WAITING not in labels(item):
             return False
         reports = [
-            c for c in item.get("comments") or []
+            c
+            for c in item.get("comments") or []
             if (c.get("body") or "").lstrip().startswith(REPORT_MARKS)
         ]
         if not reports:
@@ -139,8 +140,20 @@ class Session:
             branch = None
         prs = []
         if branch:
-            prs = json.loads(run(self.cwd, "gh", "pr", "list", "--head", branch,
-                                 "--state", "all", "--json", PR_FIELDS))
+            prs = json.loads(
+                run(
+                    self.cwd,
+                    "gh",
+                    "pr",
+                    "list",
+                    "--head",
+                    branch,
+                    "--state",
+                    "all",
+                    "--json",
+                    PR_FIELDS,
+                )
+            )
         pr = next((p for p in prs if p["state"] == "OPEN"), None)
         if pr is not None:
             return self.open_pr_problem(pr, head, dirty)
@@ -175,10 +188,10 @@ class Session:
         return None
 
     def reason(self, problem: str) -> str:
-        ship = "scripts/canon/ship-finish --title \"<заголовок>\" --body-file <тело PR.md>"
+        ship = 'scripts/canon/ship-finish --title "<заголовок>" --body-file <тело PR.md>'
         where = (
             "есть открытый PR — на нём, черновиком: "
-            f"`{ship} --unconfirmed \"Отчёт об остановке: …\"`; если и это не проходит (push "
+            f'`{ship} --unconfirmed "Отчёт об остановке: …"`; если и это не проходит (push '
             "отклонён) — вручную `gh pr ready <PR> --undo`, `gh pr edit <PR> --add-label "
             f"{WAITING}`, `gh pr comment <PR> --body-file <отчёт.md>`; "
         )
@@ -218,7 +231,9 @@ def main() -> int:
         problem = session.problem()
         text = session.reason(problem) if problem else None
     except Exception as exc:  # noqa: BLE001 — сбой хука не должен держать сессию
-        message = f"stop-check: проверка конца сессии {label} не состоялась, сессия не держится: {exc}"
+        message = (
+            f"stop-check: проверка конца сессии {label} не состоялась, сессия не держится: {exc}"
+        )
         print(json.dumps({"systemMessage": message}, ensure_ascii=False))
         return 0
     if text:

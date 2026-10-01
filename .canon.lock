@@ -1,7 +1,7 @@
 {
   "canon": "alexkabchina-arch/workflow",
-  "version": "v2026.10.01.11",
-  "commit": "027202af9352c87dd5e0a1fa9a2a13ef76afa2d2",
+  "version": "v2026.10.01.12",
+  "commit": "363f2540f35bdeb27a4a431c1faad580ff6ae3f1",
   "files": {
     ".claude/settings.base.json": "sha256:d19308019c4dc286a5264ae1b8fb0c07b11440ece35015d8bbaa1549ecb4069a",
     ".claude/settings.json": "sha256:d19308019c4dc286a5264ae1b8fb0c07b11440ece35015d8bbaa1549ecb4069a",
@@ -34,7 +34,7 @@
     ".claude/skills/setup-matt-pocock-skills/issue-tracker-gitlab.md": "sha256:ea175f73d193b3f55819c0ed9bbccf6ee0e70ad8f928e3d7607596c53380acd6",
     ".claude/skills/setup-matt-pocock-skills/issue-tracker-local.md": "sha256:7dcda20a2eb4bdc89b95d1143423c0691309921cadae3132e6424f371030506e",
     ".claude/skills/setup-matt-pocock-skills/triage-labels.md": "sha256:4f53c9b40ce2651e3611aa090eaedbd6dbc9b71ef8c5f7e65eac0d8263190d0d",
-    ".claude/skills/ship/SKILL.md": "sha256:1a8c64c90a83b6cee09c72e605820497a13eab6f9e49818ab06ee6a84b4e3525",
+    ".claude/skills/ship/SKILL.md": "sha256:5386cd09aca76c9ac55e4b62cfa662a3826bb5049dfa007f39638bb2565b2fe4",
     ".claude/skills/tdd/SKILL.md": "sha256:93ea419b76e9caaf26153b828e984f7c3fb136f4caa67b14af95f32ea965a1cc",
     ".claude/skills/tdd/agents/openai.yaml": "sha256:ea6f01cf1b8c06a4b0f5b649d74b1b8ce8685e72af1b38d70d877693e092af0b",
     ".claude/skills/tdd/mocking.md": "sha256:3ceb807fdf4a47d6a93d4d9a891e5ba6d362a6247bd08adc451feebfc17361ef",
@@ -55,17 +55,17 @@
     ".github/workflows/dependabot-review.yml": "sha256:e635bddc5536087dfaa3066f39a958914f06f6f7135f95d497c56e6683e60b36",
     ".github/workflows/restricted-paths.yml": "sha256:09160e46bb0bdeee4d7ae0d14db116be9fa700676b36fc739d5b1885985b3561",
     "matt-skills.lock.json": "sha256:8e37308004f15ec9915cabec9c86da22562c8733ab71dba66d214d3665c21818",
-    "matt-skills.txt": "sha256:8b62d7d0743bff3bb31d66c63d4c02f4d9f10205a2cc38a4b90429f13b135056",
+    "matt-skills.txt": "sha256:c9c7d9438ea799fa48563acd82f6035dabdeb9b133c3a49f22802d743c71857a",
     "scripts/canon/check_lock.py": "sha256:a31c03c155df8377e54b2e6f173fbdd9eea56efba766ee8e947a18c04c1de015",
     "scripts/canon/claude_md_length.py": "sha256:c0b1ea5c592e6284f1b53ed26765757f4ccacdf34d7e8c25c31b73ccd190427f",
-    "scripts/canon/claude_run.py": "sha256:c00551599b816faa02d1274430a2a170ee5eaa99900e9dbee22d5ec82245e5b1",
+    "scripts/canon/claude_run.py": "sha256:8aa307776f0afc11dc8b8de6962190937ab47eeb2f8ddbb0d5399285fa622e28",
     "scripts/canon/restricted_paths.py": "sha256:b7d8c3609efe321d8f376c2ed51b88e11ea0f4480e1614e0389f0f4e5f143aaa",
     "scripts/canon/review": "sha256:e447e435ec3316748a9a0ab089759524d33dc7ce73f2f1a9fc86a3e18a6fdd47",
     "scripts/canon/run-log": "sha256:a9b9a6c2c91f1eef2541adb45f9762795ba18d9ba16e4fd501428a5b69497846",
-    "scripts/canon/session-run": "sha256:659b91fa68cdaa42070fb9bc85b613b026e71a160c843d31437b2d3fcb140eee",
-    "scripts/canon/session-start": "sha256:522fc87d35fe68bfee5a8cce75d37785ee6b00027ecf9764544988a463eddab3",
+    "scripts/canon/session-run": "sha256:e65e814b4b75ce5f1c400d19700bbd4c92fc1c3ee7b12b7dd24651393703a110",
+    "scripts/canon/session-start": "sha256:44a3dc6d7287f754a7a2a6aa4d4d6a00ae6a555bfb4e95d126b60e3c9079ee5d",
     "scripts/canon/ship-finish": "sha256:3de15eb6b03d25d70777706ca95847c68f8928291ac8621b0faa5dce11097887",
-    "scripts/canon/stop-check": "sha256:ec70160d907cfce003fd87f068f54cdea442d7ff40581a31b0ca46647816f376",
-    "scripts/canon/verify": "sha256:e0ad55cd4ef83c83cbbe0a2927b07770277e1893d68abc1d035f2dcf11dbe295"
+    "scripts/canon/stop-check": "sha256:8c9a33dcbd75239997524dacdde77906280077084ceeefdde440ef74ccf40faf",
+    "scripts/canon/verify": "sha256:d517bed121562a0dc7ebaf68826fa0a5d4ba3eb825298d4522afbce5369b72c9"
   }
 }
