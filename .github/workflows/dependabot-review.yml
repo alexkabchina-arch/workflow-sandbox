@@ -1,0 +1,52 @@
+# Вендорен из канона alexkabchina-arch/workflow (`canon-sync`, `.canon.lock`): руками не править.
+#
+# Отметка ревью для Dependabot minor/patch: статус `review` = success на head-коммите PR и
+# авто-мёрж — PR сливается после зелёного CI, как PR агента после `/ship`. Отметка ревью обязательна
+# для всех, исключений в правилах защиты нет; minor/patch от Dependabot ревью ошибок не проходят,
+# их проверяет CI. Major отметку не получает — обычный путь (тикет, сессия, `/ship`).
+#
+# `pull_request_target`: workflow берётся из базовой ветки, код PR не выгружается и не исполняется;
+# на `pull_request` у запусков Dependabot токен только на чтение — статус не поставить.
+# Метаданные — `dependabot/fetch-metadata`: падает, если PR открыл не Dependabot или в нём есть чужие
+# коммиты, — тогда отметки нет. Правка поверх PR Dependabot (push не от Dependabot) отметки не
+# получает: условие на отправителя события.
+#
+# Мёрж, включённый токеном workflow, не запускает workflow на push в `main` (ограничение
+# GITHUB_TOKEN): CI на `main` после такого мёржа не идёт, PR проверен своим прогоном; всё, что
+# проект делает по push в `main` (в vps — `build-images`), ждёт следующего обычного мёржа.
+# PR Dependabot на `.github/` (экосистема `github-actions`) упирается в `restricted-paths` и ждёт
+# владельца, как любой PR на путь-ограничитель.
+name: dependabot-review
+
+on:
+  pull_request_target:
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  dependabot-review:
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.sender.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Метаданные Dependabot
+        id: meta
+        uses: dependabot/fetch-metadata@v3
+      - name: Отметка ревью и авто-мёрж
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-minor' ||
+          steps.meta.outputs.update-type == 'version-update:semver-patch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          UPDATE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state=success -f context=review \
+            -f description="Dependabot ${UPDATE#version-update:semver-}: ревью ошибок не нужно, проверяет CI"
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --auto --squash
