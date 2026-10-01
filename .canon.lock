@@ -1,10 +1,12 @@
 {
   "canon": "alexkabchina-arch/workflow",
-  "version": "v2026.09.30",
-  "commit": "daaf9bdf1c24dc6aa7ae49e55c04f4d0e6ec33fd",
+  "version": "b9dc0a1",
+  "commit": "b9dc0a1e1048aeb8b8f9809631b92f8cf8261748",
   "files": {
     ".claude/settings.base.json": "sha256:da36bff8f0f5c20b411c704e917adf832018b0ce9a6b257a54c312ab2dcd6bfc",
     ".claude/settings.json": "sha256:da36bff8f0f5c20b411c704e917adf832018b0ce9a6b257a54c312ab2dcd6bfc",
-    "scripts/canon/check_lock.py": "sha256:a31c03c155df8377e54b2e6f173fbdd9eea56efba766ee8e947a18c04c1de015"
+    ".github/workflows/restricted-paths.yml": "sha256:09160e46bb0bdeee4d7ae0d14db116be9fa700676b36fc739d5b1885985b3561",
+    "scripts/canon/check_lock.py": "sha256:a31c03c155df8377e54b2e6f173fbdd9eea56efba766ee8e947a18c04c1de015",
+    "scripts/canon/restricted_paths.py": "sha256:b7d8c3609efe321d8f376c2ed51b88e11ea0f4480e1614e0389f0f4e5f143aaa"
   }
 }
