@@ -52,8 +52,6 @@ claude_run = load_claude_run()  # общий запуск дочернего `cl
 
 MODEL = claude_run.MODEL
 LEVEL = "xhigh"
-# Ревью Opus xhigh в разведке workflow#2 стоили 0,82–3,67 USD (в среднем 1,89); уточнить на пилоте.
-DEFAULT_BUDGET_USD = claude_run.DEFAULT_BUDGET_USD
 UsageError = claude_run.UsageError
 
 DOC_SUFFIXES = {".md"}
@@ -84,24 +82,10 @@ def changed_files(base: str) -> list[str]:
     return [p for p in result.stdout.split("\0") if p]
 
 
-def budget_verdict(cost, budget: str) -> dict:
-    """Перерасход по итоговой стоимости: предупреждение и признак ready-for-human."""
-    limit = float(budget)
-    known = isinstance(cost, (int, float))
-    over = known and cost > limit
-    return {
-        "cost_usd": cost if known else None,
-        "budget_usd": limit,
-        "over_budget": over,
-        "ready_for_human": known and cost >= 2 * limit,
-        "warning": f"ревью стоило {cost:.2f} USD при пределе {budget} USD" if over else None,
-    }
-
-
 def run_review(report: Path, base: str, budget: str) -> dict:
-    """Запускает ревью и сохраняет результат; возвращает вердикт по бюджету (budget_verdict)."""
+    """Запускает ревью и сохраняет результат; возвращает вердикт по бюджету."""
     data = claude_run.run_claude([f"/review {LEVEL} {base}...HEAD"], report, budget)
-    verdict = budget_verdict(data.get("total_cost_usd"), budget)
+    verdict = claude_run.budget_verdict(data.get("total_cost_usd"), budget, "ревью стоило")
     data["canon_review"] = verdict
     claude_run.write_json(report, data)
     return verdict

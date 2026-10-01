@@ -2,9 +2,16 @@
 
 Дочерний процесс — без меток сессии тикета (иначе Stop-хук `stop-check` держал бы его), на
 закреплённой модели, с аргументами списком (без оболочки) и пустым stdin. Результат
-`--output-format json` сохраняется в `<отчёт.json>`, текст `result` — рядом в `<отчёт>.md`.
-Запуск не состоялся (сбой `claude`, выход по бюджету, ошибка, пустой `modelUsage` или `result`,
-не та модель) — `ChildError` с причиной.
+`--output-format json` сохраняется в `<отчёт.json>`, текст `result` — рядом в `<отчёт>.md`;
+со схемой (`--json-schema`) ответ — в поле `structured_output`, а `.md` пишет вызывающий из его
+полей. Запуск не состоялся (сбой `claude`, выход по бюджету, ошибка, пустой `modelUsage`, не та
+модель; без схемы — пустой `result`, со схемой — нет `structured_output`) — `ChildError` с
+причиной, а непустой `result` такого прогона — в `<отчёт>.raw.md` для разбора.
+
+`<отчёт>.md` бывает только у состоявшегося прогона. Перед новым запуском он и его `.json`
+переносятся в `<отчёт>.prev.md` и `.prev.json`: под основным именем не остаётся старый итог, а
+оплаченный отчёт не теряется, если новый прогон упадёт. Следы упавшего прогона (`.json`,
+`.raw.md`) новый запуск удаляет: его стоимость остаётся в транскрипте дочернего `claude`.
 
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
 Только стандартная библиотека Python 3.
@@ -14,14 +21,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import subprocess
 from pathlib import Path
 
 MODEL = "claude-opus-5-5"
 SESSION_VARS = {"CANON_SESSION", "CANON_ENFORCE_STOP"}
 DEFAULT_BASE = "origin/main"
+# Ревью Opus xhigh в разведке workflow#2 стоили 0,82–3,67 USD (в среднем 1,89); уточнить на пилоте.
 DEFAULT_BUDGET_USD = "10"
+# Как пишет предел человек: цифры и точка; без `inf`, экспоненты и `_`, которые съел бы float().
+BUDGET_FORMAT = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 
 
 class ChildError(Exception):
@@ -41,10 +53,7 @@ def report_path(value: str) -> Path:
 
 def budget_usd(value: str) -> str:
     """Предел проверяется до запуска: после оплаченного прогона падать на разборе поздно."""
-    try:
-        ok = float(value) > 0
-    except ValueError:
-        ok = False
+    ok = BUDGET_FORMAT.fullmatch(value) is not None and 0 < float(value) < math.inf
     if not ok:
         raise argparse.ArgumentTypeError(f"нужно положительное число USD через точку: {value}")
     return value
@@ -77,12 +86,54 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def run_claude(args: list[str], report: Path, budget: str) -> dict:
+def write_text(path: Path, text: str) -> None:
+    path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+
+
+def sibling(report: Path, suffix: str) -> Path:
+    """`<отчёт><suffix>`: `.prev.md`, `.raw.md` и т. п. рядом с `<отчёт>.json`."""
+    return report.with_name(report.stem + suffix)
+
+
+def set_aside(report: Path) -> None:
+    """Готовый отчёт прошлого прогона — в `.prev`, следы упавшего — удалить."""
+    findings = report.with_suffix(".md")
+    if findings.exists():
+        findings.replace(sibling(report, ".prev.md"))
+        if report.exists():
+            report.replace(sibling(report, ".prev.json"))
+    report.unlink(missing_ok=True)
+    sibling(report, ".raw.md").unlink(missing_ok=True)
+
+
+def budget_verdict(cost, budget: str, what: str) -> dict:
+    """Перерасход по итоговой стоимости: предупреждение и признак ready-for-human (вдвое и больше).
+
+    `what` — начало предупреждения: «ревью стоило», «проверка стоила».
+    """
+    limit = float(budget)
+    known = isinstance(cost, (int, float))
+    over = known and cost > limit
+    return {
+        "cost_usd": cost if known else None,
+        "budget_usd": limit,
+        "over_budget": over,
+        "ready_for_human": known and cost >= 2 * limit,
+        "warning": f"{what} {cost:.2f} USD при пределе {budget} USD" if over else None,
+    }
+
+
+def run_claude(args: list[str], report: Path, budget: str, schema: dict | None = None) -> dict:
     """Запускает `claude -p --model MODEL --max-budget-usd <budget> --output-format json <args>`.
 
-    Сохраняет сырой результат в `report`, текст `result` — в `report.with_suffix(".md")`;
-    возвращает разобранный JSON. Не состоялось — `ChildError`.
+    Сохраняет сырой результат в `report`; возвращает разобранный JSON. Без схемы текст `result`
+    пишется в `report.with_suffix(".md")`. Со схемой — `--json-schema`, ответ в
+    `structured_output` (объект), `.md` пишет вызывающий. Не состоялось — `ChildError`, непустой
+    `result` — в `<отчёт>.raw.md`.
     """
+    schema_args = (
+        [] if schema is None else ["--json-schema", json.dumps(schema, ensure_ascii=False)]
+    )
     command = [
         "claude",
         "-p",
@@ -92,10 +143,10 @@ def run_claude(args: list[str], report: Path, budget: str) -> dict:
         budget,
         "--output-format",
         "json",
+        *schema_args,
         *args,
     ]
-    # Итог прошлого прогона не должен пережить неудачный новый.
-    report.with_suffix(".md").unlink(missing_ok=True)
+    set_aside(report)
     try:
         proc = subprocess.run(
             command,
@@ -120,6 +171,18 @@ def run_claude(args: list[str], report: Path, budget: str) -> dict:
 
     report.parent.mkdir(parents=True, exist_ok=True)
     write_json(report, data)
+    try:
+        return check_result(data, report, budget, schema, proc.returncode)
+    except ChildError as exc:
+        text = data.get("result")
+        if isinstance(text, str) and text.strip():
+            write_text(sibling(report, ".raw.md"), text)
+            raise ChildError(f"{exc}; сырой ответ — {sibling(report, '.raw.md')}") from None
+        raise
+
+
+def check_result(data: dict, report: Path, budget: str, schema: dict | None, code: int) -> dict:
+    """Прогон состоялся — `data` (без схемы `.md` записан); иначе `ChildError`."""
     cost = data.get("total_cost_usd", "?")
     subtype = data.get("subtype")
     if subtype == "error_max_budget_usd":
@@ -132,7 +195,7 @@ def run_claude(args: list[str], report: Path, budget: str) -> dict:
     if subtype != "success" or data.get("is_error"):
         raise ChildError(
             f"завершилось ошибкой (subtype {subtype}, is_error {data.get('is_error')}, "
-            f"код {proc.returncode}); сырой результат — {report}"
+            f"код {code}); сырой результат — {report}"
         )
     text = data.get("result") or ""
     models = sorted(data.get("modelUsage") or {})
@@ -147,9 +210,14 @@ def run_claude(args: list[str], report: Path, budget: str) -> dict:
         raise ChildError(
             f"шло не на {MODEL}: modelUsage — {', '.join(models)}; сырой результат — {report}"
         )
+    if schema is not None:
+        if not isinstance(data.get("structured_output"), dict):
+            raise ChildError(
+                "нет ответа по схеме --json-schema (structured_output) — итог не распознан; "
+                f"сырой результат — {report}"
+            )
+        return data
     if not text.strip():
         raise ChildError(f"пустой текст результата; сырой результат — {report}")
-    report.with_suffix(".md").write_text(
-        text if text.endswith("\n") else text + "\n", encoding="utf-8"
-    )
+    write_text(report.with_suffix(".md"), text)
     return data
