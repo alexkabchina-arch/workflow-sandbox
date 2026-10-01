@@ -16,3 +16,9 @@ def test_parse_item_uppercase_separator():
 def test_parse_item_rejects(spec):
     with pytest.raises(ValueError):
         parse_item(spec)
+
+
+def test_parse_item_rejects_tiny_negative_price():
+    # #15: round(float) превращает -0.004 в 0, и отрицательная цена проходит
+    with pytest.raises(ValueError):
+        parse_item("1x-0.004")
