@@ -1,7 +1,7 @@
 {
   "canon": "alexkabchina-arch/workflow",
-  "version": "v2026.10.01.9",
-  "commit": "7bdda6c4d1a2b338fd5adadbe38fbd78b99689da",
+  "version": "v2026.10.01.10",
+  "commit": "03d681fdaef174f45191857c8e0bb68a0b322ed5",
   "files": {
     ".claude/settings.base.json": "sha256:d19308019c4dc286a5264ae1b8fb0c07b11440ece35015d8bbaa1549ecb4069a",
     ".claude/settings.json": "sha256:d19308019c4dc286a5264ae1b8fb0c07b11440ece35015d8bbaa1549ecb4069a",
@@ -57,7 +57,7 @@
     "matt-skills.lock.json": "sha256:8e37308004f15ec9915cabec9c86da22562c8733ab71dba66d214d3665c21818",
     "matt-skills.txt": "sha256:8b62d7d0743bff3bb31d66c63d4c02f4d9f10205a2cc38a4b90429f13b135056",
     "scripts/canon/check_lock.py": "sha256:a31c03c155df8377e54b2e6f173fbdd9eea56efba766ee8e947a18c04c1de015",
-    "scripts/canon/claude_md_length.py": "sha256:64c1ab92de9d311deac660a408350272d51daac1219d03a628f80121029def86",
+    "scripts/canon/claude_md_length.py": "sha256:c0b1ea5c592e6284f1b53ed26765757f4ccacdf34d7e8c25c31b73ccd190427f",
     "scripts/canon/restricted_paths.py": "sha256:b7d8c3609efe321d8f376c2ed51b88e11ea0f4480e1614e0389f0f4e5f143aaa",
     "scripts/canon/review": "sha256:6d57bd55e5e2ebbf2a2b90ee82554dd53be9b699793add5fb05f0e868cd41592",
     "scripts/canon/run-log": "sha256:a9b9a6c2c91f1eef2541adb45f9762795ba18d9ba16e4fd501428a5b69497846",
