@@ -16,3 +16,9 @@ def test_parse_item_uppercase_separator():
 def test_parse_item_rejects(spec):
     with pytest.raises(ValueError):
         parse_item(spec)
+
+
+@pytest.mark.xfail(reason="#15: правило для цены точнее копейки не решено", strict=True)
+def test_parse_item_rejects_sub_kopeck_price():
+    with pytest.raises(ValueError):
+        parse_item("1x0.005")
