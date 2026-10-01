@@ -1,6 +1,7 @@
 """Разбор позиций корзины из строки вида «3x100»."""
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,14 @@ def parse_item(spec: str) -> Item:
     qty = int(qty_s)
     if qty <= 0:
         raise ValueError("количество должно быть положительным")
-    price_kop = round(float(price_s) * 100)
-    if price_kop < 0:
+    try:
+        price = Decimal(price_s) * 100
+    except InvalidOperation:
+        raise ValueError(f"цена должна быть числом, получено {price_s!r}") from None
+    if not price.is_finite():
+        raise ValueError(f"цена должна быть числом, получено {price_s!r}")
+    if price < 0:
         raise ValueError("цена не может быть отрицательной")
-    return Item(qty=qty, price_kop=price_kop)
+    if price != price.to_integral_value():
+        raise ValueError(f"цена точнее копейки: {price_s!r}")
+    return Item(qty=qty, price_kop=int(price))
