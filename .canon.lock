@@ -1,7 +1,7 @@
 {
   "canon": "alexkabchina-arch/workflow",
-  "version": "409937858c92a3ecb2f459c3a18adf3ca676b000",
-  "commit": "409937858c92a3ecb2f459c3a18adf3ca676b000",
+  "version": "v2026.09.30",
+  "commit": "daaf9bdf1c24dc6aa7ae49e55c04f4d0e6ec33fd",
   "files": {
     ".claude/settings.base.json": "sha256:da36bff8f0f5c20b411c704e917adf832018b0ce9a6b257a54c312ab2dcd6bfc",
     ".claude/settings.json": "sha256:da36bff8f0f5c20b411c704e917adf832018b0ce9a6b257a54c312ab2dcd6bfc",
