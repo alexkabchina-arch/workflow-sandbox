@@ -6,6 +6,8 @@
 
 Из корня проекта, на ветке с закоммиченной работой. По порядку:
 
+0. Есть слитый PR ветки с head = локальный HEAD — «уже слит», код 0, больше ничего не делается.
+   Так же, если GitHub слил PR по ходу: ветки после push на сервере нет или открытого PR уже нет.
 1. `git push -u origin HEAD` (без force) и сверка: ветка на сервере — ровно локальный HEAD.
 2. PR ветки: нет открытого — `gh pr create`, есть — `gh pr edit` (тело и заголовок обновляются).
 3. Отметка ревью — статус `review` = success на head-коммите (`gh api …/statuses/<sha>`);
@@ -19,7 +21,8 @@
 `--unconfirmed <причина>` — критерий не подтверждён: PR черновиком, авто-мёрж выключен, метка
 `ready-for-human`, комментарий с причиной, отметки нет.
 
-Повторный запуск идемпотентен: второго PR нет, отметка только на итоговом коммите.
+Повторный запуск идемпотентен: второго PR нет, отметка только на итоговом коммите; после мёржа —
+«уже слит». Слитый PR со старым head работе не мешает: новые коммиты ветки идут новым PR.
 Код выхода 0 — готово; 1 — сбой push, `gh` или сверки; 2 — ошибка аргументов или состояния
 ветки (main, незакоммиченные правки), до любых действий.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
@@ -49,6 +52,10 @@ class UsageError(Exception):
     """Ошибка аргументов или состояния ветки (код выхода 2)."""
 
 
+class AlreadyMerged(Exception):
+    """PR с этим head уже слит (код выхода 0); аргумент — ссылка на PR."""
+
+
 def run(*cmd: str) -> str:
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
@@ -68,16 +75,25 @@ def check_branch() -> str:
     return branch
 
 
-def push(branch: str) -> str:
-    sha = run("git", "rev-parse", "HEAD")
+def check_merged(branch: str, sha: str) -> None:
+    """Слитый PR ветки с head = `sha` — повтор после авто-мёржа: делать нечего."""
+    cmd = f"gh pr list --head {branch} --state merged --json url,headRefOid"
+    found = json.loads(run(*cmd.split()))
+    merged = next((p for p in found if p.get("headRefOid") == sha), None)
+    if merged:
+        raise AlreadyMerged(merged["url"])
+
+
+def push(branch: str, sha: str) -> None:
     try:
         run("git", "push", "-u", "origin", "HEAD")
     except ShipError as exc:
         raise ShipError(f"push отклонён: {exc}") from None
     remote = run("git", "ls-remote", "origin", f"refs/heads/{branch}").split("\t")[0]
     if remote != sha:
+        if not remote:
+            check_merged(branch, sha)
         raise ShipError(f"после push ветка на сервере {remote[:7] or 'нет'}, локально {sha[:7]}")
-    return sha
 
 
 def find_pr(branch: str) -> dict | None:
@@ -85,9 +101,10 @@ def find_pr(branch: str) -> dict | None:
     return found[0] if found else None
 
 
-def upsert_pr(branch: str, title: str, body_file: str, draft: bool) -> dict:
+def upsert_pr(branch: str, sha: str, title: str, body_file: str, draft: bool) -> dict:
     pr = find_pr(branch)
     if pr is None:
+        check_merged(branch, sha)
         cmd = ["gh", "pr", "create", "--head", branch, "--title", title, "--body-file", body_file]
         run(*cmd, *(["--draft"] if draft else []))
         pr = find_pr(branch)
@@ -136,9 +153,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         branch = check_branch()
-        sha = push(branch)
+        sha = run("git", "rev-parse", "HEAD")
+        check_merged(branch, sha)
+        push(branch, sha)
         draft = args.unconfirmed is not None
-        pr = upsert_pr(branch, args.title, args.body_file, draft)
+        pr = upsert_pr(branch, sha, args.title, args.body_file, draft)
         number = str(pr["number"])
         if draft:
             if pr.get("autoMergeRequest"):
@@ -153,6 +172,9 @@ def main(argv: list[str] | None = None) -> int:
         marked = mark_review(sha, DESCRIPTION_SKIPPED if args.review_skipped else DESCRIPTION)
         if not pr.get("autoMergeRequest"):
             run("gh", "pr", "merge", number, "--auto", "--squash")
+    except AlreadyMerged as exc:
+        print(f"ship-finish: уже слит: {exc}")
+        return 0
     except UsageError as exc:
         print(f"ship-finish: {exc}", file=sys.stderr)
         return 2
