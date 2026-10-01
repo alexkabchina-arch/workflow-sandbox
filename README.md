@@ -14,3 +14,4 @@ python -m sandbox 3x100 1x49.90 --discount 10
 
 
 Контрольные сценарии канона: alexkabchina-arch/workflow#10.
+Коммит B после ревью — без отметки.
