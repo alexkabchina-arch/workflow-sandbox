@@ -15,6 +15,9 @@ def test_valid_input_prints_total(capsys):
         (["3"], "ожидался формат КОЛxЦЕНА, получено '3'"),
         (["3x100", "--discount", "101"], "скидка должна быть от 0 до 100 %"),
         (["1x0.005"], "цена точнее копейки: '0.005'"),
+        (["3x100", "--discount", "abc"], "argument --discount: invalid int value: 'abc'"),
+        (["-1x100"], "the following arguments are required: items"),
+        ([], "the following arguments are required: items"),
     ],
 )
 def test_bad_input_is_one_line_error_with_code_2(capsys, argv, reason):
