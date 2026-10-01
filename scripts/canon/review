@@ -32,33 +32,35 @@
 
 from __future__ import annotations
 
-import argparse
-import json
-import os
 import subprocess
 import sys
+import types
 from pathlib import Path, PurePosixPath
 
-MODEL = "claude-opus-5-5"
+
+def load_claude_run():
+    """Общий модуль канона рядом со скриптом — без правки `sys.path` и без `__pycache__`
+    в вендоренном `scripts/canon/` (его закоммитили бы на путь-ограничитель)."""
+    path = Path(__file__).resolve().parent / "claude_run.py"
+    module = types.ModuleType("canon_claude_run")
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    return module
+
+
+claude_run = load_claude_run()  # общий запуск дочернего `claude -p` с `verify`
+
+MODEL = claude_run.MODEL
 LEVEL = "xhigh"
-DEFAULT_BASE = "origin/main"
-SESSION_VARS = {"CANON_SESSION", "CANON_ENFORCE_STOP"}
 # Ревью Opus xhigh в разведке workflow#2 стоили 0,82–3,67 USD (в среднем 1,89); уточнить на пилоте.
-DEFAULT_BUDGET_USD = "10"
+DEFAULT_BUDGET_USD = claude_run.DEFAULT_BUDGET_USD
+UsageError = claude_run.UsageError
 
 DOC_SUFFIXES = {".md"}
 DOC_DIRS = {"docs"}
 # Инструкции агенту с командами: ревьюятся как код, хоть и `*.md`.
 AGENT_DIR = ".claude"
 OWNER_DIR = "owner"
-
-
-class ReviewError(Exception):
-    """Ревью не состоялось или неполное (код выхода 1)."""
-
-
-class UsageError(Exception):
-    """Ошибка аргументов или git (код выхода 2)."""
 
 
 def is_docs(path: str) -> bool:
@@ -82,20 +84,6 @@ def changed_files(base: str) -> list[str]:
     return [p for p in result.stdout.split("\0") if p]
 
 
-def claude_command(base: str, budget: str) -> list[str]:
-    return [
-        "claude",
-        "-p",
-        "--model",
-        MODEL,
-        "--max-budget-usd",
-        budget,
-        "--output-format",
-        "json",
-        f"/review {LEVEL} {base}...HEAD",
-    ]
-
-
 def budget_verdict(cost, budget: str) -> dict:
     """Перерасход по итоговой стоимости: предупреждение и признак ready-for-human."""
     limit = float(budget)
@@ -110,77 +98,17 @@ def budget_verdict(cost, budget: str) -> dict:
     }
 
 
-def child_env() -> dict:
-    """Окружение ревью без меток сессии тикета: Stop-хук не должен держать дочерний процесс."""
-    return {k: v for k, v in os.environ.items() if k not in SESSION_VARS}
-
-
 def run_review(report: Path, base: str, budget: str) -> dict:
     """Запускает ревью и сохраняет результат; возвращает вердикт по бюджету (budget_verdict)."""
-    try:
-        proc = subprocess.run(
-            claude_command(base, budget), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            env=child_env(),
-        )
-    except FileNotFoundError:
-        raise ReviewError("не найден `claude` на PATH") from None
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        tail = (proc.stderr or proc.stdout).strip()[-2000:]
-        raise ReviewError(f"claude вышел с кодом {proc.returncode} без JSON-результата: {tail}")
-
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    cost = data.get("total_cost_usd", "?")
-    subtype = data.get("subtype")
-    if subtype == "error_max_budget_usd":
-        raise ReviewError(
-            f"ревью упёрлось в предел --max-budget-usd {budget} (потрачено {cost} USD, "
-            "subtype error_max_budget_usd): отчёт неполный, находок нет. "
-            f"Сырой результат — {report}. "
-            "Дифф слишком велик для предела: разбить ветку или поднять предел решением владельца."
-        )
-    if subtype != "success" or data.get("is_error"):
-        raise ReviewError(
-            f"ревью завершилось ошибкой (subtype {subtype}, is_error {data.get('is_error')}, "
-            f"код {proc.returncode}); сырой результат — {report}"
-        )
-    text = data.get("result") or ""
-    models = sorted(data.get("modelUsage") or {})
-    if not models:
-        # `/review` — локальная команда: сбой до модели (например, протухшая авторизация)
-        # приходит как subtype success с пустым modelUsage и текстом ошибки в result.
-        raise ReviewError(
-            f"ревью не дошло до модели (modelUsage пуст): {text.strip()[:500] or 'без текста'}; "
-            f"сырой результат — {report}"
-        )
-    if MODEL not in models:
-        raise ReviewError(
-            f"ревью шло не на {MODEL}: modelUsage — {', '.join(models)}; сырой результат — {report}"
-        )
-    if not text.strip():
-        raise ReviewError(f"ревью вернуло пустой текст; сырой результат — {report}")
-    findings = report.with_suffix(".md")
-    findings.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
-    verdict = budget_verdict(cost, budget)
+    data = claude_run.run_claude([f"/review {LEVEL} {base}...HEAD"], report, budget)
+    verdict = budget_verdict(data.get("total_cost_usd"), budget)
     data["canon_review"] = verdict
-    report.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    claude_run.write_json(report, data)
     return verdict
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="review", description=__doc__.split("\n\n")[0])
-    parser.add_argument("report", type=Path, help="файл сырого результата (.json); рядом — .md")
-    parser.add_argument(
-        "--base", default=DEFAULT_BASE, help=f"база диффа (по умолчанию {DEFAULT_BASE})"
-    )
-    parser.add_argument(
-        "--max-budget-usd",
-        default=DEFAULT_BUDGET_USD,
-        help=f"предел объёма ревью в USD по прайсу API (по умолчанию {DEFAULT_BUDGET_USD})",
-    )
-    args = parser.parse_args(argv)
+    args = claude_run.parser("review", __doc__.split("\n\n")[0]).parse_args(argv)
     try:
         files = changed_files(args.base)
         code = [p for p in files if not is_docs(p)]
@@ -193,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as exc:
         print(f"review: {exc}", file=sys.stderr)
         return 2
-    except ReviewError as exc:
+    except claude_run.ChildError as exc:
         print(f"review: {exc}", file=sys.stderr)
         return 1
     cost = verdict["cost_usd"]

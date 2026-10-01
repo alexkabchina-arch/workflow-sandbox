@@ -33,9 +33,10 @@ python3.12 -m venv .venv
 
 Файлы канона `alexkabchina-arch/workflow` (`scripts/canon/`, `.claude/settings.base.json`,
 `.claude/settings.json`) вендорятся через `canon-sync` и записаны в `.canon.lock`: руками не правятся,
-шаг `check_lock` в CI это ловит. Проектные добавки к настройкам Claude Code — в
-`.claude/settings.project.json` (могут только дополнять базу канона); после их правки —
-`canon-sync` той же версии.
+шаг `check_lock` в CI это ловит. Линтер проекта их не проверяет (`extend-exclude` и
+`force-exclude` в `pyproject.toml`): качество кода канона — забота CI канона, у которого свои
+настройки. Проектные добавки к настройкам Claude Code — в `.claude/settings.project.json` (могут
+только дополнять базу канона); после их правки — `canon-sync` той же версии.
 
 ## Критичные зоны
 
