@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""ship-finish — конец `/ship`: push, PR, отметка ревью на head, авто-мёрж.
+
+    scripts/canon/ship-finish --title <заголовок> --body-file <тело.md>
+        [--review-skipped] [--ready-for-human <строка>] [--unconfirmed <причина>]
+
+Из корня проекта, на ветке с закоммиченной работой. По порядку:
+
+1. `git push -u origin HEAD` (без force) и сверка: ветка на сервере — ровно локальный HEAD.
+2. PR ветки: нет открытого — `gh pr create`, есть — `gh pr edit` (тело и заголовок обновляются).
+3. Отметка ревью — статус `review` = success на head-коммите (`gh api …/statuses/<sha>`);
+   уже стоит на этом коммите — не ставится второй раз. GitHub принимает статус только на коммит,
+   который уже на сервере, поэтому отметка — после push.
+4. `gh pr merge --auto --squash`, если авто-мёрж ещё не включён. Мёржа скрипт не ждёт.
+
+`--review-skipped` — ревью ошибок пропущено (дифф только из документов): отметка ставится с этим
+описанием. `--ready-for-human <строка>` — признак от ревью (перерасход вдвое): метка
+`ready-for-human` и комментарий со строкой, один раз на PR; отметка и авто-мёрж — как обычно.
+`--unconfirmed <причина>` — критерий не подтверждён: PR черновиком, авто-мёрж выключен, метка
+`ready-for-human`, комментарий с причиной, отметки нет.
+
+Повторный запуск идемпотентен: второго PR нет, отметка только на итоговом коммите.
+Код выхода 0 — готово; 1 — сбой push, `gh` или сверки; 2 — ошибка аргументов или состояния
+ветки (main, незакоммиченные правки), до любых действий.
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+
+CONTEXT = "review"
+LABEL = "ready-for-human"
+PROTECTED = {"main", "master"}
+PR_FIELDS = "number,url,isDraft,labels,autoMergeRequest"
+DESCRIPTION = "ревью ошибок пройдено (/ship)"
+DESCRIPTION_SKIPPED = "ревью ошибок не нужно: только документы (/ship)"
+
+
+class ShipError(Exception):
+    """Сбой push, gh или сверки (код выхода 1)."""
+
+
+class UsageError(Exception):
+    """Ошибка аргументов или состояния ветки (код выхода 2)."""
+
+
+def run(*cmd: str) -> str:
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise ShipError(f"{' '.join(cmd[:3])}: {(result.stderr or result.stdout).strip()}")
+    return result.stdout.strip()
+
+
+def check_branch() -> str:
+    try:
+        branch = run("git", "symbolic-ref", "--short", "HEAD")
+    except ShipError:
+        raise UsageError("HEAD не на ветке (detached)") from None
+    if branch in PROTECTED:
+        raise UsageError(f"ветка {branch}: /ship работает только из рабочей ветки")
+    if run("git", "status", "--porcelain", "--untracked-files=no"):
+        raise UsageError("есть незакоммиченные правки отслеживаемых файлов: сначала коммит")
+    return branch
+
+
+def push(branch: str) -> str:
+    sha = run("git", "rev-parse", "HEAD")
+    try:
+        run("git", "push", "-u", "origin", "HEAD")
+    except ShipError as exc:
+        raise ShipError(f"push отклонён: {exc}") from None
+    remote = run("git", "ls-remote", "origin", f"refs/heads/{branch}").split("\t")[0]
+    if remote != sha:
+        raise ShipError(f"после push ветка на сервере {remote[:7] or 'нет'}, локально {sha[:7]}")
+    return sha
+
+
+def find_pr(branch: str) -> dict | None:
+    found = json.loads(run(*f"gh pr list --head {branch} --state open --json {PR_FIELDS}".split()))
+    return found[0] if found else None
+
+
+def upsert_pr(branch: str, title: str, body_file: str, draft: bool) -> dict:
+    pr = find_pr(branch)
+    if pr is None:
+        cmd = ["gh", "pr", "create", "--head", branch, "--title", title, "--body-file", body_file]
+        run(*cmd, *(["--draft"] if draft else []))
+        pr = find_pr(branch)
+        if pr is None:
+            raise ShipError(f"PR ветки {branch} создан, но не найден")
+        return pr
+    number = str(pr["number"])
+    run("gh", "pr", "edit", number, "--title", title, "--body-file", body_file)
+    if draft and not pr["isDraft"]:
+        run("gh", "pr", "ready", number, "--undo")
+    elif not draft and pr["isDraft"]:
+        run("gh", "pr", "ready", number)
+    return pr
+
+
+def flag_for_human(pr: dict, text: str) -> None:
+    """Метка ready-for-human и комментарий — один раз на PR."""
+    if any(label["name"] == LABEL for label in pr.get("labels") or []):
+        return
+    number = str(pr["number"])
+    run("gh", "pr", "edit", number, "--add-label", LABEL)
+    run("gh", "pr", "comment", number, "--body", text)
+
+
+def mark_review(sha: str, description: str) -> bool:
+    """Ставит отметку ревью на коммит; False — она там уже стоит."""
+    statuses = json.loads(run("gh", "api", f"repos/{{owner}}/{{repo}}/commits/{sha}/statuses"))
+    latest = next((s for s in statuses if s.get("context") == CONTEXT), None)
+    if latest and latest.get("state") == "success":
+        return False
+    fields = ["state=success", f"context={CONTEXT}", f"description={description}"]
+    post = ["gh", "api", "-X", "POST", f"repos/{{owner}}/{{repo}}/statuses/{sha}"]
+    run(*post, *(arg for field in fields for arg in ("-f", field)))
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="ship-finish", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--title", required=True, help="заголовок PR")
+    parser.add_argument("--body-file", required=True, help="файл тела PR")
+    parser.add_argument("--review-skipped", action="store_true", help="дифф только из документов")
+    parser.add_argument(
+        "--ready-for-human", metavar="СТРОКА", help="признак от ревью для владельца"
+    )
+    parser.add_argument("--unconfirmed", metavar="ПРИЧИНА", help="критерий не подтверждён")
+    args = parser.parse_args(argv)
+    try:
+        branch = check_branch()
+        sha = push(branch)
+        draft = args.unconfirmed is not None
+        pr = upsert_pr(branch, args.title, args.body_file, draft)
+        number = str(pr["number"])
+        if draft:
+            if pr.get("autoMergeRequest"):
+                run("gh", "pr", "merge", number, "--disable-auto")
+            flag_for_human(pr, f"{LABEL}: не подтверждено — {args.unconfirmed}")
+            print(
+                f"ship-finish: {pr['url']} — черновик без отметки ревью, ждёт владельца ({LABEL})"
+            )
+            return 0
+        if args.ready_for_human:
+            flag_for_human(pr, f"{LABEL}: {args.ready_for_human}")
+        marked = mark_review(sha, DESCRIPTION_SKIPPED if args.review_skipped else DESCRIPTION)
+        if not pr.get("autoMergeRequest"):
+            run("gh", "pr", "merge", number, "--auto", "--squash")
+    except UsageError as exc:
+        print(f"ship-finish: {exc}", file=sys.stderr)
+        return 2
+    except ShipError as exc:
+        print(f"ship-finish: {exc}", file=sys.stderr)
+        return 1
+    mark = "поставлена" if marked else "уже стояла"
+    print(f"ship-finish: {pr['url']} — отметка ревью на {sha[:7]} {mark}, авто-мёрж включён")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
