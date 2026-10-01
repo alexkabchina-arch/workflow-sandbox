@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""session-run — стартовая команда сессии тикета: `session-start`, затем `claude` в worktree.
+
+    scripts/canon/session-run <номер тикета> [--headless [--max-budget-usd USD]] [-- <аргументы claude>]
+
+Тонкая оболочка: вся стартовая логика — в `session-start` (его можно вызвать и сам, первым шагом
+уже открытой сессии). Здесь только способ запуска: `claude` прямо в каталоге worktree (иначе
+`ccusage` припишет расход главному чекауту) с меткой сессии `CANON_SESSION` и промптом из
+`session-start`.
+
+- По умолчанию — интерактивно, без предела объёма: `--max-budget-usd` работает только с `-p`.
+- `--headless` — `claude -p --max-budget-usd <USD>` (по умолчанию 30 — около трёх медиан
+  тикета) и `--permission-mode auto`: спросить по ходу некого. Плюс `CANON_ENFORCE_STOP=1`:
+  Stop-хук `stop-check` держит сессию до PR или отчёта об остановке только здесь. Аргументы после `--` уходят в
+  `claude` как есть; свой `--permission-mode` там заменяет режим по умолчанию.
+
+Код выхода — код `session-start`, если он не 0; иначе — код `claude`.
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+START = Path(__file__).resolve().parent / "session-start"
+DEFAULT_BUDGET = "30"
+HEADLESS_MODE = "auto"
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    extra = []
+    if "--" in argv:
+        at = argv.index("--")
+        argv, extra = argv[:at], argv[at + 1 :]
+    parser = argparse.ArgumentParser(prog="session-run", description=__doc__.split("\n\n")[0])
+    parser.add_argument("ticket", help="номер тикета")
+    parser.add_argument("--headless", action="store_true", help="claude -p с пределом объёма")
+    parser.add_argument("--max-budget-usd", metavar="USD", help=f"предел (по умолчанию {DEFAULT_BUDGET})")
+    args = parser.parse_args(argv)
+    if args.max_budget_usd and not args.headless:
+        print("session-run: --max-budget-usd работает только с --headless (claude -p)", file=sys.stderr)
+        return 2
+
+    result = subprocess.run(
+        [sys.executable, str(START), args.ticket, "--json"], stdout=subprocess.PIPE, text=True
+    )
+    if result.returncode != 0:
+        return result.returncode
+    lines = result.stdout.strip().splitlines()
+    print("\n".join(lines[:-1]))
+    plan = json.loads(lines[-1])
+
+    cmd = ["claude"]
+    if args.headless:
+        cmd += ["-p", "--max-budget-usd", args.max_budget_usd or DEFAULT_BUDGET]
+        if "--permission-mode" not in extra:
+            cmd += ["--permission-mode", HEADLESS_MODE]
+    # `--` перед промптом: вариадические флаги (`--allowedTools`, `--add-dir`) иначе съедят его.
+    cmd += [*extra, "--", plan["prompt"]]
+    env = {**os.environ, "CANON_SESSION": plan["session"]}
+    env.pop("CANON_ENFORCE_STOP", None)
+    if args.headless:
+        # Stop-хук (`stop-check`) держит только headless-сессию: в интерактивной владелец рядом.
+        env["CANON_ENFORCE_STOP"] = "1"
+    sys.stdout.flush()
+    return subprocess.run(cmd, cwd=plan["worktree"], env=env).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

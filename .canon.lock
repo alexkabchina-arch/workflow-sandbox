@@ -1,16 +1,19 @@
 {
   "canon": "alexkabchina-arch/workflow",
-  "version": "v2026.10.01.5",
-  "commit": "45ed7f706f650704b460e61997488adbfc714007",
+  "version": "v2026.10.01.6",
+  "commit": "10fd8b2987f2e41bfcf890002ac4eedd7f72e314",
   "files": {
-    ".claude/settings.base.json": "sha256:4f856507d20b275448fc211a529aae780c5384cb92d833352b681dd8a84f0023",
-    ".claude/settings.json": "sha256:4f856507d20b275448fc211a529aae780c5384cb92d833352b681dd8a84f0023",
+    ".claude/settings.base.json": "sha256:d19308019c4dc286a5264ae1b8fb0c07b11440ece35015d8bbaa1549ecb4069a",
+    ".claude/settings.json": "sha256:d19308019c4dc286a5264ae1b8fb0c07b11440ece35015d8bbaa1549ecb4069a",
     ".claude/skills/ship/SKILL.md": "sha256:0110c6eb1e67aa10e54162bf63704cad8d9ec37fbea052d2ce8a0f0cb5330546",
     ".github/workflows/dependabot-review.yml": "sha256:e635bddc5536087dfaa3066f39a958914f06f6f7135f95d497c56e6683e60b36",
     ".github/workflows/restricted-paths.yml": "sha256:09160e46bb0bdeee4d7ae0d14db116be9fa700676b36fc739d5b1885985b3561",
     "scripts/canon/check_lock.py": "sha256:a31c03c155df8377e54b2e6f173fbdd9eea56efba766ee8e947a18c04c1de015",
     "scripts/canon/restricted_paths.py": "sha256:b7d8c3609efe321d8f376c2ed51b88e11ea0f4480e1614e0389f0f4e5f143aaa",
-    "scripts/canon/review": "sha256:41a8a038da56bfbb837d9cc8c880cd52d4989b62153327ff89a045e23d6015bb",
-    "scripts/canon/ship-finish": "sha256:3de15eb6b03d25d70777706ca95847c68f8928291ac8621b0faa5dce11097887"
+    "scripts/canon/review": "sha256:a904c88c8d9856924f84914b0117e7c71a07d1c65b4af5579adfea6c1cb6477c",
+    "scripts/canon/session-run": "sha256:659b91fa68cdaa42070fb9bc85b613b026e71a160c843d31437b2d3fcb140eee",
+    "scripts/canon/session-start": "sha256:522fc87d35fe68bfee5a8cce75d37785ee6b00027ecf9764544988a463eddab3",
+    "scripts/canon/ship-finish": "sha256:3de15eb6b03d25d70777706ca95847c68f8928291ac8621b0faa5dce11097887",
+    "scripts/canon/stop-check": "sha256:ec70160d907cfce003fd87f068f54cdea442d7ff40581a31b0ca46647816f376"
   }
 }
