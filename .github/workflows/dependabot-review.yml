@@ -1,11 +1,18 @@
 # Вендорен из канона alexkabchina-arch/workflow (`canon-sync`, `.canon.lock`): руками не править.
 #
-# Отметка ревью для Dependabot minor/patch: статус `review` = success на head-коммите PR и
-# авто-мёрж — PR сливается после зелёного CI, как PR агента после `/ship`. Отметка ревью обязательна
-# для всех, исключений в правилах защиты нет; minor/patch от Dependabot ревью ошибок не проходят,
-# их проверяет CI. Major отметку не получает — обычный путь (тикет, сессия, `/ship`).
+# Отметка ревью для Dependabot patch: статус `review` = success на head-коммите PR и авто-мёрж —
+# PR сливается после зелёного CI, как PR агента после `/ship`. Отметка ревью обязательна для всех,
+# исключений в правилах защиты нет; patch от Dependabot ревью ошибок не проходит, его проверяет CI.
+# Minor и major отметку не получают — обычный путь (тикет, сессия, `/ship`): для пакетов 0.x и
+# версий не по semver (CalVer, теги Docker) minor — ломающее изменение (ozon PR #595: fastapi
+# 0.136→0.141 сломал роутинг, CI этого не поймал).
 #
-# `pull_request_target`: workflow берётся из базовой ветки, код PR не выгружается и не исполняется;
+# Мёрж — только если на базе PR действует обязательная проверка `review` (набор `protect-main`):
+# `--auto` на готовом к мёржу PR сливает сразу, а workflow приходит с `canon-sync` раньше, чем
+# `protect-main` заводит правила. Без неё (нет правил, база — другая ветка, режим `--owner-merges`)
+# шаг падает и ничего не ставит; `--match-head-commit` — мёрж только проверенного коммита.
+#
+# `pull_request_target`: workflow берётся из ветки по умолчанию, код PR не выгружается и не исполняется;
 # на `pull_request` у запусков Dependabot токен только на чтение — статус не поставить.
 # Метаданные — `dependabot/fetch-metadata`: падает, если PR открыл не Dependabot или в нём есть чужие
 # коммиты, — тогда отметки нет. Правка поверх PR Dependabot (push не от Dependabot) отметки не
@@ -13,7 +20,9 @@
 #
 # Мёрж, включённый токеном workflow, не запускает workflow на push в `main` (ограничение
 # GITHUB_TOKEN): CI на `main` после такого мёржа не идёт, PR проверен своим прогоном; всё, что
-# проект делает по push в `main` (в vps — `build-images`), ждёт следующего обычного мёржа.
+# проект делает по push в `main`, ждёт следующего обычного мёржа. Хуже всего — workflow с фильтром
+# по путям на lock-файлы, их меняет почти только Dependabot: в vps `build-images` и `warm-deps-cache`
+# (`pnpm-lock.yaml`), в ozon `cache-warm` — они фактически не запускаются (чек-лист переноса).
 # PR Dependabot на `.github/` (экосистема `github-actions`) упирается в `restricted-paths` и ждёт
 # владельца, как любой PR на путь-ограничитель.
 name: dependabot-review
@@ -35,18 +44,25 @@ jobs:
     steps:
       - name: Метаданные Dependabot
         id: meta
-        uses: dependabot/fetch-metadata@v3
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
       - name: Отметка ревью и авто-мёрж
         if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-minor' ||
           steps.meta.outputs.update-type == 'version-update:semver-patch'
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.event.pull_request.head.sha }}
           UPDATE: ${{ steps.meta.outputs.update-type }}
+          BASE: ${{ github.event.pull_request.base.ref }}
         run: |
+          review=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$BASE" --jq '[.[]
+            | select(.type == "required_status_checks")
+            | .parameters.required_status_checks[] | select(.context == "review")] | length')
+          if [ "$review" = 0 ]; then
+            echo "::error::на $BASE не обязательна проверка review — сначала protect-main"
+            exit 1
+          fi
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
             -f state=success -f context=review \
             -f description="Dependabot ${UPDATE#version-update:semver-}: ревью ошибок не нужно, проверяет CI"
-          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --auto --squash
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --auto --squash --match-head-commit "$SHA"

@@ -6,25 +6,49 @@
 Из корня проекта, на закоммиченной ветке. Агент сам не может вызвать скилл `review` — только
 набранной командой, поэтому скрипт запускает дочерний процесс обычным вызовом, не в фоне:
 
-    claude -p --model claude-opus-5-5 --max-budget-usd <предел> --output-format json \\
-        "/review xhigh origin/main...HEAD" < /dev/null
+    claude -p --model claude-opus-5-5 --max-budget-usd <предел> --output-format stream-json \\
+        --verbose --json-schema <схема находок> "/review xhigh origin/main...HEAD" < /dev/null
 
 Уровень и модель одни для любого диффа (итог разведки workflow#2). Дифф только из документов
 (`docs/**`, `*.md`) — ревью пропускается; конфиги, CI и всё под `.claude/` на любой глубине
 (настройки, скиллы, агенты, правила — инструкции агенту с командами, хоть и `*.md`) ревьюятся,
-в каноне — и `owner/` (личный слой: агенты, скиллы, хуки).
-В `<отчёт.json>` — сырой результат (`modelUsage`, стоимость), рядом `<отчёт>.md` — текст
-находок.
+как и `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md` на любой глубине и в любом регистре
+и профиль `docs/agents/profile.md`; в каноне — и `owner/` (личный слой: агенты, скиллы, хуки).
+Почему так (#70, проверено вживую 02.10.2026, Claude Code 2.1.286). Находки `/review` отдаёт
+своим инструментом `ReportFindings`, последняя реплика (`result`) — только сводка «подробности
+выше»: брать её — терять находки. С `--output-format json` `/review` уходит в локальный режим
+(`local_command`, 0 ходов, `result` «Command completed») — итог мимо `claude -p` целиком;
+с `stream-json --verbose` идёт обычными ходами. Поэтому — поток, итог из события `result`, и
+схема (`--json-schema`, список `findings`): CLI после ревью требует ответ по ней — так «находок
+нет» (пустой список) отличимо от сбоя. Сами находки — из последнего принятого вызова
+`ReportFindings` верхнего уровня (оригинал; отклонённый вход модель повторяет — вызовы не
+склеиваются); нет его — из ответа по схеме (пересказ модели) со строкой
+`review: предупреждение: находки — пересказ …`. Источник — `canon_review.findings_source`.
+Ответа по схеме нет (CLI его требует всегда) или без оригинала он не по схеме, локальный режим —
+ревью не состоялось (код 1), ответ — в `<отчёт>.raw.md`; туда же — находки `ReportFindings`,
+если прогон оборвался после него.
+В `<отчёт.json>` — сырой результат (`modelUsage`, стоимость, `structured_output`), рядом
+`<отчёт>.md` — находки списком (его читает `/ship`). Пропуск тоже пишет `<отчёт.json>` (без
+`.md`). В блоке `canon_review` отчёта — что проверено: `base` (как передан), `base_sha` (начало
+диффа — merge-base базы и HEAD), `head` (HEAD на старте ревью), `skipped`, у состоявшегося
+ревью — `findings` (число находок) и `findings_source`. По ним `ship-finish` ставит отметку
+ревью: отчёт должен доходить ровно до запушенного head; у несостоявшегося ревью блока нет —
+отметки по нему нет.
+
+Прицельное повторное ревью исправлений — `--base <head прошлого отчёта>`: дифф только от него.
 
 Код выхода 0 — ревью готово или пропущено; 1 — ревью не состоялось или неполное (сбой `claude`,
-пустой `modelUsage`, не та модель), причина в stderr; 2 — ошибка аргументов или git.
+пустой `modelUsage`, не та модель, локальный режим, нет ответа по схеме или без оригинала
+находок он не по схеме), причина в stderr; 2 — ошибка аргументов или git.
 
-`--max-budget-usd` на `/review` не срабатывает: это локальная команда вне цикла ходов
-(`num_turns` 0), а предел проверяется между ходами (проверено вживую 01.10.2026). Остановить ревью
-на лету нельзя, поэтому дороже предела — не ошибка, а предупреждение по итоговой стоимости
-(решение владельца): строка `review: предупреждение: …` для тела PR, при перерасходе вдвое и
-больше — ещё строка `review: ready-for-human: …` (её разбирает `/ship`). То же — в блоке
-`canon_review` отчёта.json.
+Предел `--max-budget-usd` проверяется между ходами. 01.10.2026 `/review` шёл локальной командой
+(`num_turns` 0, вывод `json`), и предел не срабатывал; с `stream-json` (#70) ревью идёт ходами,
+и предел может остановить его посреди прогона — `error_max_budget_usd`, код 1: это жёсткий потолок
+трат, а не сбой (решение `docs/decisions/2026-10-02-review-budget-hard-cap.md` в каноне); находки,
+выданные до обрыва, — в `<отчёт>.raw.md`. Дороже предела без остановки — не ошибка, а
+предупреждение по итоговой стоимости (решение владельца): строка `review: предупреждение: …` для
+тела PR, при перерасходе вдвое и больше — ещё строка `review: ready-for-human: …` (её разбирает
+`/ship`). То же — в блоке `canon_review` отчёта.json.
 Вызывающему нужен таймаут Bash больше времени ревью (`BASH_MAX_TIMEOUT_MS` в настройках канона).
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
 Только стандартная библиотека Python 3.
@@ -32,6 +56,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import types
@@ -59,15 +84,75 @@ DOC_DIRS = {"docs"}
 # Инструкции агенту с командами: ревьюятся как код, хоть и `*.md`.
 AGENT_DIR = ".claude"
 OWNER_DIR = "owner"
+# Регистр не важен: на macOS `claude.md` открывается как `CLAUDE.md`.
+AGENT_FILES = {"claude.md", "claude.local.md", "agents.md"}
+PROFILE = ("docs", "agents", "profile.md")
+
+FINDING = {
+    "type": "object",
+    "properties": {
+        "file": {"type": "string", "description": "путь файла от корня репозитория"},
+        "line": {"type": "integer", "description": "строка, к которой относится находка"},
+        "summary": {"type": "string", "description": "в чём ошибка, одно предложение"},
+        "failure_scenario": {
+            "type": "string",
+            "description": "конкретный вход или состояние → неверный результат или сбой",
+        },
+        "category": {"type": "string", "description": "вид: correctness, security и т. п."},
+    },
+    "required": ["file", "summary"],
+}
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": FINDING,
+            "description": "Все находки ревью, без отбора, самые серьёзные первыми; "
+            "нет находок — пустой список",
+        },
+    },
+    "required": ["findings"],
+    "additionalProperties": False,
+}
+REPORT_TOOL = "ReportFindings"  # инструмент, которым `/review` отдаёт находки
+RETELLING = "structured_output"  # находки пересказаны моделью в ответе по схеме
 
 
 def is_docs(path: str) -> bool:
     p = PurePosixPath(path)
-    if AGENT_DIR in p.parts[:-1] or (p.parts and p.parts[0] == OWNER_DIR):
+    # Инструкции агенту — без учёта регистра (на macOS `.Claude/` — тот же `.claude/`);
+    # каталог документов — с точным: ошибка только в сторону лишнего ревью.
+    lower = PurePosixPath(path.lower())
+    if AGENT_DIR in lower.parts[:-1] or (lower.parts and lower.parts[0] == OWNER_DIR):
+        return False
+    if lower.name in AGENT_FILES or lower.parts[-3:] == PROFILE:
         return False
     if p.parts and p.parts[0] in DOC_DIRS:
         return True
     return p.suffix.lower() in DOC_SUFFIXES
+
+
+def git_sha(*args: str) -> str:
+    result = subprocess.run(["git", *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise UsageError(f"git {' '.join(args)}: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def reviewed_range(base: str) -> dict:
+    """Что покрывает ревью `base...HEAD`: для сверки в `ship-finish`.
+
+    Незакоммиченные правки — отказ: встроенный `/review` смотрит и их, и отчёт о `head` описал бы
+    не тот код, что проверен.
+    """
+    if git_sha("status", "--porcelain", "--untracked-files=no"):
+        raise UsageError("есть незакоммиченные правки отслеживаемых файлов: сначала коммит")
+    return {
+        "base": base,
+        "base_sha": git_sha("merge-base", base, "HEAD"),
+        "head": git_sha("rev-parse", "HEAD"),
+    }
 
 
 def changed_files(base: str) -> list[str]:
@@ -82,42 +167,177 @@ def changed_files(base: str) -> list[str]:
     return [p for p in result.stdout.split("\0") if p]
 
 
-def run_review(report: Path, base: str, budget: str) -> dict:
-    """Запускает ревью и сохраняет результат; возвращает вердикт по бюджету."""
-    data = claude_run.run_claude([f"/review {LEVEL} {base}...HEAD"], report, budget)
+def is_finding(item) -> bool:
+    return isinstance(item, dict) and all(
+        isinstance(item.get(key), str) and item[key].strip() for key in ("file", "summary")
+    )
+
+
+def tool_blocks(event: dict, kind: str) -> list[dict]:
+    """Блоки `kind` (`tool_use`, `tool_result`) события верхнего уровня, не сабагента."""
+    if event.get("parent_tool_use_id"):
+        return []
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    blocks = content if isinstance(content, list) else []
+    return [b for b in blocks if isinstance(b, dict) and b.get("type") == kind]
+
+
+def reported(events: list[dict]) -> list[dict] | None:
+    """Находки принятых вызовов `ReportFindings` верхнего уровня, без повторов; нет их — None.
+
+    Вход, отклонённый инструментом (`tool_result` с `is_error`), модель повторяет — такой вызов
+    не считается (иначе находки задвоятся, живой прогон #70). Принятые вызовы склеиваются: модель
+    может разнести находки по двум; одинаковые (`file`, `line`, `summary`) — один раз. Находки не
+    по схеме пропускаются.
+    """
+    rejected = {
+        block.get("tool_use_id")
+        for event in events
+        if event.get("type") == "user"
+        for block in tool_blocks(event, "tool_result")
+        if block.get("is_error")
+    }
+    result: dict[tuple, dict] = {}
+    accepted = False
+    for event in events:
+        if event.get("type") != "assistant":
+            continue
+        for block in tool_blocks(event, "tool_use"):
+            if block.get("name") != REPORT_TOOL or block.get("id") in rejected:
+                continue
+            given = block.get("input")
+            found = given.get("findings") if isinstance(given, dict) else None
+            if not isinstance(found, list):
+                continue
+            accepted = True
+            for item in filter(is_finding, found):
+                key = (item["file"].strip(), item.get("line"), item["summary"].strip())
+                result.setdefault(key, item)
+    return list(result.values()) if accepted and result else None
+
+
+def findings(data: dict, events: list[dict], report: Path) -> tuple[list[dict], str]:
+    """Находки и их источник: оригинал `ReportFindings`, иначе ответ по схеме (пересказ).
+
+    Оригинала нет, а ответ по схеме не по ней — `ChildError`, ответ — в `.raw.md`.
+    """
+    original = reported(events)
+    if original is not None:
+        return original, REPORT_TOOL
+    output = data["structured_output"]
+    items = output.get("findings")
+    if isinstance(items, list) and all(is_finding(item) for item in items):
+        return items, RETELLING
+    raw = claude_run.sibling(report, ".raw.md")
+    claude_run.write_text(raw, json.dumps(output, ensure_ascii=False, indent=2))
+    raise claude_run.ChildError(
+        "ответ не по схеме (нужен список findings, у каждой находки "
+        f"непустые file и summary) — находки не распознаны; ответ — {raw}"
+    )
+
+
+def keep_reported(events: list[dict], report: Path) -> str:
+    """Несостоявшийся прогон успел вызвать `ReportFindings` — оплаченные находки в `.raw.md`."""
+    original = reported(events)
+    if original is None:
+        return ""
+    raw = claude_run.sibling(report, ".raw.md")
+    raw.parent.mkdir(parents=True, exist_ok=True)  # поток мог оборваться до записи отчёта
+    before = raw.read_text(encoding="utf-8") if raw.exists() else ""
+    tail = f"\n\n## Последняя реплика\n\n{before}" if before.strip() else ""
+    claude_run.write_text(raw, render(original) + tail)
+    return f"; находки ReportFindings ({len(original)}) — в {raw}"
+
+
+def render(items: list[dict]) -> str:
+    """Находки списком в markdown — для `<отчёт>.md`."""
+    if not items:
+        return "# Ревью ошибок\n\nНаходок нет."
+    lines = [f"# Ревью ошибок\n\nНаходок: {len(items)}.\n"]
+    for number, item in enumerate(items, 1):
+        line = item.get("line")
+        where = f"{item['file']}:{line}" if isinstance(line, int) else item["file"]
+        kind = item.get("category")
+        tag = f" ({kind.strip()})" if isinstance(kind, str) and kind.strip() else ""
+        lines.append(f"{number}. `{where}`{tag} — {item['summary'].strip()}")
+        scenario = item.get("failure_scenario")
+        if isinstance(scenario, str) and scenario.strip():
+            lines.append(f"   Сценарий: {scenario.strip()}")
+    return "\n".join(lines)
+
+
+def run_review(report: Path, base: str, budget: str, scope: dict) -> dict:
+    """Запускает ревью и сохраняет результат; возвращает блок `canon_review` отчёта.
+
+    Не состоялось (нет ответа по схеме, а без оригинала `ReportFindings` — и ответ не по схеме) —
+    `ChildError`: отчёт без `canon_review`, отметки по нему нет.
+    """
+    events: list[dict] = []
+    try:
+        data = claude_run.run_claude(
+            [f"/review {LEVEL} {base}...HEAD"], report, budget, SCHEMA, events
+        )
+        items, source = findings(data, events, report)
+    except claude_run.ChildError as exc:
+        kept = keep_reported(events, report)
+        raise claude_run.ChildError(f"ревью не состоялось: {exc}{kept}") from None
+    claude_run.write_text(report.with_suffix(".md"), render(items))
     verdict = claude_run.budget_verdict(data.get("total_cost_usd"), budget, "ревью стоило")
-    data["canon_review"] = verdict
+    data["canon_review"] = {
+        **scope,
+        "skipped": False,
+        "findings": len(items),
+        "findings_source": source,
+        **verdict,
+    }
     claude_run.write_json(report, data)
-    return verdict
+    return data["canon_review"]
+
+
+def write_skipped(report: Path, scope: dict, files: list[str]) -> None:
+    """Отчёт о пропуске: по нему `ship-finish` ставит отметку «только документы»."""
+    claude_run.set_aside(report)
+    report.parent.mkdir(parents=True, exist_ok=True)
+    claude_run.write_json(report, {"canon_review": {**scope, "skipped": True, "files": files}})
 
 
 def main(argv: list[str] | None = None) -> int:
     args = claude_run.parser("review", __doc__.split("\n\n")[0]).parse_args(argv)
     try:
         files = changed_files(args.base)
+        scope = reviewed_range(args.base)
         code = [p for p in files if not is_docs(p)]
         if not code:
+            write_skipped(args.report, scope, files)
             print(
-                f"review: пропущено — в {args.base}...HEAD только документы (файлов: {len(files)})"
+                f"review: пропущено — в {args.base}...HEAD только документы "
+                f"(файлов: {len(files)}); отчёт — {args.report}"
             )
             return 0
-        verdict = run_review(args.report, args.base, args.max_budget_usd)
+        result = run_review(args.report, args.base, args.max_budget_usd, scope)
     except UsageError as exc:
         print(f"review: {exc}", file=sys.stderr)
         return 2
     except claude_run.ChildError as exc:
         print(f"review: {exc}", file=sys.stderr)
         return 1
-    cost = verdict["cost_usd"]
+    cost = result["cost_usd"]
     print(
         f"review: /review {LEVEL} на {MODEL} готово (файлов кода: {len(code)}, "
-        f"{'?' if cost is None else f'{cost:.2f}'} USD); находки — {args.report.with_suffix('.md')}"
+        f"{'?' if cost is None else f'{cost:.2f}'} USD, находок: {result['findings']}); "
+        f"находки — {args.report.with_suffix('.md')}"
     )
-    if verdict["over_budget"]:
-        print(f"review: предупреждение: {verdict['warning']}")
-    if verdict["ready_for_human"]:
+    if result["findings_source"] == RETELLING:
         print(
-            f"review: ready-for-human: {verdict['warning']} — перерасход вдвое и больше, "
+            f"review: предупреждение: находки — пересказ модели по схеме (вызова {REPORT_TOOL} "
+            "в потоке нет): список мог сократиться"
+        )
+    if result["over_budget"]:
+        print(f"review: предупреждение: {result['warning']}")
+    if result["ready_for_human"]:
+        print(
+            f"review: ready-for-human: {result['warning']} — перерасход вдвое и больше, "
             "сессии тикета поставить ready-for-human с этой строкой"
         )
     return 0

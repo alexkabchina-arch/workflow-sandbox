@@ -1,12 +1,17 @@
 """claude_run — общее для скриптов канона, запускающих дочерний `claude -p` (`review`, `verify`).
 
+`session-run` берёт отсюда только проверку предела `budget_usd`.
+
 Дочерний процесс — без меток сессии тикета (иначе Stop-хук `stop-check` держал бы его), на
-закреплённой модели, с аргументами списком (без оболочки) и пустым stdin. Результат
-`--output-format json` сохраняется в `<отчёт.json>`, текст `result` — рядом в `<отчёт>.md`;
-со схемой (`--json-schema`) ответ — в поле `structured_output`, а `.md` пишет вызывающий из его
-полей. Запуск не состоялся (сбой `claude`, выход по бюджету, ошибка, пустой `modelUsage`, не та
-модель; без схемы — пустой `result`, со схемой — нет `structured_output`) — `ChildError` с
-причиной, а непустой `result` такого прогона — в `<отчёт>.raw.md` для разбора.
+закреплённой модели, с аргументами списком (без оболочки) и пустым stdin. Итог — всегда по
+схеме (`--json-schema`): ответ — в поле `structured_output`, `.md` пишет вызывающий (из него или,
+как `review`, из событий потока).
+Текст `result` — только последняя реплика: у `/review` это сводка без находок (#70), поэтому
+итогом он не служит. Вывод — `json` или поток `stream-json` (у `review`: с `json` `/review`
+уходит в локальный режим мимо `claude -p`); итог — объект `result`, сохраняется в
+`<отчёт.json>`. Запуск не состоялся (сбой `claude`, выход по бюджету, ошибка, пустой
+`modelUsage`, не та модель, локальный режим, нет `structured_output`) — `ChildError` с причиной,
+а непустой `result` такого прогона — в `<отчёт>.raw.md` для разбора.
 
 `<отчёт>.md` бывает только у состоявшегося прогона. Перед новым запуском он и его `.json`
 переносятся в `<отчёт>.prev.md` и `.prev.json`: под основным именем не остаётся старый итог, а
@@ -123,17 +128,20 @@ def budget_verdict(cost, budget: str, what: str) -> dict:
     }
 
 
-def run_claude(args: list[str], report: Path, budget: str, schema: dict | None = None) -> dict:
-    """Запускает `claude -p --model MODEL --max-budget-usd <budget> --output-format json <args>`.
+def run_claude(
+    args: list[str], report: Path, budget: str, schema: dict, events: list | None = None
+) -> dict:
+    """Запускает `claude -p --model MODEL --max-budget-usd <budget> --output-format json
+    --json-schema <schema> <args>`.
 
-    Сохраняет сырой результат в `report`; возвращает разобранный JSON. Без схемы текст `result`
-    пишется в `report.with_suffix(".md")`. Со схемой — `--json-schema`, ответ в
+    Сохраняет сырой результат в `report`; возвращает разобранный JSON с ответом в
     `structured_output` (объект), `.md` пишет вызывающий. Не состоялось — `ChildError`, непустой
     `result` — в `<отчёт>.raw.md`.
+
+    С `events` (список) — `--output-format stream-json --verbose`: события потока дописываются в
+    `events`, итог — последнее событие `result` (тот же объект, что у `json`).
     """
-    schema_args = (
-        [] if schema is None else ["--json-schema", json.dumps(schema, ensure_ascii=False)]
-    )
+    output = ["json"] if events is None else ["stream-json", "--verbose"]
     command = [
         "claude",
         "-p",
@@ -142,8 +150,9 @@ def run_claude(args: list[str], report: Path, budget: str, schema: dict | None =
         "--max-budget-usd",
         budget,
         "--output-format",
-        "json",
-        *schema_args,
+        *output,
+        "--json-schema",
+        json.dumps(schema, ensure_ascii=False),
         *args,
     ]
     set_aside(report)
@@ -160,9 +169,15 @@ def run_claude(args: list[str], report: Path, budget: str, schema: dict | None =
     except FileNotFoundError:
         raise ChildError("не найден `claude` на PATH") from None
     try:
-        data = json.loads(proc.stdout)
+        data = json.loads(proc.stdout) if events is None else last_result(proc.stdout, events)
     except json.JSONDecodeError:
-        tail = (proc.stderr or proc.stdout).strip()[-2000:]
+        # Причина бывает в любом из потоков: stderr не должен затирать stdout. В потоке
+        # `stream-json` события — не причина: из stdout берутся только строки не JSON.
+        out = proc.stdout if events is None else "\n".join(noise(proc.stdout)) or proc.stdout
+        streams = (("stdout", out), ("stderr", proc.stderr))
+        tail = "; ".join(
+            f"{name}: {text.strip()[-1000:]}" for name, text in streams if text.strip()
+        )
         raise ChildError(
             f"claude вышел с кодом {proc.returncode} без JSON-результата: {tail}"
         ) from None
@@ -172,7 +187,7 @@ def run_claude(args: list[str], report: Path, budget: str, schema: dict | None =
     report.parent.mkdir(parents=True, exist_ok=True)
     write_json(report, data)
     try:
-        return check_result(data, report, budget, schema, proc.returncode)
+        return check_result(data, report, budget, proc.returncode)
     except ChildError as exc:
         text = data.get("result")
         if isinstance(text, str) and text.strip():
@@ -181,8 +196,41 @@ def run_claude(args: list[str], report: Path, budget: str, schema: dict | None =
         raise
 
 
-def check_result(data: dict, report: Path, budget: str, schema: dict | None, code: int) -> dict:
-    """Прогон состоялся — `data` (без схемы `.md` записан); иначе `ChildError`."""
+def stream_lines(stdout: str) -> list[str]:
+    # Только по `\n`: `splitlines()` режет и по U+2028, который Node в JSON не экранирует.
+    return [line for line in stdout.split("\n") if line.strip()]
+
+
+def parse(line: str):
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+def noise(stdout: str) -> list[str]:
+    """Строки потока не JSON — текст ошибки CLI, а не события."""
+    return [line for line in stream_lines(stdout) if parse(line) is None]
+
+
+def last_result(stdout: str, events: list) -> dict:
+    """События `stream-json` — в `events`; итог — последнее событие `result`.
+
+    Строки не JSON (шум, текст ошибки) пропускаются; нет события `result` — `JSONDecodeError`,
+    как у сломанного вывода `json`.
+    """
+    for line in stream_lines(stdout):
+        event = parse(line)
+        if isinstance(event, dict):
+            events.append(event)
+    results = [event for event in events if event.get("type") == "result"]
+    if not results:
+        raise json.JSONDecodeError("нет события result", stdout, 0)
+    return results[-1]
+
+
+def check_result(data: dict, report: Path, budget: str, code: int) -> dict:
+    """Прогон состоялся и дал ответ по схеме — `data`; иначе `ChildError`."""
     cost = data.get("total_cost_usd", "?")
     subtype = data.get("subtype")
     if subtype == "error_max_budget_usd":
@@ -210,14 +258,15 @@ def check_result(data: dict, report: Path, budget: str, schema: dict | None, cod
         raise ChildError(
             f"шло не на {MODEL}: modelUsage — {', '.join(models)}; сырой результат — {report}"
         )
-    if schema is not None:
-        if not isinstance(data.get("structured_output"), dict):
-            raise ChildError(
-                "нет ответа по схеме --json-schema (structured_output) — итог не распознан; "
-                f"сырой результат — {report}"
-            )
-        return data
-    if not text.strip():
-        raise ChildError(f"пустой текст результата; сырой результат — {report}")
-    write_text(report.with_suffix(".md"), text)
+    if data.get("local_command") and not data.get("num_turns"):
+        # Так `/review` ведёт себя с `--output-format json`: итог уходит мимо `claude -p`.
+        raise ChildError(
+            f"команда отработала локально (local_command {data['local_command']}, 0 ходов): "
+            f"итог ушёл мимо claude -p, ответа по схеме нет; сырой результат — {report}"
+        )
+    if not isinstance(data.get("structured_output"), dict):
+        raise ChildError(
+            "нет ответа по схеме --json-schema (structured_output) — итог не распознан; "
+            f"сырой результат — {report}"
+        )
     return data

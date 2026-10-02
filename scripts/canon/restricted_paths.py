@@ -10,7 +10,7 @@
 авто-мёрж не сработает, сливает владелец кнопкой с обходом правил.
 
 Запускается workflow `restricted-paths` на `pull_request_target`: скрипт и `CODEOWNERS` — из
-базовой ветки, код PR не исполняется. Только стандартная библиотека Python 3.
+ветки по умолчанию, код PR не исполняется. Только стандартная библиотека Python 3.
 """
 
 from __future__ import annotations
@@ -53,8 +53,8 @@ def pattern_regex(pattern: str) -> re.Pattern:
     return re.compile(prefix + "".join(out) + suffix)
 
 
-def parse_codeowners(text: str) -> list[tuple[re.Pattern, bool]]:
-    """Правила по порядку: (шаблон, есть ли владельцы)."""
+def parse_codeowners(text: str) -> list[tuple[re.Pattern, re.Pattern, bool]]:
+    """Правила по порядку: (шаблон, он же без учёта регистра, есть ли владельцы)."""
     rules = []
     for line in text.splitlines():
         line = line.strip()
@@ -66,15 +66,27 @@ def parse_codeowners(text: str) -> list[tuple[re.Pattern, bool]]:
             if token.startswith("#"):
                 break
             owners.append(token)
-        rules.append((pattern_regex(tokens[0]), bool(owners)))
+        regex = pattern_regex(tokens[0])
+        rules.append((regex, re.compile(regex.pattern, re.IGNORECASE), bool(owners)))
     return rules
 
 
-def is_restricted(path: str, rules: list[tuple[re.Pattern, bool]]) -> bool:
+def is_restricted(path: str, rules: list[tuple[re.Pattern, re.Pattern, bool]]) -> bool:
+    """Задет ли путь-ограничитель; последнее совпавшее правило побеждает.
+
+    На macOS (APFS) `claude.md` — тот же файл `CLAUDE.md`, и Claude Code его прочитает: строка с
+    владельцами защищает без учёта регистра. Строка без владельцев снимает защиту, только если
+    совпадает с точным регистром и с путём, и с ним же в нижнем регистре (`Docs/public/` не снимает
+    защиту с `Docs/public/x`, который на APFS может лечь в `docs/public/x`). Ошибка — в сторону
+    лишнего ручного мёржа.
+    """
     owned = False
-    for regex, has_owners in rules:
-        if regex.fullmatch(path):
-            owned = has_owners
+    lower = path.lower()
+    for exact, icase, has_owners in rules:
+        if has_owners and icase.fullmatch(path):
+            owned = True
+        elif not has_owners and exact.fullmatch(path) and exact.fullmatch(lower):
+            owned = False
     return owned
 
 

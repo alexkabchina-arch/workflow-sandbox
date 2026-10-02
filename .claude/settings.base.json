@@ -11,7 +11,8 @@
       "Bash(gh api *branches/*/protection*)",
       "Bash(gh api *rulesets*)",
       "Bash(gh api graphql *BranchProtectionRule*)",
-      "Bash(gh api graphql *RepositoryRuleset*)"
+      "Bash(gh api graphql *RepositoryRuleset*)",
+      "Bash(gh api *statuses*)"
     ]
   },
   "hooks": {
