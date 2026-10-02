@@ -14,8 +14,17 @@
   тикета) и `--permission-mode auto`: спросить по ходу некого. Плюс `CANON_ENFORCE_STOP=1`:
   Stop-хук `stop-check` держит сессию до PR или отчёта об остановке только здесь. Аргументы
   после `--` уходят в `claude` как есть; свой `--permission-mode` там заменяет режим по умолчанию.
+- Предел проверяется до `session-start`: неверный не оставляет тикет занятым и worktree
+  созданным.
+- `session-start` идёт в этом же процессе (его `prepare`), и замок сессии в личном каталоге git
+  worktree (`canon-session.lock`) берётся под его блокировкой реестра, до `setup`. Замок держит
+  этот процесс, пока идёт `claude`: `session-start` не берёт такой PR второй сессией, второй
+  `session-run` в тот же worktree останавливается с кодом 2. Снимается с концом процесса, в том
+  числе аварийным. `claude` дескриптор не наследует: иначе его унесли бы фоновые процессы
+  сессии (dev-сервер) и держали worktree занятым после её конца.
 
-Код выхода — код `session-start`, если он не 0; иначе — код `claude`.
+Код выхода — код `session-start`, если он не 0 (2 — и неверные аргументы, и в worktree уже идёт
+сессия); иначе — код `claude`.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
 Только стандартная библиотека Python 3.
 """
@@ -23,15 +32,28 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
-START = Path(__file__).resolve().parent / "session-start"
+HERE = Path(__file__).resolve().parent
 DEFAULT_BUDGET = "30"
 HEADLESS_MODE = "auto"
+
+
+def load(name: str, filename: str):
+    """Файл канона рядом со скриптом как модуль — без правки `sys.path` и без `__pycache__`."""
+    path = HERE / filename
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    return module
+
+
+claude_run = load("canon_claude_run", "claude_run.py")  # предел — как у `review` и `verify`
+session_start = load("canon_session_start", "session-start")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,7 +66,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("ticket", help="номер тикета")
     parser.add_argument("--headless", action="store_true", help="claude -p с пределом объёма")
     parser.add_argument(
-        "--max-budget-usd", metavar="USD", help=f"предел (по умолчанию {DEFAULT_BUDGET})"
+        "--max-budget-usd",
+        metavar="USD",
+        type=claude_run.budget_usd,
+        help=f"предел (по умолчанию {DEFAULT_BUDGET})",
     )
     args = parser.parse_args(argv)
     if args.max_budget_usd and not args.headless:
@@ -54,14 +79,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    result = subprocess.run(
-        [sys.executable, str(START), args.ticket, "--json"], stdout=subprocess.PIPE, text=True
-    )
-    if result.returncode != 0:
-        return result.returncode
-    lines = result.stdout.strip().splitlines()
-    print("\n".join(lines[:-1]))
-    plan = json.loads(lines[-1])
+    held = []
+
+    def claim(worktree: Path) -> None:
+        lock = session_start.take_lock(worktree)
+        if lock is None:
+            raise session_start.UsageError(f"в {worktree} уже идёт сессия — второй не запускаю")
+        held.append(lock)
+
+    code, plan = session_start.prepare(args.ticket, claim)
+    if code != 0:
+        return code
+    (lock,) = held
 
     cmd = ["claude"]
     if args.headless:
@@ -76,7 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         # Stop-хук (`stop-check`) держит только headless-сессию: в интерактивной владелец рядом.
         env["CANON_ENFORCE_STOP"] = "1"
     sys.stdout.flush()
-    return subprocess.run(cmd, cwd=plan["worktree"], env=env).returncode
+    with lock:
+        return subprocess.run(cmd, cwd=plan["worktree"], env=env).returncode
 
 
 if __name__ == "__main__":

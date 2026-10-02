@@ -15,21 +15,37 @@
 2. PR автора (`gh pr list --author @me`) на ветках сессий (`ticket-N`, `ticket-N-*`; ручные PR
    владельца на других ветках не трогаются), кроме черновиков: красный CI на head (провал
    `restricted-paths` не в счёт — это ожидание владельца) или нет отметки ревью (статус `review`)
-   на head. Есть такие — берётся первый (красные раньше), тикет откладывается. Красный CI —
-   возврат: комментарий «возврат k/2 … на <sha>»; на тот же head второй раз не пишется. Третий
+   на head; отметка с выключенным авто-мёржем — не обрыв (`ship-finish` ставит отметку последней),
+   так владелец придерживает PR. PR, в worktree которого идёт сессия (замок `session-run`), не
+   берётся. Есть такие — берётся первый (красные раньше), тикет
+   откладывается. Красный CI — возврат: комментарий «возврат k/2 … на <sha>»; на тот же head
+   второй раз не пишется. Третий
    возврат не делается: метка `ready-for-human` и комментарий-форма (вопрос, логи, варианты,
    рекомендация), PR пропускается, пока метка стоит. Владелец снял метку — ответ дан: счёт
    возвратов начинается заново. PR без отметки — дозапуск `/ship`, возвратом не считается.
-3. Тикет: открыт, не назначен другому; метка `in-progress` и исполнитель — я.
+3. Тикет: открыт, не назначен другому. Сессия тикета уже идёт (замок `session-run` в его
+   worktree) — стоп.
 4. Worktree и ветка: уже есть worktree на ветке — он; иначе рядом с главным
    `../<проект>-ticket-N` (`../<проект>-pr-M`) на ветке `ticket-N` от `origin/main` (на ветке PR).
    Ветка тикета `ticket-N` или `ticket-N-*` уже есть локально или на сервере — берётся она (две
-   с суффиксом — стоп, выбрать вручную). Ветка PR подтягивается к серверу fast-forward;
-   разошлась — стоп. Потом проектная `scripts/session/setup` в корне worktree, если есть.
+   с суффиксом — стоп, выбрать вручную). Ветка тикета, уже слитая squash-мёржем (её конец — head
+   слитого PR, которого нет в `origin/main`), заново не берётся, иначе её коммиты уйдут в новый
+   PR: только локальная и без worktree — удаляется, новая идёт от `origin/main`; на сервере или с
+   worktree — стоп с командой, как убрать. Новые коммиты поверх слитого head — обычная работа
+   ветки (новый PR), их старт не трогает. Ветка PR подтягивается
+   к серверу fast-forward; разошлась — стоп; на сервере её нет — сбой git. Потом проектная
+   `scripts/session/setup` в корне worktree, если есть.
+5. Метка `in-progress` и исполнитель — я: после worktree и `setup`, чтобы сбой на них не оставил
+   тикет занятым без сессии.
 
 Итог — путь worktree, метка сессии `CANON_SESSION` (её читает Stop-хук) и промпт; с `--json` —
 последней строкой JSON. Код выхода 0 — готово; 1 — сбой git, `gh` или `scripts/session/setup`;
-2 — ошибка аргументов, тикет закрыт или занят другим, неоднозначная ветка тикета.
+2 — ошибка аргументов, тикет закрыт или занят другим, сессия тикета уже идёт, неоднозначная или
+уже слитая ветка тикета (сообщение говорит, что убрать).
+
+`session-run` вызывает `prepare` этого файла в своём процессе и через `claim` берёт замок сессии
+под блокировкой реестра — параллельный старт не увидит worktree свободным в промежутке.
+
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
 Только стандартная библиотека Python 3.
 """
@@ -57,6 +73,8 @@ IN_PROGRESS = "in-progress"
 OWNER_CHECKS = {"restricted-paths"}
 RED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 MAX_RETURNS = 2
+# Замок сессии в личном каталоге git worktree: `session-run` держит его, пока идёт `claude`.
+SESSION_LOCK = "canon-session.lock"
 SESSION_BRANCH = re.compile(r"^ticket-\d+(-.+)?$")
 RETURN_RE = re.compile(r"^возврат (\d+)/\d+: красный CI на ([0-9a-f]{7})")
 FORM_MARK = f"{WAITING}: третий возврат не делается"
@@ -110,22 +128,72 @@ def worktrees() -> list[dict]:
     return found
 
 
-def has_ref(ref: str) -> bool:
-    return (
-        subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", ref], capture_output=True
-        ).returncode
-        == 0
+def tip(ref: str) -> str | None:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", ref], capture_output=True, text=True
     )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def has_ref(ref: str) -> bool:
+    return tip(ref) is not None
 
 
 def is_ancestor(older: str, newer: str, cwd: Path) -> bool:
-    return (
-        subprocess.run(
-            ["git", "merge-base", "--is-ancestor", older, newer], cwd=cwd, capture_output=True
-        ).returncode
-        == 0
+    """Код 1 — не предок; любой другой ненулевой (нет ссылки, сбой git) — `StartError`."""
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", older, newer],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
     )
+    if result.returncode not in (0, 1):
+        raise StartError(f"git merge-base --is-ancestor {older} {newer}: {result.stderr.strip()}")
+    return result.returncode == 0
+
+
+def worktree_of(branch: str) -> Path | None:
+    return next((Path(w["path"]) for w in worktrees() if w.get("branch") == branch), None)
+
+
+# --- замок сессии ---
+
+
+def take_lock(worktree: Path):
+    """Замок сессии worktree — открытый файл под flock; None — его держит другой процесс.
+
+    Файл — в личном каталоге git worktree. `session-run` держит замок, пока идёт `claude`;
+    снимается с концом процесса, в том числе аварийным.
+    """
+    git_dir = run("git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-dir")
+    lock = open(Path(git_dir) / SESSION_LOCK, "a")  # noqa: SIM115 — держит вызывающий
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return None
+    return lock
+
+
+def session_busy(branch: str) -> Path | None:
+    """Worktree ветки, где сейчас идёт сессия; иначе None. Только под блокировкой реестра.
+
+    Кандидаты — worktree на ветке и записи реестра с этой веткой: живая сессия могла уйти с ветки
+    (rebase, detached HEAD).
+    """
+    alive = {w["path"]: w.get("branch") for w in worktrees()}
+    paths = {path for path, name in alive.items() if name == branch}
+    paths |= {
+        path
+        for path, entry in read_registry().items()
+        if entry.get("branch") == branch and path in alive
+    }
+    for path in sorted(paths):
+        lock = take_lock(Path(path))
+        if lock is None:
+            return Path(path)
+        lock.close()
+    return None
 
 
 # --- реестр и уборка ---
@@ -295,6 +363,9 @@ def human_form(pr: dict, checks: list[str]) -> str:
 
 def pick_pr() -> dict | None:
     for pr, red in attention():
+        if busy := session_busy(pr["headRefName"]):
+            note(f"PR #{pr['number']}: в {busy} уже идёт сессия — пропущен")
+            continue
         had_form, recent = since_last_form(pr)
         if waits_owner(pr, had_form, recent):
             continue
@@ -330,7 +401,8 @@ def pick_pr() -> dict | None:
 # --- тикет ---
 
 
-def take_ticket(number: int) -> None:
+def check_ticket(number: int) -> bool:
+    """Тикет можно брать; True — метку `in-progress` и исполнителя ещё ставить."""
     fields = "number,state,labels,assignees"
     issue = json.loads(run("gh", "issue", "view", str(number), "--json", fields))
     if issue["state"] != "OPEN":
@@ -340,7 +412,12 @@ def take_ticket(number: int) -> None:
     assignees = {a["login"] for a in issue.get("assignees") or []}
     if assignees and me not in assignees:
         raise UsageError(f"тикет #{number} уже в работе: {', '.join(sorted(assignees))}")
-    if IN_PROGRESS not in labels or me not in assignees:
+    return IN_PROGRESS not in labels or me not in assignees
+
+
+def mark_ticket(number: int) -> None:
+    """Метка и исполнитель — после повторной проверки: за время `setup` тикет мог занять другой."""
+    if check_ticket(number):
         run("gh", "issue", "edit", str(number), "--add-label", IN_PROGRESS, "--add-assignee", "@me")
 
 
@@ -365,11 +442,48 @@ def ticket_branch(number: int) -> str:
     return suffixed[0] if suffixed else exact
 
 
+def retire_spent(branch: str, main: Path) -> None:
+    """Ветка тикета, уже слитая squash-мёржем, заново не берётся: её коммиты ушли бы в новый PR.
+
+    Слитая — её конец равен head слитого PR, которого нет в `origin/main` (при мёрже обычным
+    merge commit он там есть, и ветка годна как есть). Только локальная и без worktree —
+    удаляется (работы сверх слитой нет), дальше ветка заводится от `origin/main`; иначе — стоп.
+    """
+    local, remote = tip(f"refs/heads/{branch}"), tip(f"refs/remotes/origin/{branch}")
+    if local is None and remote is None:
+        return
+    fields = "number,url,headRefOid"
+    found = run("gh", "pr", "list", "--head", branch, "--state", "merged", "--json", fields)
+    merged = {pr["headRefOid"]: pr["url"] for pr in json.loads(found)}
+    spent = {
+        end: merged[end]
+        for end in {local, remote} - {None}
+        if end in merged and not is_ancestor(end, "origin/main", main)
+    }
+    if remote in spent and local in (None, remote):
+        raise UsageError(
+            f"ветка {branch} уже слита ({spent[remote]}) и осталась на сервере: удалите её "
+            f"(`git push origin --delete {branch}`) и повторите старт"
+        )
+    if local in spent and remote is None:
+        if holder := worktree_of(branch):
+            fix = (
+                f"переключите его на main (`git -C {holder} switch main`)"
+                if holder == main
+                else f"уберите его (`git worktree remove {holder}`)"
+            )
+            raise UsageError(
+                f"ветка {branch} уже слита ({spent[local]}), на ней worktree {holder}: {fix} "
+                "и повторите старт"
+            )
+        run("git", "branch", "-q", "-D", branch)
+        note(f"ветка {branch} уже слита ({spent[local]}) — удалена, новая от origin/main")
+
+
 def ensure_worktree(main: Path, branch: str, name: str, pending: set[str]) -> Path:
     """Worktree на ветке: существующий, иначе новый `../<проект>-<name>`."""
-    for w in worktrees():
-        if w.get("branch") == branch:
-            return Path(w["path"])
+    if existing := worktree_of(branch):
+        return existing
     path = (main.parent / f"{main.name}-{name}").resolve()
     if str(path) in pending:
         raise StartError(
@@ -407,16 +521,21 @@ def setup(worktree: Path) -> None:
 # --- сборка ---
 
 
-def start(number: int) -> dict:
+def start(number: int, claim=None) -> dict:
+    """Готовит сессию; `claim(worktree)` — под блокировкой реестра, до `setup` (замок сессии)."""
     main = Path(worktrees()[0]["path"])
     os.chdir(main)
     with registry_lock():
         pending = cleanup(main)
-        run("git", "fetch", "-q", "origin")
+        # --prune: ветка, удалённая на сервере после мёржа, не должна браться из старой ссылки.
+        run("git", "fetch", "-q", "--prune", "origin")
         plan = pick_pr()
         if plan is None:
-            take_ticket(number)
+            unmarked = check_ticket(number)
             branch = ticket_branch(number)
+            if busy := session_busy(branch):
+                raise UsageError(f"сессия тикета #{number} уже идёт в {busy}")
+            retire_spent(branch, main)
             plan = {
                 "kind": "ticket",
                 "ticket": number,
@@ -431,10 +550,14 @@ def start(number: int) -> dict:
             sync_pr_branch(worktree, plan["branch"])
         plan["branch"] = run("git", "-C", str(worktree), "symbolic-ref", "--short", "HEAD")
         plan["worktree"] = str(worktree)
+        if claim is not None:
+            claim(worktree)
         entries = read_registry()
         entries[str(worktree)] = {"session": plan["session"], "branch": plan["branch"]}
         write_registry(entries)
     setup(worktree)
+    if plan["kind"] == "ticket" and unmarked:
+        mark_ticket(number)
     return plan
 
 
@@ -455,25 +578,31 @@ def report(plan: dict) -> str:
     )
 
 
+def prepare(ticket: str, claim=None) -> tuple[int, dict | None]:
+    """Старт с печатью итога: (код выхода, план); план — только при коде 0."""
+    try:
+        if not ticket.lstrip("#").isdigit():
+            raise UsageError(f"номер тикета — число, а не {ticket!r}")
+        plan = start(int(ticket.lstrip("#")), claim)
+    except UsageError as exc:
+        note(str(exc))
+        return 2, None
+    except StartError as exc:
+        note(str(exc))
+        return 1, None
+    print(report(plan))
+    return 0, plan
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="session-start", description=__doc__.split("\n\n")[0])
     parser.add_argument("ticket", help="номер тикета")
     parser.add_argument("--json", action="store_true", help="итог последней строкой JSON")
     args = parser.parse_args(argv)
-    try:
-        if not args.ticket.lstrip("#").isdigit():
-            raise UsageError(f"номер тикета — число, а не {args.ticket!r}")
-        plan = start(int(args.ticket.lstrip("#")))
-    except UsageError as exc:
-        note(str(exc))
-        return 2
-    except StartError as exc:
-        note(str(exc))
-        return 1
-    print(report(plan))
-    if args.json:
+    code, plan = prepare(args.ticket)
+    if plan is not None and args.json:
         print(json.dumps(plan, ensure_ascii=False))
-    return 0
+    return code
 
 
 if __name__ == "__main__":

@@ -5,12 +5,21 @@
 # одобрение код-оунера не требуется, когда автор PR сам код-оунер (агенты работают под учётной
 # записью владельца).
 #
-# `pull_request_target`: workflow, скрипт и CODEOWNERS берутся из базовой ветки, код PR не
-# выгружается и не исполняется — PR не может ослабить собственную проверку. Список файлов — через API.
+# `pull_request_target`: workflow, скрипт и CODEOWNERS берутся из ветки по умолчанию (так GitHub
+# делает с 08.12.2025 при любой базе PR), код PR не выгружается и не исполняется — PR не может
+# ослабить собственную проверку. Список файлов — через API, он зависит от базы PR: `edited` —
+# перезапуск при смене базы (`gh pr edit --base main`), иначе на PR в `main` осталась бы зелёная
+# проверка по файлам относительно другой ветки (#82).
 name: restricted-paths
 
 on:
   pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+# Прогон по старой базе, закончившийся позже прогона `edited`, не перекрывает его: отменяется.
+concurrency:
+  group: restricted-paths-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -20,8 +29,8 @@ jobs:
   restricted-paths:
     runs-on: ubuntu-latest
     steps:
-      # На pull_request_target checkout по умолчанию выгружает базовую ветку, не PR.
-      - uses: actions/checkout@v4
+      # На pull_request_target checkout выгружает ветку по умолчанию, не PR.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - name: Файлы PR
