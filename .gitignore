@@ -1,5 +1,35 @@
+# Шаблон канона alexkabchina-arch/workflow: при переносе канона в проект копируется вручную один
+# раз (вне `.canon.lock`, `canon-sync` его не ставит), дальше файл принадлежит проекту —
+# проектные строки дописывать в конец.
+
+# Секреты: файлы окружения, ключи, учётные данные. В git остаются образцы `<имя>.env.example`
+# и `<имя>.env.<суффикс>.example`; другие (`.env.sample`, `.env.test`, если проект хранит их в
+# git) проект разрешает своей строкой `!…` в конце. `credentials` — файл (как `~/.aws/credentials`)
+# и данные в форматах ниже; каталоги и исходники `credentials*` (`credentials.py`) не трогаются.
+.env
+*.env
+*.env.*
+!*.env.example
+!*.env.*.example
+*.pem
+*.key
+*.p12
+credentials
+!credentials/
+credentials*.json
+credentials*.yaml
+credentials*.yml
+credentials*.toml
+credentials*.csv
+
+# Окружения Python — без слеша: в worktree `.venv` бывает ссылкой, а `.venv/` ловит только каталог.
+.venv
+venv
+
 __pycache__/
+.DS_Store
+
+# Проект.
 *.egg-info/
-.venv/
 .pytest_cache/
 .ruff_cache/

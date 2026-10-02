@@ -8,13 +8,27 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # gitleaks-action читает коммиты PR через API.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: python scripts/canon/check_lock.py
       - run: python3 scripts/canon/claude_md_length.py
+      # Секрет в коммитах PR роняет job (workflow#59); идёт и после упавших шагов до него.
+      # Только на PR; находка — в логе job (комментарии в PR требуют права записи).
+      - if: github.event_name == 'pull_request' && (success() || failure())
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_ENABLE_COMMENTS: "false"
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .

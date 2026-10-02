@@ -25,7 +25,7 @@ python3.12 -m venv .venv
 
 | Workflow | Job    | Что делает                            |
 | -------- | ------ | ------------------------------------- |
-| `CI`     | `test` | `check_lock` (`.canon.lock`), длина `CLAUDE.md` (предупреждение, не падает), `ruff check`, `ruff format --check`, `pytest` на Python 3.12 |
+| `CI`     | `test` | `check_lock` (`.canon.lock`), длина `CLAUDE.md` (предупреждение, не падает), gitleaks (секреты в коммитах), `ruff check`, `ruff format --check`, `pytest` на Python 3.12 |
 
 Запускается на `pull_request` и на push в `main`. Обязательная проверка для мёржа — `test`.
 
