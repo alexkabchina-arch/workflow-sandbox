@@ -8,6 +8,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # gitleaks-action читает коммиты PR через API.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -17,7 +21,9 @@ jobs:
           python-version: "3.12"
       - run: python scripts/canon/check_lock.py
       - run: python3 scripts/canon/claude_md_length.py
-      - uses: gitleaks/gitleaks-action@v3
+      # Секрет в коммитах роняет job (workflow#59); идёт и после упавших шагов до него.
+      - if: success() || failure()
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_VERSION: "8.30.1"
