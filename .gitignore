@@ -1,5 +1,23 @@
+# Шаблон канона alexkabchina-arch/workflow: копируется в проект один раз (вне `.canon.lock`),
+# дальше файл принадлежит проекту — проектные строки дописывать в конец.
+
+# Секреты: файлы окружения, ключи, учётные данные. Образцы `*.example` остаются в git.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials*
+
+# Окружения Python — без слеша: в worktree `.venv` бывает ссылкой, а `.venv/` ловит только каталог.
+.venv
+venv
+
 __pycache__/
+.DS_Store
+
+# Проект.
 *.egg-info/
-.venv/
 .pytest_cache/
 .ruff_cache/
