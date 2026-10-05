@@ -18,3 +18,4 @@ python -m sandbox 3x100 1x49.90 --discount 10
 <!-- сценарий workflow#58: зелёный путь после integration_id -->
 a
 b
+c
