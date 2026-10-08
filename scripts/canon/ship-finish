@@ -2,16 +2,18 @@
 """ship-finish — конец `/ship`: push, PR, отметка ревью на head, авто-мёрж.
 
     scripts/canon/ship-finish --title <заголовок> --body-file <тело.md>
-        --review-report <отчёт.json> [--review-report <отчёт прицельного ревью.json> …]
-        [--ready-for-human <строка>] [--unconfirmed <причина>]
+        --review-report <отчёт.json> [--ready-for-human <строка>]
+    scripts/canon/ship-finish --unconfirmed <отчёт>
 
 Из корня проекта, на ветке с закоммиченной работой. По порядку:
 
 0. Есть слитый PR ветки с head = локальный HEAD — «уже слит», код 0, больше ничего не делается
-   (отчёты ревью не нужны). Так же, если GitHub слил PR по ходу: ветки после push на сервере нет
-   или открытого PR уже нет. Затем, до любой записи, — сверка отчётов ревью (кроме `--unconfirmed`).
+   (отчёт ревью не нужен; `--unconfirmed` пишет отчёт и тогда). Так же, если GitHub слил PR по
+   ходу: ветки после push на сервере нет или открытого PR уже нет. Затем, до любой записи, —
+   сверка отчёта ревью.
 1. `git push -u origin HEAD` (без force) и сверка: ветка на сервере — ровно локальный HEAD.
 2. PR ветки: нет открытого — `gh pr create`, есть — `gh pr edit` (тело и заголовок обновляются).
+   Были коммиты после ревью — в конец тела дописывается их список.
 3. `gh pr merge --auto --squash`, если авто-мёрж ещё не включён. Мёржа скрипт не ждёт.
 4. Отметка ревью — статус `review` = success на head-коммите (`gh api …/statuses/<sha>`);
    уже стоит на этом коммите — не ставится второй раз. GitHub принимает статус только на коммит,
@@ -19,25 +21,31 @@
    оставляет PR без отметки, такой `session-start` подхватывает дозапуском `/ship`; PR с
    отметкой без авто-мёржа — только если авто-мёрж выключили потом (владелец придержал PR).
 
-`--review-report` — отчёт `scripts/canon/review` (блок `canon_review`); отметка ставится только
-по ним, а не по слову сессии. Отчёты — цепочкой в порядке прогонов: первый — ревью всей ветки
-(начало диффа уже в `origin/main`), каждый следующий — прицельное ревью исправлений от head
-предыдущего (`review --base <head>`), последний доходит ровно до HEAD; отчётов не больше
-`MAX_REPORTS` (полное и по одному прицельному на заход `/ship`). Пропуск «только документы»
-перепроверяется по файлам диффа правилом `review`, ревью — по `modelUsage` на закреплённой модели.
-Нет отчёта, дыра в цепочке, head не тот, лишний отчёт — отказ (код 2). Все отчёты — пропуск —
-отметка «только документы». Перерасход вдвое (`ready_for_human` в отчёте) помечается и без флага.
+`--review-report` — один отчёт полного ревью `scripts/canon/review` (блок `canon_review`); отметка
+ставится только по нему, а не по слову сессии. Начало диффа (`base_sha`) — в `origin/main`, head
+отчёта — HEAD или его предок. Коммиты после head отчёта (исправления по находкам, тестам,
+`/verify`, возвратам) второго ревью не проходят — их проверяют тесты, CI и `/verify`; они видны в
+описании отметки (head отчёта и число коммитов) и списком в теле PR (решение канона
+`docs/decisions/2026-10-03-no-re-review.md`). Пропуск «только документы» перепроверяется по
+файлам до самого HEAD правилом `review`, ревью — по `modelUsage` на закреплённой модели. Нет
+отчёта, отчёт не один, начало не от `origin/main`, head не предок HEAD, head — код слитого PR ветки
+(его отчёт новой работы не видел; head слитого PR не получен — тоже отказ) — отказ (код 2).
+Перерасход вдвое (`ready_for_human` в отчёте) помечается и без флага.
 `--ready-for-human <строка>` — признак от ревью или `/verify` (перерасход вдвое): метка
 `ready-for-human` и комментарий со строкой, один раз на PR (повтор узнаётся по тексту, не по
 метке); отметка и авто-мёрж — как обычно.
-`--unconfirmed <причина>` — критерий не подтверждён: PR черновиком, авто-мёрж выключен, метка
-`ready-for-human`, комментарий с причиной при каждом вызове (даже если метка уже стоит — его ищет
-Stop-хук), отметки нет.
+`--unconfirmed <причина>` — отчёт об остановке: комментарий с первой строкой «Отчёт об остановке»
+(его ищет Stop-хук) и метка `ready-for-human`, без push и без отметки; пустая причина — отказ
+(код 2), отчёт не публикуется; незакоммиченные правки и
+слитый PR не мешают. Открытого PR нет — в тикете N ветки `ticket-N` (или `ticket-N-…`), PR не
+создаётся; есть — на PR, PR переводится в черновик, авто-мёрж выключается. Пишется при каждом
+вызове: Stop-хук засчитывает только отчёт этой сессии.
 
-Повторный запуск идемпотентен: второго PR нет, отметка только на итоговом коммите; после мёржа —
-«уже слит». Слитый PR со старым head работе не мешает: новые коммиты ветки идут новым PR.
-Код выхода 0 — готово; 1 — сбой push, `gh` или сверки; 2 — ошибка аргументов или состояния
-ветки (main, незакоммиченные правки, нет или не сходятся отчёты ревью), до любой записи.
+Повторный запуск идемпотентен: второго PR нет, отметка только на итоговом коммите; после мёржа
+— «уже слит». Слитый PR со старым head работе не мешает: новые коммиты ветки идут новым PR, но с
+новым ревью — отчёт слитого PR их не покрывает. Код выхода 0 — готово; 1 — сбой push, `gh` или
+сверки; 2 — ошибка аргументов или состояния ветки (main, незакоммиченные правки, нет или не
+сходится отчёт ревью), до любой записи.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
 Только стандартная библиотека Python 3.
 """
@@ -46,17 +54,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
+import tempfile
 import types
 from pathlib import Path
 
 CONTEXT = "review"
 TARGET = "origin/main"
-# Полное ревью и по одному прицельному на заход /ship: первый и возвраты по красному CI
-# (`MAX_RETURNS` в `session-start`).
-MAX_REPORTS = 4
 LABEL = "ready-for-human"
+REPORT_MARK = "Отчёт об остановке"
+# Ветки сессий тикета, как `SESSION_BRANCH` в `session-start`: `ticket-N` и `ticket-N-*`.
+TICKET_BRANCH = re.compile(r"^ticket-(\d+)(?:-.+)?$")
 PROTECTED = {"main", "master"}
 PR_FIELDS = "number,url,isDraft,labels,autoMergeRequest"
 DESCRIPTION = "ревью ошибок пройдено (/ship)"
@@ -82,14 +92,14 @@ def run(*cmd: str) -> str:
     return result.stdout.strip()
 
 
-def check_branch() -> str:
+def check_branch(dirty_ok: bool = False) -> str:
     try:
         branch = run("git", "symbolic-ref", "--short", "HEAD")
     except ShipError:
         raise UsageError("HEAD не на ветке (detached)") from None
     if branch in PROTECTED:
         raise UsageError(f"ветка {branch}: /ship работает только из рабочей ветки")
-    if run("git", "status", "--porcelain", "--untracked-files=no"):
+    if not dirty_ok and run("git", "status", "--porcelain", "--untracked-files=no"):
         raise UsageError("есть незакоммиченные правки отслеживаемых файлов: сначала коммит")
     return branch
 
@@ -130,16 +140,17 @@ def is_ancestor(older: str, newer: str) -> bool:
     return git_ok("merge-base", "--is-ancestor", older, newer)
 
 
-def check_report(path: str, data: dict, canon) -> None:
-    """Отчёт — след прогона: пропуск — правда только документы, ревью — на закреплённой модели."""
+def check_report(path: str, data: dict, sha: str, canon) -> None:
+    """Отчёт — след прогона: пропуск — правда только документы (до самого HEAD: коммиты после
+    отчёта ревью не проходят), ревью — на закреплённой модели."""
     verdict = data["canon_review"]
     if verdict.get("skipped") is True:
-        span = f"{verdict['base_sha']}..{verdict['head']}"
+        span = f"{TARGET}...{sha}"  # как дифф `review`: слитый в ветку main — не её код
         files = run("git", "diff", "--name-only", "--no-renames", "-z", span).split("\0")
         code = [p for p in files if p and not canon.is_docs(p)]
         if code:
             raise UsageError(
-                f"отчёт ревью {path} — пропуск «только документы», а в {span[:7]}… есть код: "
+                f"отчёт ревью {path} — пропуск «только документы», а в ветке есть код: "
                 f"{', '.join(code[:5])} — запустить ревью заново"
             )
     elif canon.MODEL not in (data.get("modelUsage") or {}):
@@ -149,68 +160,112 @@ def check_report(path: str, data: dict, canon) -> None:
         )
 
 
-def check_reviews(paths: list[str], sha: str) -> list[dict]:
-    """Отчёты ревью покрывают ветку цепочкой ровно до `sha`; возвращает их блоки `canon_review`."""
+def check_review(paths: list[str], sha: str, merged: list[dict]) -> dict:
+    """Один отчёт полного ревью: от `origin/main`, head — `sha` или его предок, но не коммит
+    слитого PR ветки (`merged`): его отчёт новой работы не видел.
+
+    Возвращает блок `canon_review` отчёта."""
     if not paths:
         raise UsageError(
             "нет --review-report: отметка ревью ставится только по отчёту scripts/canon/review"
         )
-    if len(paths) > MAX_REPORTS:
+    if len(paths) > 1:
         raise UsageError(
-            f"отчётов ревью {len(paths)}, а больше {MAX_REPORTS} не бывает (полное и по одному "
-            "прицельному на заход /ship): лишний коммит — ship-finish --unconfirmed с причиной"
+            f"отчётов ревью {len(paths)}, а нужен один отчёт полного ревью ветки: прицельного "
+            "ревью нет, коммиты после ревью проверяют тесты, CI и /verify"
         )
-    reports = [load_review(path) for path in paths]
+    path = paths[0]
+    report = load_review(path)
     if not git_ok("rev-parse", "--verify", "-q", TARGET):
         raise UsageError(f"нет {TARGET}: не с чем сверить начало ревью (git fetch)")
-    reviews = [report["canon_review"] for report in reports]
-    first = reviews[0]["base_sha"]
-    if not is_ancestor(first, TARGET):
+    review = report["canon_review"]
+    if not is_ancestor(review["base_sha"], TARGET):
         raise UsageError(
-            f"первый отчёт ({paths[0]}) ревьюит не всю ветку: начало диффа {first[:7]} не в "
-            f"{TARGET} — первое ревью запускается от {TARGET}"
+            f"отчёт ({path}) ревьюит не всю ветку: начало диффа {review['base_sha'][:7]} не в "
+            f"{TARGET} — ревью запускается от {TARGET}"
         )
-    for path, prev, review in zip(paths[1:], reviews, reviews[1:]):
-        if review["base_sha"] != prev["head"]:
+    if not is_ancestor(review["head"], sha):
+        raise UsageError(
+            f"отчёт ревью ({path}) по head {review['head'][:7]}, а он не предок HEAD {sha[:7]}: "
+            f"ветка переписана или отчёт чужой — ревью заново от {TARGET}"
+        )
+    for pr in merged:
+        if pr.get("headRefOid"):
+            fetch_head(pr)
+        if pr.get("headRefOid") and is_ancestor(review["head"], pr["headRefOid"]):
             raise UsageError(
-                f"дыра в цепочке отчётов: {path} начинается с {review['base_sha'][:7]}, а "
-                f"предыдущий отчёт доходит до {prev['head'][:7]}"
+                f"отчёт ревью ({path}) — по коду уже слитого PR {pr['url']}: новые коммиты он "
+                "не видел — ревью заново"
             )
-    last = reviews[-1]["head"]
-    if last != sha:
-        if not is_ancestor(last, sha):
-            hint = "ветка переписана или отчёт чужой — ревью заново от " + TARGET
-        elif len(paths) == MAX_REPORTS:
-            hint = "прицельных ревью больше не бывает — ship-finish --unconfirmed с причиной"
-        else:
-            hint = (
-                "после ревью есть коммиты — прицельное ревью `scripts/canon/review <отчёт.json> "
-                f"--base {last}` и его отчёт ещё одним --review-report"
-            )
-        raise UsageError(f"отчёт ревью ({paths[-1]}) по head {last[:7]}, а HEAD {sha[:7]}: {hint}")
-    canon = load_canon_review()
-    for path, report in zip(paths, reports):
-        check_report(path, report, canon)
-    return reviews
+    check_report(path, report, sha, load_canon_review())
+    return review
 
 
-def human_lines(given: str | None, reviews: list[dict]) -> str | None:
-    """Признак ready-for-human: строка сессии плюс перерасходы вдвое из самих отчётов."""
+def fetch_head(pr: dict) -> None:
+    """head слитого PR — локально (`pull/<N>/head` с сервера, если его нет): иначе сверка
+    «отчёт не его» молча проходит — `merge-base` на отсутствующем коммите падает."""
+    sha = pr["headRefOid"]
+    if git_ok("cat-file", "-e", f"{sha}^{{commit}}"):
+        return
+    git_ok("fetch", "-q", "origin", f"pull/{pr.get('number')}/head")
+    if not git_ok("cat-file", "-e", f"{sha}^{{commit}}"):
+        raise UsageError(
+            f"head {sha[:7]} слитого PR {pr['url']} не получен (git fetch): не проверить, что "
+            "отчёт ревью не по его коду"
+        )
+
+
+def unreviewed_commits(review: dict, sha: str) -> list[tuple[str, str]]:
+    """Коммиты ветки после head отчёта до `sha`, старые первыми: (короткий sha, тема). Коммиты
+    `origin/main`, слитые в ветку, — не её работа и не в счёт; коммит слияния — в счёт."""
+    cmd = ["git", "log", "--reverse", "--format=%h%x00%s", sha, "--not", review["head"], TARGET]
+    return [tuple(line.split("\0", 1)) for line in run(*cmd).splitlines()]
+
+
+def read_body(body_file: str) -> str:
+    try:
+        return Path(body_file).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise UsageError(f"тело PR {body_file} не прочитано: {exc.strerror}") from None
+    except UnicodeDecodeError:
+        raise UsageError(f"тело PR {body_file}: не UTF-8") from None
+
+
+def body_with_commits(body_file: str, review: dict, unreviewed: list[tuple[str, str]]) -> str:
+    """Тело PR со списком коммитов после ревью; без них — исходный файл."""
+    body = read_body(body_file)
+    if not unreviewed:
+        return body_file
+    lines = "\n".join(f"- `{short}` {subject}" for short, subject in unreviewed)
+    tail = (
+        f"\n\n## Коммиты после ревью\n\nОтчёт ревью — по `{review['head'][:7]}`; коммиты после "
+        f"него ревью не проходили, их проверяют тесты, CI и `/verify` (`ship-finish`):\n\n{lines}\n"
+    )
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", suffix=".md", prefix="ship-finish-", delete=False
+    ) as out:
+        out.write(body.rstrip("\n") + tail)
+    return out.name
+
+
+def human_lines(given: str | None, review: dict) -> str | None:
+    """Признак ready-for-human: строка сессии плюс перерасход вдвое из самого отчёта."""
     lines = [given] if given else []
-    for review in reviews:
-        warning = review.get("warning")
-        if review.get("ready_for_human") is True and warning and warning not in (given or ""):
-            lines.append(warning)
+    warning = review.get("warning")
+    if review.get("ready_for_human") is True and warning and warning not in (given or ""):
+        lines.append(warning)
     return "; ".join(lines) or None
 
 
-def check_merged(branch: str, sha: str) -> None:
-    """Слитый PR ветки с head = `sha` — повтор после авто-мёржа: делать нечего."""
-    cmd = f"gh pr list --head {branch} --state merged --json url,headRefOid"
+def check_merged(branch: str, sha: str) -> list[dict]:
+    """Слитый PR ветки с head = `sha` — повтор после авто-мёржа: делать нечего. Иначе — слитые
+    PR ветки (`number`, `url`, `headRefOid`)."""
+    cmd = f"gh pr list --head {branch} --state merged --json number,url,headRefOid"
     found = json.loads(run(*cmd.split()))
     merged = next((p for p in found if p.get("headRefOid") == sha), None)
     if merged:
         raise AlreadyMerged(merged["url"])
+    return found
 
 
 def push(branch: str, sha: str) -> None:
@@ -230,40 +285,72 @@ def find_pr(branch: str) -> dict | None:
     return found[0] if found else None
 
 
-def upsert_pr(branch: str, sha: str, title: str, body_file: str, draft: bool) -> dict:
+def upsert_pr(branch: str, sha: str, title: str, body_file: str) -> dict:
     pr = find_pr(branch)
     if pr is None:
         check_merged(branch, sha)
-        cmd = ["gh", "pr", "create", "--head", branch, "--title", title, "--body-file", body_file]
-        run(*cmd, *(["--draft"] if draft else []))
+        run("gh", "pr", "create", "--head", branch, "--title", title, "--body-file", body_file)
         pr = find_pr(branch)
         if pr is None:
             raise ShipError(f"PR ветки {branch} создан, но не найден")
         return pr
     number = str(pr["number"])
     run("gh", "pr", "edit", number, "--title", title, "--body-file", body_file)
-    if draft and not pr["isDraft"]:
-        run("gh", "pr", "ready", number, "--undo")
-    elif not draft and pr["isDraft"]:
+    if pr["isDraft"]:
         run("gh", "pr", "ready", number)
     return pr
 
 
-def flag_for_human(pr: dict, text: str, every_time: bool = False) -> None:
-    """Метка ready-for-human и комментарий `text`: один раз на PR, `every_time` — каждый раз.
+def flag_for_human(number: str, text: str) -> None:
+    """Метка ready-for-human и комментарий `text` на PR — один раз.
 
-    Повтор узнаётся по тексту комментария, а не по метке: метка от другого признака (прошлый
-    `--unconfirmed`) не должна глушить новый. Отчёт `--unconfirmed` пишется каждый раз — Stop-хук
-    ищет отчёт этой сессии.
+    Повтор узнаётся по тексту комментария, а не по метке: метка от другого признака (отчёт об
+    остановке) не должна глушить новый, а снятую владельцем метку повтор не возвращает.
     """
-    number = str(pr["number"])
-    if not every_time:
-        comments = json.loads(run("gh", "pr", "view", number, "--json", "comments"))["comments"]
-        if any((c.get("body") or "").strip() == text.strip() for c in comments):
-            return  # признак уже передан; снятую владельцем метку не возвращать
-    if not any(label["name"] == LABEL for label in pr.get("labels") or []):
+    item = json.loads(run("gh", "pr", "view", number, "--json", "labels,comments"))
+    if any((c.get("body") or "").strip() == text.strip() for c in item.get("comments") or []):
+        return
+    if not any(label["name"] == LABEL for label in item.get("labels") or []):
         run("gh", "pr", "edit", number, "--add-label", LABEL)
     run("gh", "pr", "comment", number, "--body", text)
+
+
+def report_stop(branch: str, reason: str) -> str:
+    """Отчёт об остановке без push, при каждом вызове (его ищет Stop-хук — отчёт этой сессии):
+    на открытом PR (PR — в черновик, авто-мёрж выключен) или в тикете ветки `ticket-N`
+    (`ticket-N-…`). Возвращает, где он."""
+    # Причина — хоть одна буква или цифра после метки: «Отчёт об остановке: …» из шаблона — не она.
+    given = reason.strip()
+    if given.lower().startswith(REPORT_MARK.lower()):
+        given = given[len(REPORT_MARK) :]
+    if not re.search(r"\w", given):
+        raise UsageError(
+            "--unconfirmed без причины: владелец не узнает, что остановило — назовите причину "
+            '(--unconfirmed "критерий 2 не подтверждён: …")'
+        )
+    text = reason if reason.lstrip().startswith(REPORT_MARK) else f"{REPORT_MARK}: {reason}"
+    pr = find_pr(branch)
+    if pr is None:
+        match = TICKET_BRANCH.match(branch)
+        if not match:
+            raise UsageError(
+                f"ветка {branch}: открытого PR нет, а тикет для отчёта берётся из имени ветки "
+                "ticket-N или ticket-N-… — отчёт вручную: gh issue comment и gh issue edit "
+                f"--add-label {LABEL}"
+            )
+        kind, number, where = "issue", match.group(1), f"тикет #{match.group(1)}"
+    else:
+        kind, number = "pr", str(pr["number"])
+        where = f"{pr['url']} (черновик, авто-мёрж выключен)"
+        if pr.get("autoMergeRequest"):
+            run("gh", "pr", "merge", number, "--disable-auto")
+        if not pr["isDraft"]:
+            run("gh", "pr", "ready", number, "--undo")
+    labels = json.loads(run("gh", kind, "view", number, "--json", "labels")).get("labels") or []
+    if not any(label["name"] == LABEL for label in labels):
+        run("gh", kind, "edit", number, "--add-label", LABEL)
+    run("gh", kind, "comment", number, "--body", text)
+    return where
 
 
 def mark_review(sha: str, description: str) -> bool:
@@ -280,43 +367,52 @@ def mark_review(sha: str, description: str) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ship-finish", description=__doc__.split("\n\n")[0])
-    parser.add_argument("--title", required=True, help="заголовок PR")
-    parser.add_argument("--body-file", required=True, help="файл тела PR")
+    parser.add_argument("--title", help="заголовок PR (кроме --unconfirmed)")
+    parser.add_argument("--body-file", help="файл тела PR (кроме --unconfirmed)")
     parser.add_argument(
         "--review-report",
         action="append",
         default=[],
         metavar="ОТЧЁТ",
-        help="отчёт scripts/canon/review; прицельные — следом, в порядке прогонов",
+        help="отчёт полного ревью scripts/canon/review (один)",
     )
     parser.add_argument(
         "--ready-for-human", metavar="СТРОКА", help="признак от ревью для владельца"
     )
-    parser.add_argument("--unconfirmed", metavar="ПРИЧИНА", help="критерий не подтверждён")
+    parser.add_argument(
+        "--unconfirmed", metavar="ПРИЧИНА", help="отчёт об остановке: без push, в тикет или на PR"
+    )
     args = parser.parse_args(argv)
     try:
-        branch = check_branch()
-        sha = run("git", "rev-parse", "HEAD")
-        draft = args.unconfirmed is not None
-        check_merged(branch, sha)
-        reviews = [] if draft else check_reviews(args.review_report, sha)
-        push(branch, sha)
-        pr = upsert_pr(branch, sha, args.title, args.body_file, draft)
-        number = str(pr["number"])
-        if draft:
-            if pr.get("autoMergeRequest"):
-                run("gh", "pr", "merge", number, "--disable-auto")
-            flag_for_human(pr, f"{LABEL}: не подтверждено — {args.unconfirmed}", every_time=True)
-            print(
-                f"ship-finish: {pr['url']} — черновик без отметки ревью, ждёт владельца ({LABEL})"
-            )
+        branch = check_branch(dirty_ok=args.unconfirmed is not None)
+        if args.unconfirmed is not None:  # и после мёржа: правки в дереве — тоже остановка
+            where = report_stop(branch, args.unconfirmed)
+            print(f"ship-finish: отчёт об остановке — {where}, ждёт владельца ({LABEL}), без push")
             return 0
-        if human := human_lines(args.ready_for_human, reviews):
-            flag_for_human(pr, f"{LABEL}: {human}")
+        sha = run("git", "rev-parse", "HEAD")
+        merged = check_merged(branch, sha)
+        if not args.title or not args.body_file:
+            raise UsageError("нужны --title и --body-file (без них — только --unconfirmed)")
+        review = check_review(args.review_report, sha, merged)
+        unreviewed = unreviewed_commits(review, sha)
+        body_file = body_with_commits(args.body_file, review, unreviewed)
+        try:
+            push(branch, sha)
+            pr = upsert_pr(branch, sha, args.title, body_file)
+        finally:
+            if body_file != args.body_file:
+                Path(body_file).unlink(missing_ok=True)
+        number = str(pr["number"])
+        if human := human_lines(args.ready_for_human, review):
+            flag_for_human(number, f"{LABEL}: {human}")
         if not pr.get("autoMergeRequest"):
             run("gh", "pr", "merge", number, "--auto", "--squash")
-        skipped = all(review.get("skipped") is True for review in reviews)
-        marked = mark_review(sha, DESCRIPTION_SKIPPED if skipped else DESCRIPTION)
+        description = DESCRIPTION_SKIPPED if review.get("skipped") is True else DESCRIPTION
+        if unreviewed:
+            description += (
+                f"; отчёт по {review['head'][:7]}, коммитов после ревью: {len(unreviewed)}"
+            )
+        marked = mark_review(sha, description)
     except AlreadyMerged as exc:
         print(f"ship-finish: уже слит: {exc}")
         return 0

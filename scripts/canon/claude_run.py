@@ -6,12 +6,16 @@
 закреплённой модели, с аргументами списком (без оболочки) и пустым stdin. Итог — всегда по
 схеме (`--json-schema`): ответ — в поле `structured_output`, `.md` пишет вызывающий (из него или,
 как `review`, из событий потока).
-Текст `result` — только последняя реплика: у `/review` это сводка без находок (#70), поэтому
-итогом он не служит. Вывод — `json` или поток `stream-json` (у `review`: с `json` `/review`
-уходит в локальный режим мимо `claude -p`); итог — объект `result`, сохраняется в
-`<отчёт.json>`. Запуск не состоялся (сбой `claude`, выход по бюджету, ошибка, пустой
-`modelUsage`, не та модель, локальный режим, нет `structured_output`) — `ChildError` с причиной,
-а непустой `result` такого прогона — в `<отчёт>.raw.md` для разбора.
+Текст `result` — только последняя реплика: у `/review` это сводка без находок (#70), поэтому итогом
+он не служит. Вывод — `json` или поток `stream-json` (у `review`: с `json` `/review` уходит в
+локальный режим мимо `claude -p`); итог — объект `result` (в потоке — последний с ответом по схеме:
+модель может ответить ещё раз после него, ozon #947; такой хвост — в поле `trailing_result`, его
+ошибка или упор в предел — предупреждение, а не сбой), сохраняется в `<отчёт.json>`. Инструменты
+фоновой работы `Agent`, `Workflow`, `Monitor` дочернему процессу запрещены (`--disallowedTools=…`):
+он наследует агентов личного слоя, а фоновая задача будит модель — лишний `result` и лишние траты.
+Фоновый Bash флагом не закрыть. Запуск не состоялся (сбой `claude`, выход по бюджету, ошибка, пустой
+`modelUsage`, не та модель, локальный режим, нет `structured_output`) — `ChildError` с причиной, а
+непустой `result` такого прогона — в `<отчёт>.raw.md` для разбора.
 
 `<отчёт>.md` бывает только у состоявшегося прогона. Перед новым запуском он и его `.json`
 переносятся в `<отчёт>.prev.md` и `.prev.json`: под основным именем не остаётся старый итог, а
@@ -37,6 +41,8 @@ SESSION_VARS = {"CANON_SESSION", "CANON_ENFORCE_STOP"}
 DEFAULT_BASE = "origin/main"
 # Ревью Opus xhigh в разведке workflow#2 стоили 0,82–3,67 USD (в среднем 1,89); уточнить на пилоте.
 DEFAULT_BUDGET_USD = "10"
+# Многозначный флаг — в форме `--флаг=значение`, иначе съест следующий аргумент (audit.md).
+DISALLOWED_TOOLS = "--disallowedTools=Agent,Workflow,Monitor"
 # Как пишет предел человек: цифры и точка; без `inf`, экспоненты и `_`, которые съел бы float().
 BUDGET_FORMAT = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 
@@ -132,14 +138,15 @@ def run_claude(
     args: list[str], report: Path, budget: str, schema: dict, events: list | None = None
 ) -> dict:
     """Запускает `claude -p --model MODEL --max-budget-usd <budget> --output-format json
-    --json-schema <schema> <args>`.
+    --json-schema <schema> --disallowedTools=Agent,Workflow,Monitor <args>`.
 
     Сохраняет сырой результат в `report`; возвращает разобранный JSON с ответом в
     `structured_output` (объект), `.md` пишет вызывающий. Не состоялось — `ChildError`, непустой
     `result` — в `<отчёт>.raw.md`.
 
     С `events` (список) — `--output-format stream-json --verbose`: события потока дописываются в
-    `events`, итог — последнее событие `result` (тот же объект, что у `json`).
+    `events`, итог — последнее событие `result` с ответом по схеме (тот же объект, что у
+    `json`; см. `last_result`).
     """
     output = ["json"] if events is None else ["stream-json", "--verbose"]
     command = [
@@ -153,6 +160,7 @@ def run_claude(
         *output,
         "--json-schema",
         json.dumps(schema, ensure_ascii=False),
+        DISALLOWED_TOOLS,
         *args,
     ]
     set_aside(report)
@@ -213,11 +221,21 @@ def noise(stdout: str) -> list[str]:
     return [line for line in stream_lines(stdout) if parse(line) is None]
 
 
-def last_result(stdout: str, events: list) -> dict:
-    """События `stream-json` — в `events`; итог — последнее событие `result`.
+def is_answer(event: dict) -> bool:
+    """Событие `result` с ответом по схеме: из них `last_result` берёт итог."""
+    return event.get("type") == "result" and isinstance(event.get("structured_output"), dict)
 
-    Строки не JSON (шум, текст ошибки) пропускаются; нет события `result` — `JSONDecodeError`,
-    как у сломанного вывода `json`.
+
+def last_result(stdout: str, events: list) -> dict:
+    """События `stream-json` — в `events`; итог — последнее событие `result` с ответом по схеме.
+
+    После ответа по схеме бывает ещё `result` без него (модель ответила ещё раз после отчёта
+    фонового агента, ozon #947). Ответ принимается, хвост — в поле `trailing_result` итога
+    (`trailing_warning` даёт по нему предупреждение), стоимость — наибольшая среди событий
+    `result`: накопительна ли она в хвосте, не проверено вживую. Нет `result` с ответом по
+    схеме — последнее событие `result`: `check_result` назовёт причину. Строки не JSON (шум,
+    текст ошибки) пропускаются; нет события `result` — `JSONDecodeError`, как у сломанного
+    вывода `json`.
     """
     for line in stream_lines(stdout):
         event = parse(line)
@@ -226,7 +244,37 @@ def last_result(stdout: str, events: list) -> dict:
     results = [event for event in events if event.get("type") == "result"]
     if not results:
         raise json.JSONDecodeError("нет события result", stdout, 0)
-    return results[-1]
+    tail = results[-1]
+    answered = [event for event in results if is_answer(event)]
+    if not answered or answered[-1] is tail:
+        return tail
+    final = dict(answered[-1])
+    costs = [
+        cost
+        for cost in (event.get("total_cost_usd") for event in results)
+        if isinstance(cost, (int, float))
+    ]
+    if costs:
+        final["total_cost_usd"] = max(costs)
+    final["trailing_result"] = {
+        key: tail.get(key) for key in ("subtype", "is_error", "total_cost_usd", "result")
+    }
+    return final
+
+
+def trailing_warning(data: dict) -> str | None:
+    """Хвостовой ход после ответа по схеме кончился ошибкой — текст предупреждения, иначе None."""
+    tail = data.get("trailing_result")
+    if not isinstance(tail, dict) or (
+        tail.get("subtype") == "success" and not tail.get("is_error")
+    ):
+        return None
+    reason = (
+        "упёрся в предел --max-budget-usd"
+        if tail.get("subtype") == "error_max_budget_usd"
+        else f"завершился ошибкой (subtype {tail.get('subtype')}, is_error {tail.get('is_error')})"
+    )
+    return f"после ответа по схеме лишний ход модели {reason}: ответ принят"
 
 
 def check_result(data: dict, report: Path, budget: str, code: int) -> dict:

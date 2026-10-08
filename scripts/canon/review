@@ -7,7 +7,8 @@
 набранной командой, поэтому скрипт запускает дочерний процесс обычным вызовом, не в фоне:
 
     claude -p --model claude-opus-5-5 --max-budget-usd <предел> --output-format stream-json \\
-        --verbose --json-schema <схема находок> "/review xhigh origin/main...HEAD" < /dev/null
+        --verbose --json-schema <схема находок> --disallowedTools=Agent,Workflow,Monitor \\
+        "/review xhigh origin/main...HEAD" < /dev/null
 
 Уровень и модель одни для любого диффа (итог разведки workflow#2). Дифф только из документов
 (`docs/**`, `*.md`) — ревью пропускается; конфиги, CI и всё под `.claude/` на любой глубине
@@ -20,9 +21,10 @@
 (`local_command`, 0 ходов, `result` «Command completed») — итог мимо `claude -p` целиком;
 с `stream-json --verbose` идёт обычными ходами. Поэтому — поток, итог из события `result`, и
 схема (`--json-schema`, список `findings`): CLI после ревью требует ответ по ней — так «находок
-нет» (пустой список) отличимо от сбоя. Сами находки — из последнего принятого вызова
-`ReportFindings` верхнего уровня (оригинал; отклонённый вход модель повторяет — вызовы не
-склеиваются); нет его — из ответа по схеме (пересказ модели) со строкой
+нет» (пустой список) отличимо от сбоя. Сами находки — из принятых вызовов
+`ReportFindings` верхнего уровня до принятого ответа по схеме (оригинал; отклонённый вход модель
+повторяет — он не в счёт, принятые вызовы склеиваются без повторов; вызов в лишнем ходе после
+ответа — не в счёт); нет их — из ответа по схеме (пересказ модели) со строкой
 `review: предупреждение: находки — пересказ …`. Источник — `canon_review.findings_source`.
 Ответа по схеме нет (CLI его требует всегда) или без оригинала он не по схеме, локальный режим —
 ревью не состоялось (код 1), ответ — в `<отчёт>.raw.md`; туда же — находки `ReportFindings`,
@@ -32,10 +34,11 @@
 `.md`). В блоке `canon_review` отчёта — что проверено: `base` (как передан), `base_sha` (начало
 диффа — merge-base базы и HEAD), `head` (HEAD на старте ревью), `skipped`, у состоявшегося
 ревью — `findings` (число находок) и `findings_source`. По ним `ship-finish` ставит отметку
-ревью: отчёт должен доходить ровно до запушенного head; у несостоявшегося ревью блока нет —
-отметки по нему нет.
-
-Прицельное повторное ревью исправлений — `--base <head прошлого отчёта>`: дифф только от него.
+ревью: `head` отчёта — HEAD ветки или его предок, коммиты после него ревью не проходят (их
+проверяют тесты, CI и `/verify`, решение канона `docs/decisions/2026-10-03-no-re-review.md`); у
+несостоявшегося ревью блока нет — отметки по нему нет. Ревью — одно полное на ветку: отметку
+`ship-finish` ставит только по отчёту, чьё начало диффа — в `origin/main`; прицельного
+повторного ревью исправлений (`--base <head прошлого отчёта>`) в `/ship` нет.
 
 Код выхода 0 — ревью готово или пропущено; 1 — ревью не состоялось или неполное (сбой `claude`,
 пустой `modelUsage`, не та модель, локальный режим, нет ответа по схеме или без оригинала
@@ -49,6 +52,9 @@
 предупреждение по итоговой стоимости (решение владельца): строка `review: предупреждение: …` для
 тела PR, при перерасходе вдвое и больше — ещё строка `review: ready-for-human: …` (её разбирает
 `/ship`). То же — в блоке `canon_review` отчёта.json.
+Упор в предел или ошибка в лишнем ходе модели уже после ответа по схеме (ozon #947) — ревью
+состоялось (код 0): строка `review: предупреждение: после ответа по схеме …`, в `canon_review` —
+`trailing_warning` (решение владельца в #87).
 Вызывающему нужен таймаут Bash больше времени ревью (`BASH_MAX_TIMEOUT_MS` в настройках канона).
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
 Только стандартная библиотека Python 3.
@@ -117,6 +123,7 @@ SCHEMA = {
 }
 REPORT_TOOL = "ReportFindings"  # инструмент, которым `/review` отдаёт находки
 RETELLING = "structured_output"  # находки пересказаны моделью в ответе по схеме
+NO_CATEGORY = "без категории"  # тег находки без `category` в `<отчёт>.md`
 
 
 def is_docs(path: str) -> bool:
@@ -217,12 +224,23 @@ def reported(events: list[dict]) -> list[dict] | None:
     return list(result.values()) if accepted and result else None
 
 
+def until_answer(events: list[dict]) -> list[dict]:
+    """События потока до принятого ответа по схеме включительно (`claude_run.last_result`).
+
+    Лишний ход после ответа (ozon #947) может снова вызвать `ReportFindings` — его находки не
+    идут ни в ответ, ни в отчёт: источник находок — один прогон, тот, чей ответ принят.
+    """
+    answered = [number for number, event in enumerate(events) if claude_run.is_answer(event)]
+    return events[: answered[-1] + 1] if answered else events
+
+
 def findings(data: dict, events: list[dict], report: Path) -> tuple[list[dict], str]:
-    """Находки и их источник: оригинал `ReportFindings`, иначе ответ по схеме (пересказ).
+    """Находки и их источник: оригинал `ReportFindings` до принятого ответа по схеме, иначе
+    ответ по схеме (пересказ).
 
     Оригинала нет, а ответ по схеме не по ней — `ChildError`, ответ — в `.raw.md`.
     """
-    original = reported(events)
+    original = reported(until_answer(events))
     if original is not None:
         return original, REPORT_TOOL
     output = data["structured_output"]
@@ -238,8 +256,9 @@ def findings(data: dict, events: list[dict], report: Path) -> tuple[list[dict], 
 
 
 def keep_reported(events: list[dict], report: Path) -> str:
-    """Несостоявшийся прогон успел вызвать `ReportFindings` — оплаченные находки в `.raw.md`."""
-    original = reported(events)
+    """Несостоявшийся прогон успел вызвать `ReportFindings` — оплаченные находки в `.raw.md`
+    (до принятого ответа по схеме, если он был: хвост — не этого прогона)."""
+    original = reported(until_answer(events))
     if original is None:
         return ""
     raw = claude_run.sibling(report, ".raw.md")
@@ -259,7 +278,10 @@ def render(items: list[dict]) -> str:
         line = item.get("line")
         where = f"{item['file']}:{line}" if isinstance(line, int) else item["file"]
         kind = item.get("category")
-        tag = f" ({kind.strip()})" if isinstance(kind, str) and kind.strip() else ""
+        # Нет категории — явная пометка: такую находку вне диффа `/ship` относит к техдолгу.
+        tag = (
+            f" ({kind.strip()})" if isinstance(kind, str) and kind.strip() else f" ({NO_CATEGORY})"
+        )
         lines.append(f"{number}. `{where}`{tag} — {item['summary'].strip()}")
         scenario = item.get("failure_scenario")
         if isinstance(scenario, str) and scenario.strip():
@@ -290,6 +312,7 @@ def run_review(report: Path, base: str, budget: str, scope: dict) -> dict:
         "findings": len(items),
         "findings_source": source,
         **verdict,
+        "trailing_warning": claude_run.trailing_warning(data),
     }
     claude_run.write_json(report, data)
     return data["canon_review"]
@@ -333,6 +356,8 @@ def main(argv: list[str] | None = None) -> int:
             f"review: предупреждение: находки — пересказ модели по схеме (вызова {REPORT_TOOL} "
             "в потоке нет): список мог сократиться"
         )
+    if result["trailing_warning"]:
+        print(f"review: предупреждение: {result['trailing_warning']}")
     if result["over_budget"]:
         print(f"review: предупреждение: {result['warning']}")
     if result["ready_for_human"]:

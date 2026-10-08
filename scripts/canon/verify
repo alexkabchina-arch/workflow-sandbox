@@ -8,7 +8,8 @@
 дочерним процессом, поэтому скрипт запускает его обычным вызовом, не в фоне:
 
     claude -p --model claude-opus-5-5 --max-budget-usd <предел> --output-format json \\
-        --json-schema <схема итога> --permission-mode auto \\
+        --json-schema <схема итога> --disallowedTools=Agent,Workflow,Monitor \\
+        --permission-mode auto \\
         "/verify Проверь изменение ветки: дифф git diff <база>...HEAD. …"
 
 Диапазон диффа — всегда явный: без него скилл берёт `@{u}..` или `origin/HEAD...` и на ветке без
