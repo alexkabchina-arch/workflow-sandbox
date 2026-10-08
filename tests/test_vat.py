@@ -18,6 +18,26 @@ def test_vat_exact_half_rounds_up():
     assert vat_included_kop(3) == 1
 
 
+def test_refund_vat_mirrors_sale():
+    # Возврат 0,03 ₽ гасит НДС продажи: −0,5 коп. → −1
+    assert vat_included_kop(-3) == -1
+
+
+def test_vat_at_other_rate():
+    # 11,00 ₽ с НДС 10 % → НДС 1,00 ₽
+    assert vat_included_kop(1100, 10) == 100
+
+
+def test_vat_at_max_rate():
+    # Ставка 100 % допустима: 2,00 ₽ → НДС 1,00 ₽
+    assert vat_included_kop(200, 100) == 100
+
+
+def test_vat_exact_on_large_sum():
+    # 10**17 * 20 / 120 = 16 666 666 666 666 666,67 — float тут теряет последнюю цифру
+    assert vat_included_kop(10**17) == 16666666666666667
+
+
 def test_zero_rate_gives_no_vat():
     assert vat_included_kop(1000, 0) == 0
 
