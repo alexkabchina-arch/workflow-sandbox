@@ -25,6 +25,20 @@ def test_format_rub():
     assert format_rub(5) == "0.05 ₽"
 
 
+@pytest.mark.parametrize(
+    ("kop", "expected"),
+    [
+        (99, "0.99 ₽"),
+        (99999, "999.99 ₽"),
+        (123456, "1\u00a0234.56 ₽"),
+        (100000000, "1\u00a0000\u00a0000.00 ₽"),
+    ],
+)
+def test_format_rub_thousands_separator(kop, expected):
+    # Тысячи рублей разделяются неразрывным пробелом U+00A0
+    assert format_rub(kop) == expected
+
+
 def test_cli(capsys):
     assert main(["3x100", "1x49.90", "--discount", "10"]) == 0
     assert capsys.readouterr().out.strip() == "314.91 ₽"

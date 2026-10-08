@@ -15,4 +15,6 @@ def order_total_kop(items: Iterable[Item], discount_pct: int = 0) -> int:
 
 def format_rub(kop: int) -> str:
     rub, rest = divmod(kop, 100)
-    return f"{rub}.{rest:02d} ₽"
+    # Тысячи — через неразрывный пробел U+00A0, чтобы сумма не переносилась
+    rub_str = f"{rub:,}".replace(",", " ")
+    return f"{rub_str}.{rest:02d} ₽"
