@@ -14,7 +14,9 @@ def order_total_kop(items: Iterable[Item], discount_pct: int = 0) -> int:
 
 
 def format_rub(kop: int) -> str:
-    rub, rest = divmod(kop, 100)
+    # Знак отдельно: divmod от отрицательного дал бы -1235 и 44 вместо -1234 и 56
+    sign = "-" if kop < 0 else ""
+    rub, rest = divmod(abs(kop), 100)
     # Тысячи — через неразрывный пробел U+00A0, чтобы число не разрывалось переносом
     rub_str = f"{rub:,}".replace(",", "\u00a0")
-    return f"{rub_str}.{rest:02d} ₽"
+    return f"{sign}{rub_str}.{rest:02d} ₽"
