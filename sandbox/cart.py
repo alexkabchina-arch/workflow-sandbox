@@ -19,8 +19,8 @@ class Item:
 def parse_item(spec: str) -> Item:
     """«3x100» или «3X100» → 3 штуки по 100 ₽ (цена хранится в копейках).
 
-    Пробелы вокруг «x» и по краям допустимы (« 3 x 100 »), внутри числа — ValueError («3 0x1»):
-    так ведут себя int() и Decimal(), отдельной обработки нет.
+    Пробельные символы (как у str.strip(): пробел, таб, перевод строки) вокруг «x» и по краям
+    допустимы (« 3 x 100 »), внутри числа — ValueError («3 0x1»): так ведут себя int() и Decimal().
 
     Цена неотрицательна и не точнее копейки: «1x0.005» и «1x-0.01» — ValueError, без округления.
     """
@@ -30,7 +30,7 @@ def parse_item(spec: str) -> Item:
     qty = int(qty_s)
     if qty <= 0:
         raise ValueError("количество должно быть положительным")
-    price_raw = spec[len(qty_s) + len(sep) :]
+    price_raw = spec[len(qty_s) + len(sep) :].strip()
     try:
         price = Decimal(price_s)
         if not price.is_finite():

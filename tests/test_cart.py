@@ -19,6 +19,7 @@ def test_parse_item_uppercase_separator():
 def test_parse_item_allows_spaces_around_separator():
     assert parse_item(" 3 x 100 ") == Item(qty=3, price_kop=10000)
     assert parse_item("1 X 49.90") == Item(qty=1, price_kop=4990)
+    assert parse_item("\t3\tx\t100\n") == Item(qty=3, price_kop=10000)
 
 
 @pytest.mark.parametrize(
@@ -57,6 +58,7 @@ def test_parse_item_rejects(spec):
         ("1x123456789012345678901234567.89", "до 15 цифр"),
         ("1x1e999999", "до 15 цифр"),
         ("1xNaN", "'NaN'"),
+        (" 3 x 0.005 ", "точнее копейки: '0.005'"),
     ],
 )
 def test_parse_item_price_errors(spec, message):
