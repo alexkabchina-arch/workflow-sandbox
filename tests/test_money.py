@@ -20,11 +20,29 @@ def test_discount_out_of_range(pct):
         order_total_kop([Item(1, 100)], pct)
 
 
-def test_format_rub():
-    assert format_rub(31491) == "314.91 ₽"
-    assert format_rub(5) == "0.05 ₽"
+@pytest.mark.parametrize(
+    ("kop", "expected"),
+    [
+        (0, "0.00 ₽"),
+        (5, "0.05 ₽"),
+        (99, "0.99 ₽"),
+        (31491, "314.91 ₽"),
+        (99999, "999.99 ₽"),
+        # Тысячи рублей разделяются неразрывным пробелом U+00A0
+        (100000, "1\u00a0000.00 ₽"),
+        (123456, "1\u00a0234.56 ₽"),
+        (100000000, "1\u00a0000\u00a0000.00 ₽"),
+    ],
+)
+def test_format_rub(kop, expected):
+    assert format_rub(kop) == expected
 
 
 def test_cli(capsys):
     assert main(["3x100", "1x49.90", "--discount", "10"]) == 0
     assert capsys.readouterr().out.strip() == "314.91 ₽"
+
+
+def test_cli_thousands_separator(capsys):
+    assert main(["1000x1000"]) == 0
+    assert capsys.readouterr().out == "1\u00a0000\u00a0000.00 ₽\n"
