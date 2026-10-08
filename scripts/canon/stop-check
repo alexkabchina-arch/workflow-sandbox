@@ -14,8 +14,8 @@
   без красного CI и с авто-мёржем, незакоммиченных правок отслеживаемых файлов нет — конец `/ship`;
 - слитый PR ветки с head = локальный HEAD, незакоммиченных правок нет;
 - отчёт об остановке **этой** сессии: метка `ready-for-human` и комментарий, первая строка
-  которого — «Отчёт об остановке…» (или «ready-for-human: не подтверждено…» от `ship-finish
-  --unconfirmed`), созданный после начала сессии (первая запись транскрипта). Где: открытый PR
+  которого — «Отчёт об остановке…» (так его пишет и `ship-finish --unconfirmed`), созданный после
+  начала сессии (первая запись транскрипта). Где: открытый PR
   ветки — на нём, и он черновик (иначе `session-start` возьмёт его дозапуском `/ship`); PR нет —
   на тикете N (`ticket-N`) или на PR M (`pr-M`).
 
@@ -43,7 +43,7 @@ from datetime import datetime
 REVIEW = "review"
 WAITING = "ready-for-human"
 ENFORCE = "CANON_ENFORCE_STOP"
-REPORT_MARKS = ("Отчёт об остановке", f"{WAITING}: не подтверждено")
+REPORT_MARK = "Отчёт об остановке"
 OWNER_CHECKS = {"restricted-paths"}
 RED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 SESSION = re.compile(r"^(ticket|pr)-(\d+)$")
@@ -123,7 +123,7 @@ class Session:
         reports = [
             c
             for c in item.get("comments") or []
-            if (c.get("body") or "").lstrip().startswith(REPORT_MARKS)
+            if (c.get("body") or "").lstrip().startswith(REPORT_MARK)
         ]
         if not reports:
             return False
@@ -188,12 +188,12 @@ class Session:
         return None
 
     def reason(self, problem: str) -> str:
-        ship = 'scripts/canon/ship-finish --title "<заголовок>" --body-file <тело PR.md>'
         where = (
-            "есть открытый PR — на нём, черновиком: "
-            f'`{ship} --unconfirmed "Отчёт об остановке: …"`; если и это не проходит (push '
-            "отклонён) — вручную `gh pr ready <PR> --undo`, `gh pr edit <PR> --add-label "
-            f"{WAITING}`, `gh pr comment <PR> --body-file <отчёт.md>`; "
+            '`scripts/canon/ship-finish --unconfirmed "Отчёт об остановке: …"` — без push: есть '
+            "открытый PR — на нём, PR в черновик, авто-мёрж выключен; PR нет — в тикете ветки "
+            "ticket-N или ticket-N-…. Если и это не проходит — вручную: есть открытый PR — "
+            "`gh pr merge <PR> --disable-auto`, `gh pr ready <PR> --undo`, `gh pr edit <PR> "
+            f"--add-label {WAITING}`, `gh pr comment <PR> --body-file <отчёт.md>`; "
         )
         if self.kind == "ticket":
             where += (
@@ -209,9 +209,9 @@ class Session:
             f"Сессия {self.label} не закончена: {problem}. Законный конец — одно из двух. "
             "(1) Довести /ship по шагам `.claude/skills/ship/SKILL.md` — открытый PR ветки с "
             "отметкой review на запушенном head, без красного CI и с авто-мёржем; отметку "
-            "`ship-finish` ставит только по отчётам `scripts/canon/review`, доходящим до head; "
-            "после правки — коммит, одно прицельное ревью на заход /ship (возврат по красному CI "
-            "— новый заход) и ship-finish заново. "
+            "`ship-finish` ставит только по отчёту полного ревью `scripts/canon/review`, чей head "
+            "— HEAD или его предок; после правки — коммит, тесты и линтеры и ship-finish заново с "
+            "тем же отчётом полного ревью. "
             "(2) Если довести нельзя — отчёт об остановке этой сессии: комментарий, "
             "первая строка которого «Отчёт об остановке», дальше причина, доказательства, "
             f"варианты, рекомендация — понятно владельцу без сессии; плюс метка {WAITING}. "

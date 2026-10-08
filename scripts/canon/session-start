@@ -11,7 +11,9 @@
    проектная команда `scripts/session/cleanup <путь worktree>` из главного worktree. Успех —
    запись уходит из реестра; сбой — запись остаётся до следующего старта, старт продолжается,
    но заново занять этот путь нельзя, пока ресурсы не убраны. Нет команды — запись просто уходит.
-   Реестр — `canon-sessions.json` в общем каталоге git, правится под блокировкой.
+   Реестр — `canon-sessions.json` в общем каталоге git, правится под блокировкой. Затем
+   `git fetch --prune`; главный чекаут на `main` без незакоммиченного — fast-forward к
+   `origin/main` (иначе сообщение, старт идёт дальше).
 2. PR автора (`gh pr list --author @me`) на ветках сессий (`ticket-N`, `ticket-N-*`; ручные PR
    владельца на других ветках не трогаются), кроме черновиков: красный CI на head (провал
    `restricted-paths` не в счёт — это ожидание владельца) или нет отметки ревью (статус `review`)
@@ -29,19 +31,30 @@
    `../<проект>-ticket-N` (`../<проект>-pr-M`) на ветке `ticket-N` от `origin/main` (на ветке PR).
    Ветка тикета `ticket-N` или `ticket-N-*` уже есть локально или на сервере — берётся она (две
    с суффиксом — стоп, выбрать вручную). Ветка тикета, уже слитая squash-мёржем (её конец — head
-   слитого PR, которого нет в `origin/main`), заново не берётся, иначе её коммиты уйдут в новый
-   PR: только локальная и без worktree — удаляется, новая идёт от `origin/main`; на сервере или с
-   worktree — стоп с командой, как убрать. Новые коммиты поверх слитого head — обычная работа
-   ветки (новый PR), их старт не трогает. Ветка PR подтягивается
-   к серверу fast-forward; разошлась — стоп; на сервере её нет — сбой git. Потом проектная
+   слитого PR или его предок, и его нет в `origin/main`), заново не берётся, иначе её коммиты
+   уйдут в новый PR: только локальная и без worktree — удаляется, новая идёт от `origin/main`;
+   на сервере или с worktree — стоп с командой, как убрать. Новые коммиты поверх слитого head —
+   обычная работа ветки (новый PR), их старт не трогает. Ветка PR подтягивается к серверу
+   fast-forward; разошлась — стоп; на сервере её нет — сбой git. Потом проектная
    `scripts/session/setup` в корне worktree, если есть.
+   Перед worktree — уборка слитых PR (только если старт дошёл сюда): ветка `ticket-*`, которой
+   нет на сервере и чей конец — head слитого PR или его предок (любым мёржем, и squash; head,
+   которого нет локально, подтягивается `pull/<N>/head`), — её
+   worktree (`git worktree remove` без `--force`: незакоммиченное, кроме игнорируемого, держит
+   его; занятый, с живой сессией или каталог самого старта — пропуск с сообщением), проектная
+   `cleanup` для него и ветка. С новыми коммитами поверх слитого head, сбой git или `gh` на
+   ветке — пропуск с сообщением. Ветка этого старта и главный чекаут не
+   трогаются.
 5. Метка `in-progress` и исполнитель — я: после worktree и `setup`, чтобы сбой на них не оставил
    тикет занятым без сессии.
 
-Итог — путь worktree, метка сессии `CANON_SESSION` (её читает Stop-хук) и промпт; с `--json` —
-последней строкой JSON. Код выхода 0 — готово; 1 — сбой git, `gh` или `scripts/session/setup`;
-2 — ошибка аргументов, тикет закрыт или занят другим, сессия тикета уже идёт, неоднозначная или
-уже слитая ветка тикета (сообщение говорит, что убрать).
+Итог — путь worktree, метка сессии `CANON_SESSION` (её читает Stop-хук), промпт и строка
+«Запуск:» для новой сессии из терминала. Не из `session-run` и не изнутри worktree плана — ещё
+строка «Открытая сессия остаётся в главном чекауте»: команды с путём worktree, `EnterWorktree` не
+вызывать (вход вне `.claude/worktrees/` ждёт клика владельца). С `--json` — последней строкой
+JSON. Код выхода 0 — готово; 1 — сбой git, `gh` или `scripts/session/setup`; 2 — ошибка
+аргументов, тикет закрыт или занят другим, сессия тикета уже идёт, неоднозначная или уже слитая
+ветка тикета (сообщение говорит, что убрать).
 
 `session-run` вызывает `prepare` этого файла в своём процессе и через `claim` берёт замок сессии
 под блокировкой реестра — параллельный старт не увидит worktree свободным в промежутке.
@@ -139,6 +152,10 @@ def has_ref(ref: str) -> bool:
     return tip(ref) is not None
 
 
+def git_ok(*args: str, cwd: Path) -> bool:
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=False).returncode == 0
+
+
 def is_ancestor(older: str, newer: str, cwd: Path) -> bool:
     """Код 1 — не предок; любой другой ненулевой (нет ссылки, сбой git) — `StartError`."""
     result = subprocess.run(
@@ -224,24 +241,165 @@ def write_registry(entries: dict) -> None:
     os.replace(tmp.name, path)
 
 
+def clean_resources(path: str, main: Path) -> bool:
+    """Проектная `cleanup <путь>` из главного worktree; нет команды — убирать нечего."""
+    command = main / CLEANUP
+    if not command.is_file():
+        return True
+    code, output = project_command([str(command), path], main)
+    if code != 0:
+        note(f"уборка {path} не удалась ({CLEANUP}): {output}; повтор при следующем старте")
+        return False
+    note(f"убраны ресурсы worktree {path}")
+    return True
+
+
 def cleanup(main: Path) -> set[str]:
     """Уборка исчезнувших worktree; итог — пути, чьи ресурсы убрать не удалось."""
     run("git", "worktree", "prune")
     alive = {w["path"] for w in worktrees()}
     entries = read_registry()
-    command = main / CLEANUP
     pending = set()
     for path in sorted(set(entries) - alive):
-        if command.is_file():
-            code, output = project_command([str(command), path], main)
-            if code != 0:
-                note(f"уборка {path} не удалась ({CLEANUP}): {output}; повтор при следующем старте")
-                pending.add(path)
-                continue
-            note(f"убраны ресурсы исчезнувшего worktree {path}")
+        if not clean_resources(path, main):
+            pending.add(path)
+            continue
         del entries[path]
     write_registry(entries)
     return pending
+
+
+def sync_main(main: Path) -> None:
+    """Главный чекаут на `main` без правок — fast-forward к `origin/main`; иначе сообщение.
+
+    Отставший `main` подсовывает `/code-review` старую базу. Старт это не останавливает.
+    """
+    branch = subprocess.run(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=main,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if branch != "main":
+        note(f"главный чекаут {main} не на main ({branch or 'detached HEAD'}) — не догнан")
+        return
+    try:
+        dirty = run("git", "status", "--porcelain", "--untracked-files=no", cwd=main)
+    except StartError as exc:
+        note(f"главный чекаут {main} не догнан до origin/main: {exc}")
+        return
+    if dirty:
+        note(f"главный чекаут {main}: незакоммиченные правки — не догнан до origin/main")
+        return
+    try:
+        run("git", "merge", "-q", "--ff-only", "origin/main", cwd=main)
+    except StartError as exc:
+        note(
+            f"главный чекаут {main} не догнан до origin/main (разошёлся или мешают "
+            f"неотслеживаемые файлы): {exc}"
+        )
+
+
+def sweep_merged(main: Path, keep: str, here: Path | None) -> set[str]:
+    """Worktree и ветки слитых PR; итог — пути, чьи ресурсы убрать не удалось.
+
+    Убирается ветка `ticket-*`, которой нет на сервере и чей конец — head слитого PR или его
+    предок, каким бы мёржем PR ни был слит (`ship-finish` сливает squash): её worktree
+    (`git worktree remove` без `--force`), проектная `cleanup` для него, затем ветка. С новыми
+    коммитами поверх слитого head — пропуск с сообщением. Не трогаются: `keep` (ветка этого
+    старта), ветки на сервере (открытые PR), главный чекаут, ветка с живой сессией, worktree, из
+    которого запущен старт (`here`: открытая сессия без замка). Сбой git или `gh` на ветке —
+    пропуск, старт идёт дальше.
+    """
+    branches = run("git", "for-each-ref", "--format=%(refname:short)", "refs/heads/ticket-*")
+    holders = {w.get("branch"): Path(w["path"]) for w in worktrees()}
+    pending = set()
+    for branch in branches.split():
+        if branch == keep or not SESSION_BRANCH.match(branch):
+            continue
+        try:
+            if path := sweep_branch(branch, holders.get(branch), main, here):
+                pending.add(path)
+        except StartError as exc:
+            note(f"пропуск {branch}: {exc}")
+    return pending
+
+
+def merged_url(end: str, merged: dict[str, dict], main: Path) -> str | None:
+    """PR, слитый с концом `end` или с коммитами поверх него (ветку догнали на сервере).
+
+    head такого PR после squash-мёржа локально обычно нет: он подтягивается с сервера
+    (`pull/<N>/head`, как в `ship-finish`); не подтянулся — не этот PR.
+    """
+    if end in merged:
+        return merged[end]["url"]
+    for head, pr in merged.items():
+        fetch_head(head, pr["number"], main)
+        with contextlib.suppress(StartError):  # head нет локально — не этот PR
+            if is_ancestor(end, head, main):
+                return pr["url"]
+    return None
+
+
+def fetch_head(sha: str, number: int, main: Path) -> None:
+    """head слитого PR — локально; нет — `git fetch origin pull/<N>/head`, сбой не страшен."""
+    if git_ok("cat-file", "-e", f"{sha}^{{commit}}", cwd=main):
+        return
+    git_ok("fetch", "-q", "origin", f"pull/{number}/head", cwd=main)
+
+
+def sweep_branch(branch: str, path: Path | None, main: Path, here: Path | None) -> str | None:
+    """Одна ветка `sweep_merged`; итог — путь worktree, чьи ресурсы убрать не удалось."""
+    if has_ref(f"refs/remotes/origin/{branch}"):
+        return None
+    end = tip(f"refs/heads/{branch}")
+    if end is None:  # ветку уже удалили
+        return None
+    merged = merged_heads(branch)
+    url = merged_url(end, merged, main)
+    if url is None:
+        if merged:
+            note(
+                f"пропуск {branch}: конец ветки — не head слитого PR и не его предок "
+                "(новые коммиты поверх слитого или head слитого PR не получен с сервера)"
+            )
+        return None
+    if path == main:
+        note(f"пропуск {branch}: на ней главный чекаут")
+        return None
+    # По реестру тоже: живая сессия могла уйти с ветки в detached HEAD.
+    if busy := session_busy(branch):
+        note(f"пропуск {branch}: в {busy} идёт сессия")
+        return None
+    if path is not None and here is not None and here.is_relative_to(path):
+        note(f"пропуск {branch}: из {path} запущен этот старт")
+        return None
+    failed = None
+    if path is not None:
+        result = subprocess.run(
+            ["git", "worktree", "remove", str(path)], capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            note(f"пропуск {branch}: {path} не убран — {result.stderr.strip()}")
+            return None
+        note(f"убран worktree {path} слитого PR {url}")
+        entries = read_registry()
+        if clean_resources(str(path), main):
+            entries.pop(str(path), None)
+        else:
+            entries.setdefault(str(path), {"branch": branch})
+            failed = str(path)
+        write_registry(entries)
+    # Конец ветки — head слитого PR или его предок (проверено выше): работы сверх слитой нет.
+    # `-d` отказал бы на squash-мёрже (ветки нет в `origin/main`) и сверял бы её с HEAD главного
+    # чекаута, который мог не догнаться. `-D`, а не `update-ref -d`: он убирает и настройки ветки в
+    # конфиге и не трогает ветку, которую перебазируют в другом worktree.
+    if tip(f"refs/heads/{branch}") != end:
+        note(f"пропуск {branch}: ветку сдвинули во время уборки")
+        return failed
+    run("git", "branch", "-q", "-D", branch)
+    note(f"удалена ветка {branch} слитого PR {url}")
+    return failed
 
 
 # --- PR автора ---
@@ -442,23 +600,32 @@ def ticket_branch(number: int) -> str:
     return suffixed[0] if suffixed else exact
 
 
+def merged_heads(branch: str) -> dict[str, dict]:
+    """Слитые в main PR ветки: {head: {"url", "number"}}.
+
+    PR, слитый в другую ветку (стек PR), работу в main не донёс — для уборки ветка не слита.
+    """
+    query = ["--head", branch, "--base", "main", "--state", "merged"]
+    found = run("gh", "pr", "list", *query, "--json", "number,url,headRefOid")
+    return {pr["headRefOid"]: pr for pr in json.loads(found)}
+
+
 def retire_spent(branch: str, main: Path) -> None:
     """Ветка тикета, уже слитая squash-мёржем, заново не берётся: её коммиты ушли бы в новый PR.
 
-    Слитая — её конец равен head слитого PR, которого нет в `origin/main` (при мёрже обычным
-    merge commit он там есть, и ветка годна как есть). Только локальная и без worktree —
+    Слитая — её конец равен head слитого PR или его предок (ветку догнали на сервере; head
+    подтягивается, как в `merged_url`), и его нет в `origin/main` (при мёрже обычным merge commit
+    он там есть, и ветка годна как есть). Только локальная и без worktree —
     удаляется (работы сверх слитой нет), дальше ветка заводится от `origin/main`; иначе — стоп.
     """
     local, remote = tip(f"refs/heads/{branch}"), tip(f"refs/remotes/origin/{branch}")
     if local is None and remote is None:
         return
-    fields = "number,url,headRefOid"
-    found = run("gh", "pr", "list", "--head", branch, "--state", "merged", "--json", fields)
-    merged = {pr["headRefOid"]: pr["url"] for pr in json.loads(found)}
+    merged = merged_heads(branch)
     spent = {
-        end: merged[end]
+        end: url
         for end in {local, remote} - {None}
-        if end in merged and not is_ancestor(end, "origin/main", main)
+        if (url := merged_url(end, merged, main)) and not is_ancestor(end, "origin/main", main)
     }
     if remote in spent and local in (None, remote):
         raise UsageError(
@@ -521,14 +688,18 @@ def setup(worktree: Path) -> None:
 # --- сборка ---
 
 
-def start(number: int, claim=None) -> dict:
-    """Готовит сессию; `claim(worktree)` — под блокировкой реестра, до `setup` (замок сессии)."""
+def start(number: int, claim=None, here: Path | None = None) -> dict:
+    """Готовит сессию; `claim(worktree)` — под блокировкой реестра, до `setup` (замок сессии).
+
+    `here` — каталог, откуда запущен старт: его worktree уборка слитых PR не трогает.
+    """
     main = Path(worktrees()[0]["path"])
     os.chdir(main)
     with registry_lock():
         pending = cleanup(main)
         # --prune: ветка, удалённая на сервере после мёржа, не должна браться из старой ссылки.
         run("git", "fetch", "-q", "--prune", "origin")
+        sync_main(main)
         plan = pick_pr()
         if plan is None:
             unmarked = check_ticket(number)
@@ -536,6 +707,7 @@ def start(number: int, claim=None) -> dict:
             if busy := session_busy(branch):
                 raise UsageError(f"сессия тикета #{number} уже идёт в {busy}")
             retire_spent(branch, main)
+            pending |= sweep_merged(main, keep=branch, here=here)
             plan = {
                 "kind": "ticket",
                 "ticket": number,
@@ -546,6 +718,7 @@ def start(number: int, claim=None) -> dict:
             worktree = ensure_worktree(main, branch, plan["session"], pending)
         else:
             plan["postponed"] = number
+            pending |= sweep_merged(main, keep=plan["branch"], here=here)
             worktree = ensure_worktree(main, plan["branch"], plan["session"], pending)
             sync_pr_branch(worktree, plan["branch"])
         plan["branch"] = run("git", "-C", str(worktree), "symbolic-ref", "--short", "HEAD")
@@ -561,36 +734,53 @@ def start(number: int, claim=None) -> dict:
     return plan
 
 
-def report(plan: dict) -> str:
+def report(plan: dict, outside: bool) -> str:
+    """Итог для человека; `outside` — старт не из `session-run` и не изнутри worktree плана:
+    из открытой сессии в главном чекауте или из терминала — их скрипт не различает."""
     if plan["kind"] == "pr":
         head = f"PR автора требует внимания: {plan['url']} — тикет #{plan['postponed']} отложен"
     else:
         head = f"тикет #{plan['ticket']}: метка {IN_PROGRESS}"
-    return "\n".join(
-        [
-            f"session-start: {head}",
-            f"  worktree  {plan['worktree']} (ветка {plan['branch']})",
-            f"  сессия    CANON_SESSION={plan['session']}",
-            f"  промпт    {plan['prompt']}",
-            f"Запуск: cd {shlex.quote(plan['worktree'])} && CANON_SESSION={plan['session']} "
-            f"claude -- {shlex.quote(plan['prompt'])}",
-        ]
-    )
+    lines = [
+        f"session-start: {head}",
+        f"  worktree  {plan['worktree']} (ветка {plan['branch']})",
+        f"  сессия    CANON_SESSION={plan['session']}",
+        f"  промпт    {plan['prompt']}",
+        f"Запуск: cd {shlex.quote(plan['worktree'])} && CANON_SESSION={plan['session']} "
+        f"claude -- {shlex.quote(plan['prompt'])}",
+    ]
+    if outside:
+        wt = shlex.quote(plan["worktree"])
+        lines.append(
+            f"Открытая сессия остаётся в главном чекауте: команды — `cd {wt} && …` или "
+            f"`git -C {wt}`, правки — по абсолютным путям в worktree; EnterWorktree не вызывать "
+            "(вход вне .claude/worktrees/ ждёт клика владельца); промпт набирает владелец, "
+            "«Запуск:» — для новой сессии из терминала"
+        )
+    return "\n".join(lines)
 
 
 def prepare(ticket: str, claim=None) -> tuple[int, dict | None]:
     """Старт с печатью итога: (код выхода, план); план — только при коде 0."""
     try:
+        try:
+            here = Path.cwd().resolve()  # `start` уходит в главный worktree
+        except FileNotFoundError:
+            raise UsageError(
+                "текущий каталог удалён (терминал остался в убранном worktree) — перейдите в "
+                "главный чекаут проекта и повторите старт"
+            ) from None
         if not ticket.lstrip("#").isdigit():
             raise UsageError(f"номер тикета — число, а не {ticket!r}")
-        plan = start(int(ticket.lstrip("#")), claim)
+        plan = start(int(ticket.lstrip("#")), claim, here)
     except UsageError as exc:
         note(str(exc))
         return 2, None
     except StartError as exc:
         note(str(exc))
         return 1, None
-    print(report(plan))
+    inside = here.is_relative_to(Path(plan["worktree"]).resolve())
+    print(report(plan, outside=claim is None and not inside))
     return 0, plan
 
 
