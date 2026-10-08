@@ -1,4 +1,4 @@
-"""НДС, включённый в сумму: total * rate / (100 + rate), в копейках."""
+"""НДС, включённый в сумму: total * rate / (100 + rate), в копейках, округление половина вверх."""
 
 
 def vat_included_kop(total_kop: int, rate_pct: int = 20) -> int:

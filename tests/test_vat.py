@@ -13,6 +13,11 @@ def test_vat_rounds_half_up_to_kopeck():
     assert vat_included_kop(100) == 17
 
 
+def test_vat_exact_half_rounds_up():
+    # 0,03 ₽ * 20 / 120 = 0,5 коп. → 1
+    assert vat_included_kop(3) == 1
+
+
 def test_zero_rate_gives_no_vat():
     assert vat_included_kop(1000, 0) == 0
 
