@@ -16,6 +16,11 @@ def test_parse_item_uppercase_separator():
     assert parse_item("3X100") == Item(qty=3, price_kop=10000)
 
 
+def test_parse_item_allows_spaces_around_separator():
+    assert parse_item(" 3 x 100 ") == Item(qty=3, price_kop=10000)
+    assert parse_item("1 X 49.90") == Item(qty=1, price_kop=4990)
+
+
 @pytest.mark.parametrize(
     "spec",
     [
@@ -32,6 +37,8 @@ def test_parse_item_uppercase_separator():
         "1xabc",
         "1xnan",
         "1xinf",
+        "3 0x1",
+        "3x1 00",
     ],
 )
 def test_parse_item_rejects(spec):
