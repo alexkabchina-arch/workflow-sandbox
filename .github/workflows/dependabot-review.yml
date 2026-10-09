@@ -23,8 +23,8 @@
 # проект делает по push в `main`, ждёт следующего обычного мёржа. Хуже всего — workflow с фильтром
 # по путям на lock-файлы, их меняет почти только Dependabot: в vps `build-images` и `warm-deps-cache`
 # (`pnpm-lock.yaml`), в ozon `cache-warm` — они фактически не запускаются (чек-лист переноса).
-# PR Dependabot на `.github/` (экосистема `github-actions`) упирается в `restricted-paths` и ждёт
-# владельца, как любой PR на путь-ограничитель.
+# PR Dependabot на `.github/` (экосистема `github-actions`) ждёт одобрения владельца (`CODEOWNERS`):
+# Dependabot — не владелец, одобрение код-оунера с его PR требуется.
 name: dependabot-review
 
 on:
