@@ -21,3 +21,7 @@
 # Профиль проекта: критичные зоны и ожидаемые job CI. CODEOWNERS не различает разделы
 # файла — под одобрением весь профиль.
 /docs/agents/profile.md         @alexkabchina-arch
+
+# Обязательный раздел `CLAUDE.md` — файл канона, подключённый импортом (#144): правило агенту,
+# как сам `CLAUDE.md`, хоть его содержимое и сверяет `.canon.lock`.
+/.claude/canon/                 @alexkabchina-arch

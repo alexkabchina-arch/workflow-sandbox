@@ -30,12 +30,17 @@
 ревью не состоялось (код 1), ответ — в `<отчёт>.raw.md`; туда же — находки `ReportFindings`,
 если прогон оборвался после него.
 В `<отчёт.json>` — сырой результат (`modelUsage`, стоимость, `structured_output`), рядом
-`<отчёт>.md` — находки списком (его читает `/ship`). Пропуск тоже пишет `<отчёт.json>` (без
-`.md`). В блоке `canon_review` отчёта — что проверено: `base` (как передан), `base_sha` (начало
-диффа — merge-base базы и HEAD), `head` (HEAD на старте ревью), `skipped`, у состоявшегося
-ревью — `findings` (число находок) и `findings_source`. По ним `ship-finish` ставит отметку
-ревью: `head` отчёта — HEAD ветки или его предок, коммиты после него ревью не проходят (их
-проверяют тесты, CI и `/verify`, решение канона `docs/decisions/2026-10-03-no-re-review.md`); у
+`<отчёт>.md` — находки списком (его читает `/ship`).
+Схема требует и ответ на обязательный вопрос `weakening`: ослабляет ли дифф проверки, права
+агента, правила или обезличивание (пустая строка — нет). Ответ — в `canon_review.weakening`,
+в `<отчёт>.md` и строкой `review: ослабление защиты: …`; ответа нет — пометка
+`NO_WEAKENING_ANSWER`, не «нет». Без решения сессии по нему `ship-finish` откажет.
+Пропуск тоже пишет `<отчёт.json>` (без `.md`). В блоке `canon_review` отчёта — что проверено:
+`base` (как передан), `base_sha` (начало диффа — merge-base базы и HEAD), `head` (HEAD на
+старте ревью), `skipped`, у состоявшегося ревью — `findings` (число находок), `findings_source`
+и `weakening`. По ним `ship-finish` ставит отметку ревью: `head` отчёта — HEAD ветки или его
+предок, коммиты после него ревью не проходят (их проверяют тесты, CI и `/verify`, решение
+канона `docs/decisions/2026-10-03-no-re-review.md`); у
 несостоявшегося ревью блока нет — отметки по нему нет. Ревью — одно полное на ветку: отметку
 `ship-finish` ставит только по отчёту, чьё начало диффа — в `origin/main`; прицельного
 повторного ревью исправлений (`--base <head прошлого отчёта>`) в `/ship` нет.
@@ -71,7 +76,7 @@ from pathlib import Path, PurePosixPath
 
 def load_claude_run():
     """Общий модуль канона рядом со скриптом — без правки `sys.path` и без `__pycache__`
-    в вендоренном `scripts/canon/` (его закоммитили бы на путь-ограничитель)."""
+    в вендоренном `scripts/canon/` (его закоммитили бы вместе с работой ветки)."""
     path = Path(__file__).resolve().parent / "claude_run.py"
     module = types.ModuleType("canon_claude_run")
     module.__file__ = str(path)
@@ -117,13 +122,26 @@ SCHEMA = {
             "description": "Все находки ревью, без отбора, самые серьёзные первыми; "
             "нет находок — пустой список",
         },
+        "weakening": {
+            "type": "string",
+            "description": "Обязательный вопрос: ослабляет ли дифф проверки (тесты, CI, "
+            "обязательные проверки, ревью, хуки), права агента (разрешения и запреты настроек, "
+            "доступы), правила (CLAUDE.md и его импорты, в том числе .claude/canon/process.md, "
+            "AGENTS.md, скиллы, профиль, CODEOWNERS) или "
+            "обезличивание данных? Ослабление — снять, отключить, сузить, сделать "
+            "необязательным или обходимым. Нет — пустая строка; да — что именно ослабляется, "
+            "файл и строка, простыми словами",
+        },
     },
-    "required": ["findings"],
+    "required": ["findings", "weakening"],
     "additionalProperties": False,
 }
 REPORT_TOOL = "ReportFindings"  # инструмент, которым `/review` отдаёт находки
 RETELLING = "structured_output"  # находки пересказаны моделью в ответе по схеме
 NO_CATEGORY = "без категории"  # тег находки без `category` в `<отчёт>.md`
+# Нет ответа на вопрос об ослаблении — не «нет ослабления»: решает сессия (`ship-finish`).
+NO_WEAKENING_ANSWER = "ревью не ответило на вопрос об ослаблении защиты — оценить дифф самому"
+PLAIN_NO = {"", "нет", "ослабления нет", "не ослабляет", "no", "none"}  # ответ «нет» словами
 
 
 def is_docs(path: str) -> bool:
@@ -269,16 +287,33 @@ def keep_reported(events: list[dict], report: Path) -> str:
     return f"; находки ReportFindings ({len(original)}) — в {raw}"
 
 
-def render(items: list[dict]) -> str:
-    """Находки списком в markdown — для `<отчёт>.md`."""
+def weakening(output: dict) -> str:
+    """Ответ на вопрос об ослаблении защиты: пустая строка — нет («Нет.» и подобное — тоже);
+    не ответило — пометка."""
+    answer = output.get("weakening")
+    if not isinstance(answer, str):
+        return NO_WEAKENING_ANSWER
+    answer = answer.strip()
+    return "" if answer.lower().rstrip(".!") in PLAIN_NO else answer
+
+
+def render(items: list[dict], weakened: str | None = None) -> str:
+    """Находки списком в markdown и ответ об ослаблении защиты (`None` — ответа ещё нет) — для
+    `<отчёт>.md`."""
+    tail = ""
+    if weakened:
+        tail = f"\n\n## Ослабление защиты\n\n{weakened}"
+    elif weakened is not None:
+        tail = "\n\nОслабления защиты нет."
     if not items:
-        return "# Ревью ошибок\n\nНаходок нет."
+        return "# Ревью ошибок\n\nНаходок нет." + tail
     lines = [f"# Ревью ошибок\n\nНаходок: {len(items)}.\n"]
     for number, item in enumerate(items, 1):
         line = item.get("line")
         where = f"{item['file']}:{line}" if isinstance(line, int) else item["file"]
         kind = item.get("category")
-        # Нет категории — явная пометка: такую находку вне диффа `/ship` относит к техдолгу.
+        # Нет категории — явная пометка, чтобы находка не выглядела оборванной; техдолг
+        # `/ship` решает по сценарию вреда, не по тегу.
         tag = (
             f" ({kind.strip()})" if isinstance(kind, str) and kind.strip() else f" ({NO_CATEGORY})"
         )
@@ -286,7 +321,7 @@ def render(items: list[dict]) -> str:
         scenario = item.get("failure_scenario")
         if isinstance(scenario, str) and scenario.strip():
             lines.append(f"   Сценарий: {scenario.strip()}")
-    return "\n".join(lines)
+    return "\n".join(lines) + tail
 
 
 def run_review(report: Path, base: str, budget: str, scope: dict) -> dict:
@@ -304,13 +339,15 @@ def run_review(report: Path, base: str, budget: str, scope: dict) -> dict:
     except claude_run.ChildError as exc:
         kept = keep_reported(events, report)
         raise claude_run.ChildError(f"ревью не состоялось: {exc}{kept}") from None
-    claude_run.write_text(report.with_suffix(".md"), render(items))
+    weakened = weakening(data["structured_output"])
+    claude_run.write_text(report.with_suffix(".md"), render(items, weakened))
     verdict = claude_run.budget_verdict(data.get("total_cost_usd"), budget, "ревью стоило")
     data["canon_review"] = {
         **scope,
         "skipped": False,
         "findings": len(items),
         "findings_source": source,
+        "weakening": weakened,
         **verdict,
         "trailing_warning": claude_run.trailing_warning(data),
     }
@@ -351,6 +388,9 @@ def main(argv: list[str] | None = None) -> int:
         f"{'?' if cost is None else f'{cost:.2f}'} USD, находок: {result['findings']}); "
         f"находки — {args.report.with_suffix('.md')}"
     )
+    if result["weakening"]:
+        lines = [line.strip() for line in result["weakening"].splitlines() if line.strip()]
+        print(f"review: ослабление защиты: {' / '.join(lines)}")
     if result["findings_source"] == RETELLING:
         print(
             f"review: предупреждение: находки — пересказ модели по схеме (вызова {REPORT_TOOL} "

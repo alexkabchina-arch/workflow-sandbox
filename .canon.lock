@@ -1,8 +1,9 @@
 {
   "canon": "alexkabchina-arch/workflow",
-  "version": "v2026.10.06.1",
-  "commit": "209901c8673966dfdb10a30648087668ae708e74",
+  "version": "a2211ec14af3b5515f3d2d0db28bf4330b0b44bb",
+  "commit": "a2211ec14af3b5515f3d2d0db28bf4330b0b44bb",
   "files": {
+    ".claude/canon/process.md": "sha256:71a7d9b3644b2fd8c97791f475813edc42ae5c71897dce442ab33c09e8b72d1d",
     ".claude/settings.base.json": "sha256:3376fceb69069049db14d869748652ba205fd02f70408fa620993f2eabdfe816",
     ".claude/settings.json": "sha256:3376fceb69069049db14d869748652ba205fd02f70408fa620993f2eabdfe816",
     ".claude/skills/code-review/SKILL.md": "sha256:47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50",
@@ -34,7 +35,7 @@
     ".claude/skills/setup-matt-pocock-skills/issue-tracker-gitlab.md": "sha256:ea175f73d193b3f55819c0ed9bbccf6ee0e70ad8f928e3d7607596c53380acd6",
     ".claude/skills/setup-matt-pocock-skills/issue-tracker-local.md": "sha256:7dcda20a2eb4bdc89b95d1143423c0691309921cadae3132e6424f371030506e",
     ".claude/skills/setup-matt-pocock-skills/triage-labels.md": "sha256:4f53c9b40ce2651e3611aa090eaedbd6dbc9b71ef8c5f7e65eac0d8263190d0d",
-    ".claude/skills/ship/SKILL.md": "sha256:4adc69b1d8cfd14f978e986eaa9be6481ff89c22d18bbed875742e1d43646b3e",
+    ".claude/skills/ship/SKILL.md": "sha256:68bb2e0d18fece978730579189af0a897a7aaddd296f16fb5896e0e77d37218b",
     ".claude/skills/tdd/SKILL.md": "sha256:93ea419b76e9caaf26153b828e984f7c3fb136f4caa67b14af95f32ea965a1cc",
     ".claude/skills/tdd/agents/openai.yaml": "sha256:ea6f01cf1b8c06a4b0f5b649d74b1b8ce8685e72af1b38d70d877693e092af0b",
     ".claude/skills/tdd/mocking.md": "sha256:3ceb807fdf4a47d6a93d4d9a891e5ba6d362a6247bd08adc451feebfc17361ef",
@@ -52,20 +53,18 @@
     ".claude/skills/writing-for-agents/SKILL-MECHANICS.md": "sha256:c768e6307c7c10728c401c213f2c4ba71c542127eeb7ad2956aabd15a0fa0059",
     ".claude/skills/writing-for-agents/SKILL.md": "sha256:551adca942227b44192edba88acd4e8db911f0121ce58ad16944ccf6a896a74a",
     ".claude/skills/writing-for-agents/agents/openai.yaml": "sha256:eacb24b2a618cfb81dacb0416f4fdd75ddf3a8060f8ddb99aae1b1e301907e4b",
-    ".github/workflows/dependabot-review.yml": "sha256:f4ca3a5c29c5eba16ee349e31b37f2cf45a8c06c92cf26cdce94d8e1f43607d8",
-    ".github/workflows/restricted-paths.yml": "sha256:f8851ae7916897aa3a11099ac5114ef500c5ac5584ad7ab982d09b4ebdb4b268",
+    ".github/workflows/dependabot-review.yml": "sha256:e9bc6b1c2943272d455d539d9d11a5520fe00f8ae437166861e3c1c43ed3d0e3",
     "matt-skills.lock.json": "sha256:8e37308004f15ec9915cabec9c86da22562c8733ab71dba66d214d3665c21818",
     "matt-skills.txt": "sha256:f0ef8fee24a88f874975ad990961c35e53c50ebcb42004888c859dc22ff03d9f",
     "scripts/canon/check_lock.py": "sha256:a31c03c155df8377e54b2e6f173fbdd9eea56efba766ee8e947a18c04c1de015",
-    "scripts/canon/claude_md_length.py": "sha256:c0b1ea5c592e6284f1b53ed26765757f4ccacdf34d7e8c25c31b73ccd190427f",
+    "scripts/canon/claude_md_length.py": "sha256:7dfb3e57501e8618341c7562e5658c118f71d026c982285dc43c9c0104895019",
     "scripts/canon/claude_run.py": "sha256:c1852b2fd19190b974c81959678093bd542fe07188cc6e9a765744f1fcff6cd7",
-    "scripts/canon/restricted_paths.py": "sha256:21b384e9b89397c34093416453b952bb088906891757181c8715f93604c0bc7d",
-    "scripts/canon/review": "sha256:734d44fa2a71f98d1279c7b6181d61764514aac1ee5d5db8a3687b7051ce554a",
+    "scripts/canon/review": "sha256:d3a066bde9d92de54d61c42a0f80c6ce0e6dff988e7152a4002864486f6a1696",
     "scripts/canon/run-log": "sha256:a9b9a6c2c91f1eef2541adb45f9762795ba18d9ba16e4fd501428a5b69497846",
     "scripts/canon/session-run": "sha256:e6c48edd0ef282f806d91bbaeef91d665d926597ddb8f9d9d93270267696ac3b",
-    "scripts/canon/session-start": "sha256:369be0f79ef4fa7ee761cfc8c21ba1dcf06ec81fad395ed900f1d2dfcc08b252",
-    "scripts/canon/ship-finish": "sha256:7ceb7f68c2af1da5111345ddd9b0d479e4276cc8b1c4afa550464ac628b5967d",
-    "scripts/canon/stop-check": "sha256:083f87d3bf1598e71f1ae6b9260742401d14d9d5e15227a3378e3ae7493dc6b1",
-    "scripts/canon/verify": "sha256:bd183de937254d4cc8e41393e8835b5b126129c1f767e50c8a8ae89760278cc0"
+    "scripts/canon/session-start": "sha256:c6526b414738d74fedcb0400105a76b1131ace7a3fa7c69b3c1973b9d74f7ca5",
+    "scripts/canon/ship-finish": "sha256:75a45233e7225c0a5cada73c69bde2579311670b973a7cb89e88ef98bf6b6a6e",
+    "scripts/canon/stop-check": "sha256:24f645159d3c93fbab1abc2a6b833c0bca8b7e19ff984d5cb2c3f36223783643",
+    "scripts/canon/verify": "sha256:770aa4c6ed949c97591eb74a9781267d92cdbd306bb7b6c058418d268133c849"
   }
 }

@@ -15,20 +15,27 @@
    `git fetch --prune`; главный чекаут на `main` без незакоммиченного — fast-forward к
    `origin/main` (иначе сообщение, старт идёт дальше).
 2. PR автора (`gh pr list --author @me`) на ветках сессий (`ticket-N`, `ticket-N-*`; ручные PR
-   владельца на других ветках не трогаются), кроме черновиков: красный CI на head (провал
-   `restricted-paths` не в счёт — это ожидание владельца) или нет отметки ревью (статус `review`)
-   на head; отметка с выключенным авто-мёржем — не обрыв (`ship-finish` ставит отметку последней),
-   так владелец придерживает PR. PR, в worktree которого идёт сессия (замок `session-run`), не
-   берётся. Есть такие — берётся первый (красные раньше), тикет
-   откладывается. Красный CI — возврат: комментарий «возврат k/2 … на <sha>»; на тот же head
-   второй раз не пишется. Третий
-   возврат не делается: метка `ready-for-human` и комментарий-форма (вопрос, логи, варианты,
+   владельца на других ветках не трогаются), кроме черновиков: красный CI на head или нет
+   отметки ревью (статус `review`) на head, или конфликт с `main` (`mergeable` = `CONFLICTING`
+   или `mergeStateStatus` = `DIRTY` у PR на базе `main` с авто-мёржем: он такой PR не сольёт;
+   `UNKNOWN` в списке — перезапрос `gh pr view` с паузой); отметка с выключенным авто-мёржем —
+   не обрыв (`ship-finish` ставит отметку последней), так владелец придерживает PR, и конфликт
+   его не отдаёт сессии. PR, в worktree которого идёт
+   сессия (замок `session-run`), не берётся. Есть такие — берётся первый (красные, затем
+   конфликтные, затем без отметки), тикет откладывается. Красный CI — возврат: комментарий
+   «возврат k/2 … на <sha>»; на тот же head второй раз не пишется. Третий возврат не
+   делается: метка `ready-for-human` и комментарий-форма (вопрос, логи, варианты,
    рекомендация), PR пропускается, пока метка стоит. Владелец снял метку — ответ дан: счёт
-   возвратов начинается заново. PR без отметки — дозапуск `/ship`, возвратом не считается.
+   возвратов начинается заново. PR без отметки — дозапуск `/ship`, конфликтный — `/ship` с
+   догоном базы мёржем; ни то, ни другое возвратом не считается. В PR есть «Отчёт об
+   остановке» — промпт велит прочитать его и ответ владельца.
 3. Тикет: открыт, не назначен другому. Сессия тикета уже идёт (замок `session-run` в его
    worktree) — стоп.
-4. Worktree и ветка: уже есть worktree на ветке — он; иначе рядом с главным
-   `../<проект>-ticket-N` (`../<проект>-pr-M`) на ветке `ticket-N` от `origin/main` (на ветке PR).
+4. Worktree и ветка: уже есть worktree на ветке — он; иначе внутри главного
+   `.claude/worktrees/ticket-N` (`.claude/worktrees/pr-M`) на ветке `ticket-N` от `origin/main` (на
+   ветке PR): в такой worktree открытая сессия входит `EnterWorktree` с `path` без клика владельца.
+   `.claude/worktrees/` не игнорируется — строка в `info/exclude`, чтобы `git status` и линтеры
+   главного чекаута его не видели.
    Ветка тикета `ticket-N` или `ticket-N-*` уже есть локально или на сервере — берётся она (две
    с суффиксом — стоп, выбрать вручную). Ветка тикета, уже слитая squash-мёржем (её конец — head
    слитого PR или его предок, и его нет в `origin/main`), заново не берётся, иначе её коммиты
@@ -48,13 +55,14 @@
 5. Метка `in-progress` и исполнитель — я: после worktree и `setup`, чтобы сбой на них не оставил
    тикет занятым без сессии.
 
-Итог — путь worktree, метка сессии `CANON_SESSION` (её читает Stop-хук), промпт и строка
-«Запуск:» для новой сессии из терминала. Не из `session-run` и не изнутри worktree плана — ещё
-строка «Открытая сессия остаётся в главном чекауте»: команды с путём worktree, `EnterWorktree` не
-вызывать (вход вне `.claude/worktrees/` ждёт клика владельца). С `--json` — последней строкой
-JSON. Код выхода 0 — готово; 1 — сбой git, `gh` или `scripts/session/setup`; 2 — ошибка
-аргументов, тикет закрыт или занят другим, сессия тикета уже идёт, неоднозначная или уже слитая
-ветка тикета (сообщение говорит, что убрать).
+Итог — путь worktree, метка сессии `CANON_SESSION` (её читает Stop-хук), промпт и строка «Запуск:»
+для новой сессии из терминала. Не из `session-run` и не изнутри worktree плана — ещё строка
+«Открытая сессия: войти в worktree — `EnterWorktree` с `path`…»; worktree вне `.claude/worktrees/`
+(заведён до режима В) или старт не из главного чекаута — с пометкой, что вход ждёт клика, и запасным
+путём без входа (`needs_click` плана). С `--json` — последней строкой JSON. Код выхода 0 — готово;
+1 — сбой git, `gh` или `scripts/session/setup`; 2 — ошибка аргументов, тикет закрыт или занят
+другим, сессия тикета уже идёт, неоднозначная или уже слитая ветка тикета
+(сообщение говорит, что убрать).
 
 `session-run` вызывает `prepare` этого файла в своём процессе и через `claim` берёт замок сессии
 под блокировкой реестра — параллельный старт не увидит worktree свободным в промежутке.
@@ -75,15 +83,17 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REGISTRY = "canon-sessions.json"
+# Worktree сессий — внутри главного чекаута: вход `EnterWorktree` с `path` сюда не ждёт клика.
+SESSION_WORKTREES = ".claude/worktrees"
 SETUP = "scripts/session/setup"
 CLEANUP = "scripts/session/cleanup"
 REVIEW = "review"
 WAITING = "ready-for-human"
 IN_PROGRESS = "in-progress"
-OWNER_CHECKS = {"restricted-paths"}
 RED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 MAX_RETURNS = 2
 # Замок сессии в личном каталоге git worktree: `session-run` держит его, пока идёт `claude`.
@@ -91,7 +101,15 @@ SESSION_LOCK = "canon-session.lock"
 SESSION_BRANCH = re.compile(r"^ticket-\d+(-.+)?$")
 RETURN_RE = re.compile(r"^возврат (\d+)/\d+: красный CI на ([0-9a-f]{7})")
 FORM_MARK = f"{WAITING}: третий возврат не делается"
-PR_FIELDS = "number,title,url,headRefName,headRefOid,isDraft,labels,statusCheckRollup"
+PR_FIELDS = (
+    "number,title,url,headRefName,headRefOid,baseRefName,isDraft,labels,statusCheckRollup,"
+    "autoMergeRequest,mergeable,mergeStateStatus"
+)
+# `mergeable` GitHub считает фоном: список отдаёт `UNKNOWN`, итог появляется через секунды.
+RECHECK_TRIES = 3
+RECHECK_PAUSE = 1.0
+# Первая строка отчёта об остановке — `REPORT_MARK` в `ship-finish`, менять вместе.
+REPORT_MARK = "Отчёт об остановке"
 PR_LIMIT = "200"
 
 
@@ -406,9 +424,7 @@ def sweep_branch(branch: str, path: Path | None, main: Path, here: Path | None) 
 
 
 def is_red(item: dict) -> bool:
-    name = item.get("name") or item.get("context")
-    state = item.get("conclusion") or item.get("state")
-    return name not in OWNER_CHECKS and state in RED
+    return (item.get("conclusion") or item.get("state")) in RED
 
 
 def failed_checks(pr: dict) -> list[str]:
@@ -428,8 +444,36 @@ def is_marked(pr: dict) -> bool:
     )
 
 
+def is_conflicting(pr: dict) -> bool:
+    """Конфликт с `main`: GitHub не сольёт PR, пока ветка не догонит базу (#121).
+
+    `UNKNOWN` (GitHub ещё считает) и `BEHIND` (отстала без конфликта) — не конфликт. PR на другой
+    базе (стек PR) — не конфликт с `main`: догон `main` его не снимет.
+    """
+    if pr.get("baseRefName", "main") != "main":
+        return False
+    return pr.get("mergeable") == "CONFLICTING" or pr.get("mergeStateStatus") == "DIRTY"
+
+
+def recheck_merge_state(pr: dict) -> None:
+    """`mergeable` = `UNKNOWN` в списке — GitHub ещё считает: `gh pr view` до `RECHECK_TRIES` раз
+    с паузой. Всё ещё `UNKNOWN` или сбой `gh` — не конфликт: поймает следующий старт."""
+    fields = "mergeable,mergeStateStatus"
+    for attempt in range(RECHECK_TRIES):
+        if pr.get("mergeable") != "UNKNOWN":
+            return
+        if attempt:
+            time.sleep(RECHECK_PAUSE)
+        try:
+            pr.update(json.loads(run("gh", "pr", "view", str(pr["number"]), "--json", fields)))
+        except StartError as exc:
+            note(f"PR #{pr['number']}: состояние слияния не получено — {exc}")
+            return
+
+
 def attention() -> list[tuple[dict, bool]]:
-    """PR сессий автора, требующие внимания: [(pr, красный)], красные первыми, по номеру."""
+    """PR сессий автора, требующие внимания: [(pr, красный)]; красные, затем конфликтные, затем
+    без отметки, внутри — по номеру."""
     prs = json.loads(
         run(
             "gh",
@@ -452,7 +496,18 @@ def attention() -> list[tuple[dict, bool]]:
         red = bool(failed_checks(pr))
         if red or not is_marked(pr):
             found.append((pr, red))
-    return sorted(found, key=lambda item: (not item[1], item[0]["number"]))
+            continue
+        # Отметка без авто-мёржа — PR придержал владелец: конфликт его не отдаёт в `/ship`, иначе
+        # `ship-finish` включил бы авто-мёрж снова. Перезапрос — только здесь: у остальных
+        # конфликт меняет лишь порядок и промпт, а догон базы `/ship` делает всегда.
+        if not pr.get("autoMergeRequest"):
+            continue
+        recheck_merge_state(pr)
+        if is_conflicting(pr):
+            found.append((pr, red))
+    return sorted(
+        found, key=lambda item: (not item[1], not is_conflicting(item[0]), item[0]["number"])
+    )
 
 
 def since_last_form(pr: dict) -> tuple[bool, list[str]]:
@@ -534,11 +589,20 @@ def pick_pr() -> dict | None:
         answered = (
             " Владелец ответил в PR после третьей неудачи — прочитай ответ." if had_form else ""
         )
+        if any(body.startswith(REPORT_MARK) for body in recent):
+            answered += " В PR есть отчёт об остановке — прочитай его и ответ владельца после него."
+        catch_up = "догони базу мёржем (не rebase) по шагу /ship «Догон базы»"
         if red:
+            conflict = f" Ветка ещё и в конфликте с main: {catch_up}." if is_conflicting(pr) else ""
             prompt = (
                 f"PR #{pr['number']} (ветка {branch}): красный CI на {sha} — "
-                f"{', '.join(failed_checks(pr))}; возврат {k}/{MAX_RETURNS}.{answered} "
+                f"{', '.join(failed_checks(pr))}; возврат {k}/{MAX_RETURNS}.{answered}{conflict} "
                 "Найди причину, исправь в этой ветке, затем /ship."
+            )
+        elif is_conflicting(pr):
+            prompt = (
+                f"PR #{pr['number']} (ветка {branch}): конфликт слияния с main на {sha} — "
+                f"авто-мёрж его не сольёт.{answered} Доведи /ship: {catch_up}."
             )
         else:
             prompt = (
@@ -610,13 +674,23 @@ def merged_heads(branch: str) -> dict[str, dict]:
     return {pr["headRefOid"]: pr for pr in json.loads(found)}
 
 
+def remove_holder(holder: Path, main: Path) -> str:
+    """Команда, освобождающая слитую ветку от worktree `holder`."""
+    if holder == main:
+        return f"переключите worktree {holder} на main (`git -C {holder} switch main`)"
+    return f"уберите worktree {holder} (`git worktree remove {holder}`)"
+
+
 def retire_spent(branch: str, main: Path) -> None:
     """Ветка тикета, уже слитая squash-мёржем, заново не берётся: её коммиты ушли бы в новый PR.
 
     Слитая — её конец равен head слитого PR или его предок (ветку догнали на сервере; head
     подтягивается, как в `merged_url`), и его нет в `origin/main` (при мёрже обычным merge commit
-    он там есть, и ветка годна как есть). Только локальная и без worktree —
-    удаляется (работы сверх слитой нет), дальше ветка заводится от `origin/main`; иначе — стоп.
+    он там есть, и ветка годна как есть). Слитая на сервере — стоп, если локальной работы сверх
+    неё нет: локального конца нет, он слит (#116: мог отстать от догнанной на сервере) или лежит в
+    `origin/main`; worktree на слитом локальном конце называется в том же стопе. Слитый локальный
+    конец без worktree удаляется (работы сверх слитой нет), дальше ветка заводится от
+    `origin/main`, а если на сервере она жива с новой работой — от серверной; с worktree — стоп.
     """
     local, remote = tip(f"refs/heads/{branch}"), tip(f"refs/remotes/origin/{branch}")
     if local is None and remote is None:
@@ -627,32 +701,52 @@ def retire_spent(branch: str, main: Path) -> None:
         for end in {local, remote} - {None}
         if (url := merged_url(end, merged, main)) and not is_ancestor(end, "origin/main", main)
     }
-    if remote in spent and local in (None, remote):
+    holder = worktree_of(branch) if local in spent else None
+    if remote in spent and (
+        local is None or local in spent or is_ancestor(local, "origin/main", main)
+    ):
+        also = f"; {remove_holder(holder, main)}" if holder else ""
         raise UsageError(
             f"ветка {branch} уже слита ({spent[remote]}) и осталась на сервере: удалите её "
-            f"(`git push origin --delete {branch}`) и повторите старт"
+            f"(`git push origin --delete {branch}`){also} и повторите старт"
         )
-    if local in spent and remote is None:
-        if holder := worktree_of(branch):
-            fix = (
-                f"переключите его на main (`git -C {holder} switch main`)"
-                if holder == main
-                else f"уберите его (`git worktree remove {holder}`)"
-            )
+    if local in spent:
+        if holder:
             raise UsageError(
-                f"ветка {branch} уже слита ({spent[local]}), на ней worktree {holder}: {fix} "
-                "и повторите старт"
+                f"ветка {branch} уже слита ({spent[local]}), на ней worktree {holder}: "
+                f"{remove_holder(holder, main)} и повторите старт"
             )
         run("git", "branch", "-q", "-D", branch)
-        note(f"ветка {branch} уже слита ({spent[local]}) — удалена, новая от origin/main")
+        base = "origin/main" if remote is None else f"origin/{branch}"
+        note(f"ветка {branch} уже слита ({spent[local]}) — удалена, новая от {base}")
+
+
+def ignore_session_worktrees(main: Path) -> None:
+    """`.claude/worktrees/` — в `info/exclude`, если проект его ещё не игнорирует: иначе главный
+    чекаут видит worktree сессий неотслеживаемыми, а инструменты, читающие игнор git (ruff),
+    идут в их файлы."""
+    if git_ok("check-ignore", "-q", "--no-index", f"{SESSION_WORKTREES}/probe", cwd=main):
+        return
+    exclude = common_dir() / "info" / "exclude"
+    try:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if text and not text.endswith("\n"):
+            text += "\n"
+        exclude.write_text(f"{text}{SESSION_WORKTREES}/\n", encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise StartError(f"{exclude}: строка {SESSION_WORKTREES}/ не дописана — {exc}") from None
 
 
 def ensure_worktree(main: Path, branch: str, name: str, pending: set[str]) -> Path:
-    """Worktree на ветке: существующий, иначе новый `../<проект>-<name>`."""
+    """Worktree на ветке: существующий, иначе новый `.claude/worktrees/<name>` главного."""
     if existing := worktree_of(branch):
         return existing
-    path = (main.parent / f"{main.name}-{name}").resolve()
-    if str(path) in pending:
+    ignore_session_worktrees(main)
+    path = (main / SESSION_WORKTREES / name).resolve()
+    # Ресурсы проекта привязаны к имени сессии, а не к пути: прежний `../<проект>-<name>` (до
+    # режима В) с неубранными ресурсами держит и новый путь.
+    if any(Path(p).name in (name, f"{main.name}-{name}") for p in pending):
         raise StartError(
             f"ресурсы прежнего worktree {path} не убраны ({CLEANUP}): "
             "сначала уборка, иначе новая сессия унаследует старые"
@@ -723,6 +817,11 @@ def start(number: int, claim=None, here: Path | None = None) -> dict:
             sync_pr_branch(worktree, plan["branch"])
         plan["branch"] = run("git", "-C", str(worktree), "symbolic-ref", "--short", "HEAD")
         plan["worktree"] = str(worktree)
+        # Без клика `EnterWorktree` входит только в `.claude/worktrees/` из сессии главного
+        # чекаута (#105, #115): клика ждёт worktree, заведённый до режима В, или старт из сессии,
+        # которая уже в другом worktree.
+        nested = worktree.resolve().is_relative_to((main / SESSION_WORKTREES).resolve())
+        plan["needs_click"] = not (nested and from_main_checkout(here, main))
         if claim is not None:
             claim(worktree)
         entries = read_registry()
@@ -734,9 +833,17 @@ def start(number: int, claim=None, here: Path | None = None) -> dict:
     return plan
 
 
+def from_main_checkout(here: Path | None, main: Path) -> bool:
+    """Старт из главного чекаута, а не из одного из его worktree (они бывают и внутри него)."""
+    if here is None:
+        return True
+    others = (Path(w["path"]) for w in worktrees()[1:])
+    return here.is_relative_to(main) and not any(here.is_relative_to(w) for w in others)
+
+
 def report(plan: dict, outside: bool) -> str:
     """Итог для человека; `outside` — старт не из `session-run` и не изнутри worktree плана:
-    из открытой сессии в главном чекауте или из терминала — их скрипт не различает."""
+    из открытой сессии или из терминала — их скрипт не различает."""
     if plan["kind"] == "pr":
         head = f"PR автора требует внимания: {plan['url']} — тикет #{plan['postponed']} отложен"
     else:
@@ -751,11 +858,16 @@ def report(plan: dict, outside: bool) -> str:
     ]
     if outside:
         wt = shlex.quote(plan["worktree"])
+        click_note = (
+            f" (вход ждёт клика владельца: worktree вне {SESSION_WORKTREES}/ или старт не из "
+            f"главного чекаута; без входа — команды `cd {wt} && …` или `git -C {wt}`, правки — "
+            "по абсолютным путям в worktree)"
+            if plan["needs_click"]
+            else ""
+        )
         lines.append(
-            f"Открытая сессия остаётся в главном чекауте: команды — `cd {wt} && …` или "
-            f"`git -C {wt}`, правки — по абсолютным путям в worktree; EnterWorktree не вызывать "
-            "(вход вне .claude/worktrees/ ждёт клика владельца); промпт набирает владелец, "
-            "«Запуск:» — для новой сессии из терминала"
+            f"Открытая сессия: войти в worktree — EnterWorktree с path {wt}{click_note}, дальше "
+            "работа из него; промпт набирает владелец, «Запуск:» — для новой сессии из терминала"
         )
     return "\n".join(lines)
 

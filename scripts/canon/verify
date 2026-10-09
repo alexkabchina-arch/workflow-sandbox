@@ -56,7 +56,7 @@ from pathlib import Path
 
 def load_claude_run():
     """Общий модуль канона рядом со скриптом — без правки `sys.path` и без `__pycache__`
-    в вендоренном `scripts/canon/` (его закоммитили бы на путь-ограничитель)."""
+    в вендоренном `scripts/canon/` (его закоммитили бы вместе с работой ветки)."""
     path = Path(__file__).resolve().parent / "claude_run.py"
     module = types.ModuleType("canon_claude_run")
     module.__file__ = str(path)

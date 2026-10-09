@@ -2,7 +2,7 @@
 """ship-finish — конец `/ship`: push, PR, отметка ревью на head, авто-мёрж.
 
     scripts/canon/ship-finish --title <заголовок> --body-file <тело.md>
-        --review-report <отчёт.json> [--ready-for-human <строка>]
+        --review-report <отчёт.json> [--ready-for-human <строка>] [--weakening <решение>]
     scripts/canon/ship-finish --unconfirmed <отчёт>
 
 Из корня проекта, на ветке с закоммиченной работой. По порядку:
@@ -34,6 +34,13 @@
 `--ready-for-human <строка>` — признак от ревью или `/verify` (перерасход вдвое): метка
 `ready-for-human` и комментарий со строкой, один раз на PR (повтор узнаётся по тексту, не по
 метке); отметка и авто-мёрж — как обычно.
+`--weakening <решение>` — решение сессии, когда ревью нашло ослабление проверок, прав агента,
+правил или обезличивания (`canon_review.weakening` не пуст или ответа нет): «запрошено тикетом:
+<цитата>», «убрано коммитом <sha>: …» (коммит сверяется: он среди коммитов после отчёта) или
+«ослабления нет: <почему>». Без него такой отчёт — отказ (код 2) до любой записи:
+ослабление, которого тикет не просит, — блокирующая находка (решение канона
+`docs/decisions/2026-10-08-no-restricted-paths.md`). Находка и решение — разделом
+«Ослабление защиты» в конце тела PR.
 `--unconfirmed <причина>` — отчёт об остановке: комментарий с первой строкой «Отчёт об остановке»
 (его ищет Stop-хук) и метка `ready-for-human`, без push и без отметки; пустая причина — отказ
 (код 2), отчёт не публикуется; незакоммиченные правки и
@@ -70,6 +77,7 @@ TICKET_BRANCH = re.compile(r"^ticket-(\d+)(?:-.+)?$")
 PROTECTED = {"main", "master"}
 PR_FIELDS = "number,url,isDraft,labels,autoMergeRequest"
 DESCRIPTION = "ревью ошибок пройдено (/ship)"
+REMOVED_BY = re.compile(r"убрано коммитом\s+`?([0-9a-f]{7,40})\b", re.I)
 DESCRIPTION_SKIPPED = "ревью ошибок не нужно: только документы (/ship)"
 
 
@@ -231,20 +239,63 @@ def read_body(body_file: str) -> str:
         raise UsageError(f"тело PR {body_file}: не UTF-8") from None
 
 
-def body_with_commits(body_file: str, review: dict, unreviewed: list[tuple[str, str]]) -> str:
-    """Тело PR со списком коммитов после ревью; без них — исходный файл."""
+def weakening_section(
+    review: dict, decision: str | None, unreviewed: list[tuple[str, str]], canon
+) -> str:
+    """Проверяет решение сессии по ослаблению защиты и возвращает раздел тела PR о нём;
+    ослабления нет — пустая строка.
+
+    Ревью нашло ослабление проверок, прав агента, правил или обезличивания (или не ответило на
+    вопрос) — без решения `--weakening` отказ: такая находка блокирующая. «Убрано коммитом
+    <sha>» сверяется: коммит — среди коммитов ветки после отчёта (`unreviewed`).
+    """
+    if review.get("skipped") is True:
+        return ""
+    found = review.get("weakening")
+    if not isinstance(found, str):
+        found = canon.NO_WEAKENING_ANSWER
+    found = found.strip()
+    if not found:
+        return ""
+    decision = (decision or "").strip()
+    if not decision:
+        raise UsageError(
+            f"ревью: ослабление защиты — {found}. Блокирующая находка: тикет его не просит — "
+            "убрать в ветке или отчёт об остановке. Решение — в --weakening: "
+            '"запрошено тикетом: <цитата>", "убрано коммитом <sha>: …" или '
+            '"ослабления нет: <почему>"'
+        )
+    if match := REMOVED_BY.match(decision):
+        given = match.group(1)
+        after = [run("git", "rev-parse", short) for short, _ in unreviewed]
+        if not any(full.startswith(given) for full in after):
+            raise UsageError(
+                f"--weakening: коммита {given} нет среди коммитов ветки после отчёта ревью — "
+                "назовите коммит, который убрал ослабление"
+            )
+    return f"\n\n## Ослабление защиты\n\nРевью: {found}\n\nРешение сессии: {decision}"
+
+
+def pr_body(
+    body_file: str, review: dict, unreviewed: list[tuple[str, str]], weakening: str = ""
+) -> str:
+    """Тело PR: раздел об ослаблении защиты и список коммитов после ревью в конце; без них —
+    исходный файл."""
     body = read_body(body_file)
-    if not unreviewed:
+    if not unreviewed and not weakening:
         return body_file
-    lines = "\n".join(f"- `{short}` {subject}" for short, subject in unreviewed)
-    tail = (
-        f"\n\n## Коммиты после ревью\n\nОтчёт ревью — по `{review['head'][:7]}`; коммиты после "
-        f"него ревью не проходили, их проверяют тесты, CI и `/verify` (`ship-finish`):\n\n{lines}\n"
-    )
+    tail = weakening
+    if unreviewed:
+        lines = "\n".join(f"- `{short}` {subject}" for short, subject in unreviewed)
+        tail += (
+            f"\n\n## Коммиты после ревью\n\nОтчёт ревью — по `{review['head'][:7]}`; коммиты "
+            "после него ревью не проходили, их проверяют тесты, CI и `/verify` "
+            f"(`ship-finish`):\n\n{lines}\n"
+        )
     with tempfile.NamedTemporaryFile(
         "w", encoding="utf-8", suffix=".md", prefix="ship-finish-", delete=False
     ) as out:
-        out.write(body.rstrip("\n") + tail)
+        out.write(body.rstrip("\n") + tail.rstrip("\n") + "\n")
     return out.name
 
 
@@ -380,6 +431,11 @@ def main(argv: list[str] | None = None) -> int:
         "--ready-for-human", metavar="СТРОКА", help="признак от ревью для владельца"
     )
     parser.add_argument(
+        "--weakening",
+        metavar="РЕШЕНИЕ",
+        help="решение сессии по ослаблению защиты из отчёта ревью: запрошено тикетом или убрано",
+    )
+    parser.add_argument(
         "--unconfirmed", metavar="ПРИЧИНА", help="отчёт об остановке: без push, в тикет или на PR"
     )
     args = parser.parse_args(argv)
@@ -395,7 +451,8 @@ def main(argv: list[str] | None = None) -> int:
             raise UsageError("нужны --title и --body-file (без них — только --unconfirmed)")
         review = check_review(args.review_report, sha, merged)
         unreviewed = unreviewed_commits(review, sha)
-        body_file = body_with_commits(args.body_file, review, unreviewed)
+        weakening = weakening_section(review, args.weakening, unreviewed, load_canon_review())
+        body_file = pr_body(args.body_file, review, unreviewed, weakening)
         try:
             push(branch, sha)
             pr = upsert_pr(branch, sha, args.title, body_file)
