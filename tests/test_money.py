@@ -48,7 +48,7 @@ def test_format_rub(kop, expected):
 
 def test_cli(capsys):
     assert main(["3x100", "1x49.90", "--discount", "10"]) == 0
-    assert capsys.readouterr().out.strip() == "314.91\u00a0₽"
+    assert capsys.readouterr().out == "314.91\u00a0₽\n"
 
 
 def test_cli_thousands_separator(capsys):
