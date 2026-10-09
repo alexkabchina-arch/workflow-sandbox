@@ -1,4 +1,4 @@
-from decimal import localcontext
+from decimal import InvalidOperation, localcontext
 
 import pytest
 
@@ -59,11 +59,36 @@ def test_parse_item_rejects(spec):
         ("1x1e999999", "до 15 цифр"),
         ("1xNaN", "'NaN'"),
         (" 3 x 0.005 ", "точнее копейки: '0.005'"),
+        ("3x1 00", "^цена должна быть числом, получено '1 00'$"),
+        ("1xabc", "^цена должна быть числом, получено 'abc'$"),
+        ("1xinf", "^цена должна быть числом, получено 'inf'$"),
+        ("1x", "^цена должна быть числом, получено ''$"),
     ],
 )
 def test_parse_item_price_errors(spec, message):
     with pytest.raises(ValueError, match=message):
         parse_item(spec)
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        ("3 0x1", "^количество должно быть целым числом, получено '3 0'$"),
+        ("abcx100", "^количество должно быть целым числом, получено 'abc'$"),
+        ("1.5x100", "^количество должно быть целым числом, получено '1.5'$"),
+        (" x100", "^количество должно быть целым числом, получено ''$"),
+    ],
+)
+def test_parse_item_qty_errors(spec, message):
+    with pytest.raises(ValueError, match=message):
+        parse_item(spec)
+
+
+def test_parse_item_price_not_a_number_ignores_global_decimal_context():
+    with localcontext() as ctx:
+        ctx.traps[InvalidOperation] = False
+        with pytest.raises(ValueError, match="^цена должна быть числом, получено 'abc'$"):
+            parse_item("1xabc")
 
 
 def test_parse_item_price_ignores_global_decimal_context():

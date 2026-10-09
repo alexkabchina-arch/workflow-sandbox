@@ -27,14 +27,23 @@ def parse_item(spec: str) -> Item:
     qty_s, sep, price_s = spec.lower().partition("x")
     if not sep:
         raise ValueError(f"ожидался формат КОЛxЦЕНА, получено {spec!r}")
-    qty = int(qty_s)
+    try:
+        qty = int(qty_s)
+    except ValueError:
+        qty_raw = spec[: len(qty_s)].strip()
+        raise ValueError(f"количество должно быть целым числом, получено {qty_raw!r}") from None
     if qty <= 0:
         raise ValueError("количество должно быть положительным")
     price_raw = spec[len(qty_s) + len(sep) :].strip()
+    # Нечисло и слишком длинное число — разные ошибки: сообщение не должно винить длину «abc».
+    # Decimal() — точная конверсия; без ловушки в глобальном контексте нечисло даёт NaN.
     try:
         price = Decimal(price_s)
-        if not price.is_finite():
-            raise InvalidOperation
+    except InvalidOperation:
+        price = None
+    if price is None or not price.is_finite():
+        raise ValueError(f"цена должна быть числом, получено {price_raw!r}")
+    try:
         price = price.quantize(KOPECK, context=PRICE_CONTEXT)
     except Inexact:
         raise ValueError(f"цена точнее копейки: {price_raw!r}") from None
