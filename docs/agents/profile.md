@@ -59,7 +59,7 @@ python3.12 -m venv .venv
 Перед «₽» — неразрывный пробел U+00A0, на глаз он не отличается от обычного; проверка побайтово:
 
 ```bash
-.venv/bin/python -m sandbox 3x100 1x49.90 --discount 10 | od -c
+.venv/bin/python -m sandbox 3x100 1x49.90 --discount 10 | LC_ALL=C od -c
 ```
 
 Ожидается `3   1   4   .   9   1 302 240 342 202 275  \n`: `302 240` — U+00A0, `342 202 275` — «₽».
