@@ -5,7 +5,7 @@ from sandbox.__main__ import main
 
 def test_valid_input_prints_total(capsys):
     assert main(["3x100", "1x49.90", "--discount", "10"]) == 0
-    assert capsys.readouterr().out == "314.91 ₽\n"
+    assert capsys.readouterr().out == "314.91\u00a0₽\n"
 
 
 @pytest.mark.parametrize(

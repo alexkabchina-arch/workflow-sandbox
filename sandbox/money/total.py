@@ -17,6 +17,6 @@ def format_rub(kop: int) -> str:
     # Знак отдельно: для -123456 divmod дал бы -1235 и 44 вместо -1234 и 56
     sign = "-" if kop < 0 else ""
     rub, rest = divmod(abs(kop), 100)
-    # Тысячи — через неразрывный пробел U+00A0, чтобы число не разрывалось переносом
+    # Тысячи и «₽» — через неразрывный пробел U+00A0, чтобы сумма не разрывалась переносом
     rub_str = f"{rub:,}".replace(",", "\u00a0")
-    return f"{sign}{rub_str}.{rest:02d} ₽"
+    return f"{sign}{rub_str}.{rest:02d}\u00a0₽"
