@@ -24,17 +24,18 @@ def parse_item(spec: str) -> Item:
 
     Цена неотрицательна и не точнее копейки: «1x0.005» и «1x-0.01» — ValueError, без округления.
     """
-    qty_s, sep, price_s = spec.lower().partition("x")
+    # Разделитель — первый «x» или «X». Не через lower(): он меняет длину строки («İ» → 2 символа),
+    # а части нужны дословно — для сообщений об ошибке.
+    qty_s, sep, price_s = spec.replace("X", "x", 1).partition("x")
+    qty_raw, price_raw = qty_s.strip(), price_s.strip()
     if not sep:
         raise ValueError(f"ожидался формат КОЛxЦЕНА, получено {spec!r}")
     try:
         qty = int(qty_s)
     except ValueError:
-        qty_raw = spec[: len(qty_s)].strip()
         raise ValueError(f"количество должно быть целым числом, получено {qty_raw!r}") from None
     if qty <= 0:
         raise ValueError("количество должно быть положительным")
-    price_raw = spec[len(qty_s) + len(sep) :].strip()
     # Нечисло и слишком длинное число — разные ошибки: сообщение не должно винить длину «abc».
     # Decimal() — точная конверсия; без ловушки в глобальном контексте нечисло даёт NaN.
     try:
