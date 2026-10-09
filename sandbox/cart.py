@@ -1,7 +1,10 @@
 """Разбор позиций корзины из строки вида «3x100»."""
 
+import re
 from dataclasses import dataclass
 from decimal import Context, Decimal, Inexact, InvalidOperation
+
+SEPARATOR = re.compile("[xX]")
 
 # Цена — в рублях, не точнее копейки и не длиннее MAX_PRICE_DIGITS цифр. Свой контекст, а не
 # глобальный getcontext(): округление и переполнение здесь — ошибка ввода, а не тихая правка суммы.
@@ -24,17 +27,40 @@ def parse_item(spec: str) -> Item:
 
     Цена неотрицательна и не точнее копейки: «1x0.005» и «1x-0.01» — ValueError, без округления.
     """
-    qty_s, sep, price_s = spec.lower().partition("x")
+    # Части — дословно из ввода, для сообщений об ошибке: не через lower(), он меняет длину строки
+    # («İ» → 2 символа), и не через replace(): он тронул бы «X» внутри цены («1xabX»).
+    sep = SEPARATOR.search(spec)
     if not sep:
         raise ValueError(f"ожидался формат КОЛxЦЕНА, получено {spec!r}")
-    qty = int(qty_s)
+    qty_s, price_s = spec[: sep.start()], spec[sep.end() :]
+    try:
+        qty = int(qty_s)
+    except ValueError:
+        # int() отказывает и корректному целому длиннее sys.int_info.str_digits_check_threshold.
+        if qty_s.strip().lstrip("+-").isdecimal():
+            raise ValueError("количество слишком большое") from None
+        raise ValueError(
+            f"количество должно быть целым числом, получено {qty_s.strip()!r}"
+        ) from None
     if qty <= 0:
         raise ValueError("количество должно быть положительным")
-    price_raw = spec[len(qty_s) + len(sep) :].strip()
+    price_raw = price_s.strip()
+    # Нечисло и слишком длинное число — разные ошибки: сообщение не должно винить длину «abc».
+    # Конверсия точная (prec контекста её не округляет); показатель за пределами Decimal —
+    # тоже отказ конверсии, но синтаксически это число, и его отличает float().
     try:
-        price = Decimal(price_s)
-        if not price.is_finite():
-            raise InvalidOperation
+        price = Decimal(price_s, context=PRICE_CONTEXT)
+    except InvalidOperation:
+        try:
+            float(price_s)
+        except ValueError:
+            raise ValueError(f"цена должна быть числом, получено {price_raw!r}") from None
+        raise ValueError(
+            f"цена должна быть числом до {MAX_PRICE_DIGITS} цифр, получено {price_raw!r}"
+        ) from None
+    if not price.is_finite():
+        raise ValueError(f"цена должна быть числом, получено {price_raw!r}")
+    try:
         price = price.quantize(KOPECK, context=PRICE_CONTEXT)
     except Inexact:
         raise ValueError(f"цена точнее копейки: {price_raw!r}") from None
