@@ -1,0 +1,8 @@
+name: sc160-audit-test-probe
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 50
+      - run: 'true'
