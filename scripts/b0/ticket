@@ -15,7 +15,7 @@
 решение о /verify, тело PR, финиш. Скрипт решает только механику; суждение — в заданиях агенту.
 
 Состояние — `<общий каталог git>/b0/ticket-N.json`, журнал вызовов — `b0/log.jsonl` там же.
-Сценарии проб Auto-fix (SCENARIOS): `red` — после финиша коммит с нарушенным форматом (красный
+Сценарии проб Auto-fix (SCENARIOS): `red` — перед финишем коммит с нарушенным форматом (красный
 CI), `conflict` — после финиша пустой коммит удерживает PR без отметки, пока соседний PR с
 правкой конца README не сольётся. Красный тест — подложенный локальный файл вне ветки
 (`tests/test_b0_local.py`), один раз на тикет: вина окружения, а не ветки.
@@ -25,8 +25,10 @@ CI), `conflict` — после финиша пустой коммит удерж
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -66,6 +68,7 @@ def git(*args, cwd=None):
     return run(["git", *args], cwd=cwd, check=True).stdout.strip()
 
 
+@functools.cache  # cleanup удаляет cwd: дальше git из него не вызвать
 def common_dir() -> Path:
     return Path(git("rev-parse", "--path-format=absolute", "--git-common-dir"))
 
@@ -138,8 +141,17 @@ def dirty() -> str:
     return git("status", "--porcelain", "--untracked-files=no")
 
 
+def is_ticket_branch(n: int, name: str) -> bool:
+    """Ветка сессии тикета, как SESSION_BRANCH у session-start: ticket-N и ticket-N-*."""
+    return re.fullmatch(rf"ticket-{n}(-.+)?", name or "") is not None
+
+
+def pr_branch(n: int) -> str:
+    return load(n).get("branch") or f"ticket-{n}"
+
+
 def pr_view(n: int, fields: str) -> dict | None:
-    res = run(["gh", "pr", "view", f"ticket-{n}", "--json", fields])
+    res = run(["gh", "pr", "view", pr_branch(n), "--json", fields])
     return json.loads(res.stdout) if res.returncode == 0 else None
 
 
@@ -223,10 +235,13 @@ def cmd_resume(n: int, _args) -> int:
         raise Stop(f"вопросов по тикету #{n} не было")
     since = st["questions"][-1]["ts"]
     raw = run(["gh", "api", f"repos/{repo()}/issues/{n}/comments", "--paginate"], check=True)
+    # Репозиторий публичный: ответ — только от владельца (аккаунт gh этой машины), не от любого.
+    me = run(["gh", "api", "user", "-q", ".login"], check=True).stdout.strip()
     answers = [
         c["body"]
         for c in json.loads(raw.stdout)
         if c["created_at"] >= since.replace("+00:00", "Z")
+        and (c.get("user") or {}).get("login") == me
         and not c["body"].startswith(QUESTION_MARK)
     ]
     log({"cmd": "resume", "ticket": n, "answers": len(answers)})
@@ -253,13 +268,16 @@ def cmd_resume(n: int, _args) -> int:
 
 
 def cmd_ship(n: int, args) -> int:
-    if branch() != f"ticket-{n}":
+    if not is_ticket_branch(n, branch()):
         raise Stop(f"не на ветке ticket-{n}: запускать из worktree тикета")
     main = main_checkout()
     wd = work_dir(n)
     st = load(n)
+    st["branch"] = branch()
     if args.weakening:
         st["weakening"] = args.weakening
+    if args.ready_for_human:
+        st["ready_for_human"] = args.ready_for_human
     if args.done:
         st["done"][st["step"]] = args.done
     log({"cmd": "ship", "ticket": n, "step": st["step"], "done": args.done, "head": head_or_none()})
@@ -331,7 +349,8 @@ def cmd_ship(n: int, args) -> int:
             "Тесты и линтеры зелёные. Реши, нужен ли /verify: затронуто ли поведение CLI (рецепт — "
             f"docs/agents/profile.md). Нужен — критерии тикета в {wd / 'criteria.txt'} и "
             f"`scripts/canon/verify {wd / 'verify.json'} --criteria-file {wd / 'criteria.txt'}` "
-            f"({LONG}); FAIL — почини, закоммить.",
+            f"({LONG}); FAIL — почини, закоммить. Строка `verify: ready-for-human: …` — передай её "
+            '`--ready-for-human "<строка>"` в следующий вызов.',
             f'`{ME} ship {n} --done "verify: PASS | FAIL→исправлено | не нужен: почему"`',
         )
         return 0
@@ -367,19 +386,34 @@ def cmd_ship(n: int, args) -> int:
             return 0
         st["step"] = "finish"
 
-    if st["step"] == "finished":
-        if head_or_none() == st["finished_heads"][-1]:
-            return finish_task(st, n)
-        ok, out = checks(main)
-        st.setdefault("tests", []).append({"ts": now(), "head": head_or_none(), "ok": ok})
-        if not ok:
-            task(
-                st,
-                "2/5 красный тест (после финиша)",
-                f"Тесты или линтеры красные:\n{out}\n\nПочини, закоммить.",
-                nxt,
-            )
-            return 0
+    if st["step"] == "finished" and head_or_none() in st["finished_heads"]:
+        if SCENARIOS.get(n) == "conflict" and not st.get("probe", {}).get("neighbour_merged"):
+            probe_conflict(st, n)  # прошлая попытка пробы оборвалась
+        return finish_task(st, n)
+
+    # Перед каждым финишем — догон main (шаг 4а /ship) и тесты на итоговом коде.
+    git("fetch", "-q", "origin")
+    if run(["git", "merge-base", "--is-ancestor", "origin/main", "HEAD"]).returncode != 0:
+        task(
+            st,
+            "догон main",
+            "Ветка отстаёт от origin/main: догони мёржем (не rebase) по A2.4 — конфликт "
+            "разрешай с сохранением смысла обеих правок; смысловой конфликт — отчёт об остановке "
+            '`scripts/canon/ship-finish --unconfirmed "…"`. Коммит слияния.',
+            nxt,
+        )
+        return 0
+    ok, out = checks(main)
+    st.setdefault("tests", []).append({"ts": now(), "head": head_or_none(), "ok": ok})
+    if not ok:
+        task(
+            st,
+            "2/5 красный тест (перед финишем)",
+            f"Тесты или линтеры красные:\n{out}\n\n"
+            "Пойми, чья вина — ветки или окружения — и почини. Правка кода — коммитом.",
+            nxt,
+        )
+        return 0
 
     return finish(st, n, body)
 
@@ -399,6 +433,12 @@ def finish(st: dict, n: int, body: Path) -> int:
     ]
     if st.get("weakening"):
         cmd += ["--weakening", st["weakening"]]
+    if st.get("ready_for_human"):
+        cmd += ["--ready-for-human", st["ready_for_human"]]
+    kind = SCENARIOS.get(n)
+    if kind == "red" and "probe" not in st:
+        # До ship-finish: отметка и авто-мёрж встают на красный head, PR сам не сольётся.
+        probe_red(st, n)
     res = run(cmd, capture=False)
     log({"cmd": "ship-finish", "ticket": n, "code": res.returncode, "head": head_or_none()})
     if res.returncode != 0:
@@ -411,37 +451,47 @@ def finish(st: dict, n: int, body: Path) -> int:
             f"`{ME} ship {n}` ({LONG})",
         )
         return 1
-    first = st["step"] != "finished"
     st["step"] = "finished"
     st.setdefault("finished_heads", []).append(head_or_none())
     save(st)
-    if first and SCENARIOS.get(n):
-        probe(st, n)
+    if kind == "conflict" and not st.get("probe", {}).get("neighbour_merged"):
+        probe_conflict(st, n)
     return finish_task(st, n)
 
 
-def probe(st: dict, n: int) -> None:
-    """Проба Auto-fix: PR после финиша сам не сольётся."""
-    kind = SCENARIOS[n]
-    if kind == "red":
-        p = Path("sandbox/__init__.py")
-        p.write_text(p.read_text() + "B0_PROBE=1\n")
-        git("commit", "-qam", "b0: проба Auto-fix (б) — нарушен формат, CI красный")
-    else:
-        git("commit", "-q", "--allow-empty", "-m", "b0: проба Auto-fix (а) — удержание PR")
-    git("push", "-q", "origin", "HEAD")
-    st["probe"] = {"kind": kind, "ts": now(), "head": head_or_none()}
+def probe_red(st: dict, n: int) -> None:
+    """Проба Auto-fix (б): одинарные кавычки докстринга — ruff format --check красный в CI;
+    ruff format возвращает файл ровно к исходному, артефакта в коде не остаётся."""
+    p = Path(git("rev-parse", "--show-toplevel")) / "sandbox/__init__.py"
+    p.write_text(p.read_text().replace('"""', "'''"))
+    git("commit", "-qam", "b0: проба Auto-fix (б) — нарушен формат, CI красный")
+    st["probe"] = {"kind": "red", "ts": now(), "head": head_or_none()}
     save(st)
-    log({"cmd": "probe", "ticket": n, "kind": kind, "head": head_or_none()})
-    if kind == "conflict":
-        neighbour(n)
+    log({"cmd": "probe", "ticket": n, "kind": "red", "head": head_or_none()})
 
 
-def neighbour(n: int) -> None:
+def probe_conflict(st: dict, n: int) -> None:
+    """Проба Auto-fix (а): пустой коммит без отметки держит PR, пока соседний PR не сольётся."""
+    pr = st.setdefault("probe", {"kind": "conflict", "ts": now()})
+    if not pr.get("head"):
+        git("commit", "-q", "--allow-empty", "-m", "b0: проба Auto-fix (а) — удержание PR")
+        git("push", "-q", "origin", "HEAD")
+        pr["head"] = head_or_none()
+        st["finished_heads"].append(pr["head"])  # повторный ship на нём — не новая работа
+        save(st)
+        log({"cmd": "probe", "ticket": n, "kind": "conflict", "head": pr["head"]})
+    pr["neighbour_merged"] = neighbour(n)
+    save(st)
+
+
+def neighbour(n: int) -> bool:
     """Соседний PR из документов (ревью — бесплатный пропуск): раздел в конце README."""
     main = main_checkout()
     wt = main / ".claude/worktrees" / NEIGHBOUR
     git("fetch", "-q", "origin")
+    # Остатки прошлой попытки — заново от origin/main.
+    run(["git", "worktree", "remove", "--force", str(wt)], cwd=main)
+    run(["git", "branch", "-D", NEIGHBOUR], cwd=main)
     git("worktree", "add", "-q", "--no-track", "-b", NEIGHBOUR, str(wt), "origin/main")
     readme = wt / "README.md"
     readme.write_text(
@@ -475,9 +525,13 @@ def neighbour(n: int) -> None:
         if res.stdout.strip() == "MERGED":
             break
         time.sleep(POLL)
+    merged = res.stdout.strip() == "MERGED"
     git("worktree", "remove", str(wt), cwd=main)
     run(["git", "branch", "-D", NEIGHBOUR], cwd=main)
     log({"cmd": "neighbour", "ticket": n, "state": res.stdout.strip()})
+    if not merged:
+        raise Stop("соседний PR не слит за 20 минут — проба (а) не состоялась")
+    return True
 
 
 def finish_task(st: dict, n: int) -> int:
@@ -503,21 +557,40 @@ def finish_task(st: dict, n: int) -> int:
 def blocker(pr: dict) -> str | None:
     if pr.get("mergeable") == "CONFLICTING" or pr.get("mergeStateStatus") == "DIRTY":
         return "конфликт с main"
-    for c in pr.get("statusCheckRollup") or []:
+    rollup = pr.get("statusCheckRollup") or []
+    for c in rollup:
         if (c.get("conclusion") or c.get("state") or "").upper() in RED_CHECKS:
             return f"красная проверка {c.get('name') or c.get('context')}"
+    done = all((c.get("status") or "COMPLETED") == "COMPLETED" for c in rollup)
+    marked = any(c.get("context") == "review" and c.get("state") == "SUCCESS" for c in rollup)
+    if pr.get("mergeable") == "MERGEABLE" and done and not marked:
+        return "нет отметки review на head"
     return None
 
 
 def cmd_wait(n: int, _args) -> int:
     st = load(n)
     fields = "state,url,mergedAt,mergeable,mergeStateStatus,statusCheckRollup,headRefOid"
-    start = time.time()
+    start, fails = time.time(), 0
     log({"cmd": "wait", "ticket": n})
     while time.time() - start < WAIT_LIMIT:
         pr = pr_view(n, fields)
-        if pr is None:
-            raise Stop(f"PR ветки ticket-{n} не найден")
+        if pr is None:  # разовый сбой сети или лимит gh — не повод сходить с маршрута
+            fails += 1
+            if fails > 5:
+                raise Stop(f"PR ветки {pr_branch(n)} не найден (gh отказал 6 раз подряд)")
+            time.sleep(POLL)
+            continue
+        fails = 0
+        if pr["state"] == "CLOSED":
+            task(
+                st,
+                "PR закрыт",
+                "PR закрыт без мёржа. Отчёт об остановке: "
+                '`scripts/canon/ship-finish --unconfirmed "PR закрыт без мёржа"`.',
+                "конец хода",
+            )
+            return 1
         if pr["state"] == "MERGED":
             st["merged_at"] = pr["mergedAt"]
             st["merge_seen"] = now()
@@ -543,7 +616,7 @@ def cmd_wait(n: int, _args) -> int:
                     else "Почини сам сейчас: "
                 )
                 + "конфликт — догон origin/main мёржем по A2.4 (смысл обеих правок), красная "
-                "проверка — исправление; коммит.",
+                "проверка — исправление, коммит; нет отметки — ничего чинить не надо.",
                 f"`{ME} ship {n}` ({LONG}) — заново поставит отметку на новый head",
             )
             return 0
@@ -575,20 +648,26 @@ def cmd_cleanup(n: int, _args) -> int:
     pr = pr_view(n, "state,headRefOid,mergedAt")
     if not pr or pr["state"] != "MERGED":
         raise Stop(f"PR ветки ticket-{n} не слит — убирать нечего")
+    common_dir()  # закешировать до удаления worktree: cwd может быть внутри него
+    git("worktree", "prune", cwd=main)  # чужие устаревшие записи — до замера, не после
     before = worktrees(main)
-    mine = [p for p, b in before.items() if b == f"ticket-{n}"]
+    mine = [p for p, b in before.items() if is_ticket_branch(n, b)]
     inside = any(Path.cwd().resolve().is_relative_to(Path(p).resolve()) for p in mine)
-    notes = []
+    notes, kept = [], []
     for p in mine:
         res = run(["git", "worktree", "remove", p], cwd=main)
         notes.append(f"worktree {p}: " + ("убран" if res.returncode == 0 else res.stderr.strip()))
-    ref = f"refs/heads/ticket-{n}"
+        if res.returncode != 0:
+            kept.append(before[p])
+    name = pr_branch(n)
+    ref = f"refs/heads/{name}"
     sha = run(["git", "rev-parse", "--verify", "-q", ref], cwd=main).stdout.strip()
-    if sha:
+    if sha and name in kept:
+        notes.append(f"ветка {name}: оставлена — её worktree не убран")
+    elif sha:
         res = run(["git", "update-ref", "-d", ref, sha], cwd=main)
-        notes.append(f"ветка ticket-{n}: " + ("удалена" if res.returncode == 0 else res.stderr))
-        run(["git", "config", "--remove-section", f"branch.ticket-{n}"], cwd=main)
-    git("worktree", "prune", cwd=main)
+        notes.append(f"ветка {name}: " + ("удалена" if res.returncode == 0 else res.stderr))
+        run(["git", "config", "--remove-section", f"branch.{name}"], cwd=main)
     after = worktrees(main)
     others_before = {p: b for p, b in before.items() if p not in mine}
     touched = sorted(set(others_before) - set(after))
@@ -608,6 +687,12 @@ def cmd_cleanup(n: int, _args) -> int:
         f"Уборка через {delay} с после мёржа. Чужие worktree: "
         + (f"ТРОНУТЫ {touched}" if touched else f"не тронуты ({len(others_before)})")
     )
+    if kept:
+        say(
+            "Уборка не завершена: разбери причину выше (незакоммиченное или чужой файл в "
+            f"worktree), убери его и повтори `{ME} cleanup {n}`."
+        )
+        return 1
     say("Конец маршрута. Итог владельцу — 2–3 строки: PR, что сделано, уборка.")
     return 0
 
@@ -625,6 +710,7 @@ def main(argv=None) -> int:
     ship.add_argument("n", type=int)
     ship.add_argument("--done")
     ship.add_argument("--weakening")
+    ship.add_argument("--ready-for-human")
     args = parser.parse_args(argv)
     handlers = {
         "start": cmd_start,
