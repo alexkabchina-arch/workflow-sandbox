@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+"""ticket — одноразовая заглушка маршрута тикета для прогона B0 (alexkabchina-arch/workflow#153).
+
+    scripts/b0/ticket start N            режим /start: session-start и задание «без вопросов в чат»
+    scripts/b0/ticket ask N ВОПРОС [ВАРИАНТ…]   вопрос комментарием в тикет, метка ready-for-human
+    scripts/b0/ticket resume N           ответ владельца из тикета, снятие метки
+    scripts/b0/ticket ship N [--done ИТОГ] [--weakening РЕШЕНИЕ]
+                                         следующий шаг маршрута: ревью, задание, финиш
+    scripts/b0/ticket wait N             ожидание мёржа PR (до 20 минут)
+    scripts/b0/ticket cleanup N          уборка worktree и ветки слитого PR (из главного чекаута)
+
+Проверяет гипотезы этапа B: агент проходит цикл «скрипт → задание → скрипт» до конца (Г4),
+в режиме start спрашивает только в тикете (Г5), после мёржа сразу убирает за собой (Г6), Auto-fix
+приложения доводит PR после финиша. Пять заданий маршрута `ship`: находки ревью, красный тест,
+решение о /verify, тело PR, финиш. Скрипт решает только механику; суждение — в заданиях агенту.
+
+Состояние — `<общий каталог git>/b0/ticket-N.json`, журнал вызовов — `b0/log.jsonl` там же.
+Сценарии проб Auto-fix (SCENARIOS): `red` — перед финишем коммит с нарушенным форматом (красный
+CI), `conflict` — после финиша пустой коммит удерживает PR без отметки, пока соседний PR с
+правкой конца README не сольётся. Красный тест — подложенный локальный файл вне ветки
+(`tests/test_b0_local.py`), один раз на тикет: вина окружения, а не ветки.
+В канон не идёт: после прогона удаляется вместе с блоком B0 в `CLAUDE.md` и скиллом `start`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCENARIOS = {88: "red", 90: "conflict"}
+NEIGHBOUR = "b0-neighbour"
+WAIT_LIMIT = 20 * 60
+POLL = 10
+ME = "scripts/b0/ticket"
+LONG = "Bash timeout 1800000"
+QUESTION_MARK = "**Вопрос сессии** (b0)"
+PLANTED = "tests/test_b0_local.py"
+PLANTED_TEXT = """# Локальная проверка машины разработчика (не из репозитория).
+import shutil
+
+
+def test_local_tool():
+    assert shutil.which("sandbox-local-tool"), "нет sandbox-local-tool в PATH"
+"""
+RED_CHECKS = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+
+
+class Stop(Exception):
+    """Ошибка вызова: сообщение агенту, код 2."""
+
+
+def run(cmd, cwd=None, check=False, capture=True):
+    res = subprocess.run(cmd, cwd=cwd, text=True, capture_output=capture)
+    if check and res.returncode != 0:
+        raise Stop(f"{' '.join(map(str, cmd))}: код {res.returncode}\n{res.stdout}{res.stderr}")
+    return res
+
+
+def git(*args, cwd=None):
+    return run(["git", *args], cwd=cwd, check=True).stdout.strip()
+
+
+@functools.cache  # cleanup удаляет cwd: дальше git из него не вызвать
+def common_dir() -> Path:
+    return Path(git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+
+
+def main_checkout() -> Path:
+    return common_dir().parent
+
+
+def b0_dir() -> Path:
+    d = common_dir() / "b0"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def work_dir(n: int) -> Path:
+    d = b0_dir() / f"ticket-{n}"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load(n: int) -> dict:
+    p = b0_dir() / f"ticket-{n}.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    return {"ticket": n, "mode": "implement", "step": "review", "done": {}, "history": []}
+
+
+def save(st: dict) -> None:
+    p = b0_dir() / f"ticket-{st['ticket']}.json"
+    p.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+
+
+def log(event: dict) -> None:
+    with (b0_dir() / "log.jsonl").open("a") as f:
+        f.write(json.dumps({"ts": now(), **event}, ensure_ascii=False) + "\n")
+
+
+def say(text: str) -> None:
+    print(text, flush=True)
+
+
+def task(st: dict, name: str, body: str, nxt: str) -> None:
+    """Задание агенту: что сделать и какой вызов следующий."""
+    st["history"].append({"ts": now(), "task": name})
+    log({"cmd": "task", "ticket": st["ticket"], "task": name, "head": head_or_none()})
+    save(st)
+    say(f"\nЗАДАНИЕ b0 «{name}», тикет #{st['ticket']}\n{body}")
+    if st.get("mode") == "start":
+        say(
+            "Режим start: вопросов в чат нет — всё, что спросил бы владельца, — "
+            f'`{ME} ask {st["ticket"]} "вопрос" "вариант 1" "вариант 2"`.'
+        )
+    say(f"Дальше: {nxt}")
+
+
+def head_or_none():
+    res = run(["git", "rev-parse", "--short", "HEAD"])
+    return res.stdout.strip() or None
+
+
+def branch() -> str:
+    return git("branch", "--show-current")
+
+
+def dirty() -> str:
+    return git("status", "--porcelain", "--untracked-files=no")
+
+
+def is_ticket_branch(n: int, name: str) -> bool:
+    """Ветка сессии тикета, как SESSION_BRANCH у session-start: ticket-N и ticket-N-*."""
+    return re.fullmatch(rf"ticket-{n}(-.+)?", name or "") is not None
+
+
+def pr_branch(n: int) -> str:
+    return load(n).get("branch") or f"ticket-{n}"
+
+
+def pr_view(n: int, fields: str) -> dict | None:
+    res = run(["gh", "pr", "view", pr_branch(n), "--json", fields])
+    return json.loads(res.stdout) if res.returncode == 0 else None
+
+
+def checks(main: Path) -> tuple[bool, str]:
+    """Тесты и линтеры профиля на коде worktree (python -m: пакет из текущего каталога)."""
+    venv = main / ".venv" / "bin"
+    root = git("rev-parse", "--show-toplevel")
+    out, ok = [], True
+    for cmd in (
+        [venv / "python", "-m", "pytest", "-q"],
+        [venv / "ruff", "check", "."],
+        [venv / "ruff", "format", "--check", "."],
+    ):
+        res = run([str(c) for c in cmd], cwd=root)
+        ok = ok and res.returncode == 0
+        tail = (res.stdout + res.stderr).strip().splitlines()[-15:]
+        out.append(f"$ {' '.join(map(str, cmd[1:]))} → код {res.returncode}\n" + "\n".join(tail))
+    return ok, "\n".join(out)
+
+
+# --- start / ask / resume -------------------------------------------------------------------
+
+
+def cmd_start(n: int, _args) -> int:
+    main = main_checkout()
+    res = run([str(main / "scripts/canon/session-start"), str(n)], cwd=main)
+    say(res.stdout + res.stderr)
+    log({"cmd": "start", "ticket": n, "code": res.returncode})
+    if res.returncode != 0:
+        say(
+            "session-start отказал — разбери причину выше; тикет занят или сбой — "
+            'отчёт об остановке: `scripts/canon/ship-finish --unconfirmed "<причина>"`.'
+        )
+        return res.returncode
+    st = load(n)
+    st["mode"] = "start"
+    task(
+        st,
+        "реализация",
+        "1. Войди в worktree по строке «Открытая сессия» выше (EnterWorktree с path).\n"
+        f"2. Реализуй тикет #{n} по /implement: TDD, /code-review, коммит. Владелец в чате не "
+        "отвечает: неясное в тикете — вопрос через ask (см. ниже), затем закончи ход и жди.\n"
+        f"3. После коммита — `{ME} ship {n}` ({LONG}).",
+        f"`{ME} ship {n}` после коммита",
+    )
+    return 0
+
+
+def repo() -> str:
+    return run(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], check=True
+    ).stdout.strip()
+
+
+def cmd_ask(n: int, args) -> int:
+    if not args.question.strip():
+        raise Stop("пустой вопрос")
+    opts = "\n".join(f"{i}. {o}" for i, o in enumerate(args.options, 1))
+    body = f"{QUESTION_MARK}\n\n{args.question}\n"
+    if opts:
+        body += f"\nВарианты:\n{opts}\n"
+    body += "\nОтвет — комментарием здесь, затем «продолжай» в чате сессии."
+    url = run(["gh", "issue", "comment", str(n), "--body", body], check=True).stdout.strip()
+    run(["gh", "issue", "edit", str(n), "--add-label", "ready-for-human"], check=True)
+    st = load(n)
+    st.setdefault("questions", []).append({"ts": now(), "url": url, "question": args.question})
+    st["paused"] = True
+    save(st)
+    log({"cmd": "ask", "ticket": n, "url": url})
+    say(
+        f"Вопрос в тикете: {url}\nПауза. Владельцу в чат — только эта строка: «Вопрос в тикете: "
+        f"{url}. Ответьте там и напишите „продолжай“». Других вопросов не задавай; закончи ход.\n"
+        f"Дальше: после «продолжай» — `{ME} resume {n}`."
+    )
+    return 0
+
+
+def cmd_resume(n: int, _args) -> int:
+    st = load(n)
+    if not st.get("questions"):
+        raise Stop(f"вопросов по тикету #{n} не было")
+    since = st["questions"][-1]["ts"]
+    raw = run(["gh", "api", f"repos/{repo()}/issues/{n}/comments", "--paginate"], check=True)
+    # Репозиторий публичный: ответ — только от владельца (аккаунт gh этой машины), не от любого.
+    me = run(["gh", "api", "user", "-q", ".login"], check=True).stdout.strip()
+    answers = [
+        c["body"]
+        for c in json.loads(raw.stdout)
+        if c["created_at"] >= since.replace("+00:00", "Z")
+        and (c.get("user") or {}).get("login") == me
+        and not c["body"].startswith(QUESTION_MARK)
+    ]
+    log({"cmd": "resume", "ticket": n, "answers": len(answers)})
+    if not answers:
+        say(
+            "Ответа в тикете ещё нет. Скажи владельцу одной строкой: «ответа в тикете нет» — "
+            f"и закончи ход. Дальше: после ответа — `{ME} resume {n}`."
+        )
+        return 0
+    run(["gh", "issue", "edit", str(n), "--remove-label", "ready-for-human"])
+    st["paused"] = False
+    task(
+        st,
+        "ответ получен",
+        "Ответ владельца из тикета:\n\n"
+        + "\n\n---\n\n".join(answers)
+        + f"\n\nПродолжай реализацию по ответу. После коммита — `{ME} ship {n}` ({LONG}).",
+        f"`{ME} ship {n}` после коммита",
+    )
+    return 0
+
+
+# --- ship -----------------------------------------------------------------------------------
+
+
+def cmd_ship(n: int, args) -> int:
+    if not is_ticket_branch(n, branch()):
+        raise Stop(f"не на ветке ticket-{n}: запускать из worktree тикета")
+    main = main_checkout()
+    wd = work_dir(n)
+    st = load(n)
+    st["branch"] = branch()
+    if args.weakening:
+        st["weakening"] = args.weakening
+    if args.ready_for_human:
+        st["ready_for_human"] = args.ready_for_human
+    if args.done:
+        st["done"][st["step"]] = args.done
+    log({"cmd": "ship", "ticket": n, "step": st["step"], "done": args.done, "head": head_or_none()})
+    save(st)
+    nxt = f"`{ME} ship {n}` ({LONG})"
+
+    if dirty():
+        task(st, "незакоммиченное", "В дереве незакоммиченные правки — закоммить их.", nxt)
+        return 0
+
+    if st["step"] == "review":
+        report = wd / "review.json"
+        say("Ревью ошибок ветки (scripts/canon/review), это несколько минут…")
+        res = run(["scripts/canon/review", str(report)], capture=False)
+        if res.returncode != 0:
+            task(
+                st,
+                "ревью не состоялось",
+                "Ревью упало (вывод выше). Отчёт об остановке: "
+                '`scripts/canon/ship-finish --unconfirmed "ревью не состоялось: …"`.',
+                "конец хода",
+            )
+            return 1
+        st["review_head"] = head_or_none()
+        st["step"] = "findings"
+        md = report.with_suffix(".md")
+        task(
+            st,
+            "1/5 находки ревью",
+            f"Находки — в {md if md.exists() else '(пропуск ревью: только документы)'}.\n"
+            "По каждой — решение: исправить, отклонить с причиной или техдолг (тикет). Исправления "
+            f"— коммитом. Решения списком — в {wd / 'findings.md'} (попадут в тело PR). "
+            "Строка «ослабление защиты» в отчёте — реши и передай "
+            f'`--weakening "<решение>"` в следующий вызов.',
+            f'`{ME} ship {n} --done "<итог одной строкой>"` ({LONG})',
+        )
+        return 0
+
+    if st["step"] == "findings":
+        if not args.done:
+            task(
+                st,
+                "1/5 находки ревью",
+                "Задание не закрыто: нужен итог в --done.",
+                f'`{ME} ship {n} --done "<итог одной строкой>"`',
+            )
+            return 0
+        st["step"] = "tests"
+
+    if st["step"] == "tests":
+        if not st.get("planted"):
+            (Path(git("rev-parse", "--show-toplevel")) / PLANTED).write_text(PLANTED_TEXT)
+            st["planted"] = True
+        ok, out = checks(main)
+        st.setdefault("tests", []).append({"ts": now(), "head": head_or_none(), "ok": ok})
+        if not ok:
+            task(
+                st,
+                "2/5 красный тест",
+                f"Тесты или линтеры красные:\n{out}\n\nПойми, чья вина — ветки или окружения — "
+                "и почини. Правка кода — коммитом.",
+                f'`{ME} ship {n} --done "<чья вина и что сделано>"` ({LONG})',
+            )
+            return 0
+        st["step"] = "verify"
+        task(
+            st,
+            "3/5 решение о /verify",
+            "Тесты и линтеры зелёные. Реши, нужен ли /verify: затронуто ли поведение CLI (рецепт — "
+            f"docs/agents/profile.md). Нужен — критерии тикета в {wd / 'criteria.txt'} и "
+            f"`scripts/canon/verify {wd / 'verify.json'} --criteria-file {wd / 'criteria.txt'}` "
+            f"({LONG}); FAIL — почини, закоммить. Строка `verify: ready-for-human: …` — передай её "
+            '`--ready-for-human "<строка>"` в следующий вызов.',
+            f'`{ME} ship {n} --done "verify: PASS | FAIL→исправлено | не нужен: почему"`',
+        )
+        return 0
+
+    if st["step"] == "verify":
+        if not args.done:
+            task(
+                st,
+                "3/5 решение о /verify",
+                "Задание не закрыто: нужен итог в --done.",
+                f'`{ME} ship {n} --done "verify: …"`',
+            )
+            return 0
+        st["step"] = "body"
+        task(
+            st,
+            "4/5 тело PR",
+            f"Напиши тело PR в {wd / 'body.md'}: «Что сделано» (2–5 строк), решения по находкам "
+            f"ревью (из {wd / 'findings.md'}), итог /verify, строка `Closes #{n}`.",
+            f'`{ME} ship {n} --done "тело готово"` ({LONG})',
+        )
+        return 0
+
+    body = wd / "body.md"
+    if st["step"] == "body":
+        if not body.exists() or not body.read_text().strip():
+            task(
+                st,
+                "4/5 тело PR",
+                f"Файла {body} нет или он пуст — напиши тело PR.",
+                f'`{ME} ship {n} --done "тело готово"`',
+            )
+            return 0
+        st["step"] = "finish"
+
+    if st["step"] == "finished" and head_or_none() in st["finished_heads"]:
+        if SCENARIOS.get(n) == "conflict" and not st.get("probe", {}).get("neighbour_merged"):
+            probe_conflict(st, n)  # прошлая попытка пробы оборвалась
+        return finish_task(st, n)
+
+    # Перед каждым финишем — догон main (шаг 4а /ship) и тесты на итоговом коде.
+    git("fetch", "-q", "origin")
+    if run(["git", "merge-base", "--is-ancestor", "origin/main", "HEAD"]).returncode != 0:
+        task(
+            st,
+            "догон main",
+            "Ветка отстаёт от origin/main: догони мёржем (не rebase) по A2.4 — конфликт "
+            "разрешай с сохранением смысла обеих правок; смысловой конфликт — отчёт об остановке "
+            '`scripts/canon/ship-finish --unconfirmed "…"`. Коммит слияния.',
+            nxt,
+        )
+        return 0
+    ok, out = checks(main)
+    st.setdefault("tests", []).append({"ts": now(), "head": head_or_none(), "ok": ok})
+    if not ok:
+        task(
+            st,
+            "2/5 красный тест (перед финишем)",
+            f"Тесты или линтеры красные:\n{out}\n\n"
+            "Пойми, чья вина — ветки или окружения — и почини. Правка кода — коммитом.",
+            nxt,
+        )
+        return 0
+
+    return finish(st, n, body)
+
+
+def finish(st: dict, n: int, body: Path) -> int:
+    title = run(
+        ["gh", "issue", "view", str(n), "--json", "title", "-q", ".title"], check=True
+    ).stdout.strip()
+    cmd = [
+        "scripts/canon/ship-finish",
+        "--title",
+        f"{title} (#{n})",
+        "--body-file",
+        str(body),
+        "--review-report",
+        str(work_dir(n) / "review.json"),
+    ]
+    if st.get("weakening"):
+        cmd += ["--weakening", st["weakening"]]
+    if st.get("ready_for_human"):
+        cmd += ["--ready-for-human", st["ready_for_human"]]
+    kind = SCENARIOS.get(n)
+    if kind == "red" and "probe" not in st:
+        # До ship-finish: отметка и авто-мёрж встают на красный head, PR сам не сольётся.
+        probe_red(st, n)
+    res = run(cmd, capture=False)
+    log({"cmd": "ship-finish", "ticket": n, "code": res.returncode, "head": head_or_none()})
+    if res.returncode != 0:
+        task(
+            st,
+            "5/5 финиш: отказ",
+            "ship-finish отказал (вывод выше). Разбери: поправимо (ослабление защиты — "
+            "`--weakening`, незакоммиченное) — поправь и повтори; нет — отчёт об остановке "
+            '`scripts/canon/ship-finish --unconfirmed "…"`.',
+            f"`{ME} ship {n}` ({LONG})",
+        )
+        return 1
+    st["step"] = "finished"
+    st.setdefault("finished_heads", []).append(head_or_none())
+    save(st)
+    if kind == "conflict" and not st.get("probe", {}).get("neighbour_merged"):
+        probe_conflict(st, n)
+    return finish_task(st, n)
+
+
+def probe_red(st: dict, n: int) -> None:
+    """Проба Auto-fix (б): одинарные кавычки докстринга — ruff format --check красный в CI;
+    ruff format возвращает файл ровно к исходному, артефакта в коде не остаётся."""
+    p = Path(git("rev-parse", "--show-toplevel")) / "sandbox/__init__.py"
+    p.write_text(p.read_text().replace('"""', "'''"))
+    git("commit", "-qam", "b0: проба Auto-fix (б) — нарушен формат, CI красный")
+    st["probe"] = {"kind": "red", "ts": now(), "head": head_or_none()}
+    save(st)
+    log({"cmd": "probe", "ticket": n, "kind": "red", "head": head_or_none()})
+
+
+def probe_conflict(st: dict, n: int) -> None:
+    """Проба Auto-fix (а): пустой коммит без отметки держит PR, пока соседний PR не сольётся."""
+    pr = st.setdefault("probe", {"kind": "conflict", "ts": now()})
+    if not pr.get("head"):
+        git("commit", "-q", "--allow-empty", "-m", "b0: проба Auto-fix (а) — удержание PR")
+        git("push", "-q", "origin", "HEAD")
+        pr["head"] = head_or_none()
+        st["finished_heads"].append(pr["head"])  # повторный ship на нём — не новая работа
+        save(st)
+        log({"cmd": "probe", "ticket": n, "kind": "conflict", "head": pr["head"]})
+    pr["neighbour_merged"] = neighbour(n)
+    save(st)
+
+
+def neighbour(n: int) -> bool:
+    """Соседний PR из документов (ревью — бесплатный пропуск): раздел в конце README."""
+    main = main_checkout()
+    wt = main / ".claude/worktrees" / NEIGHBOUR
+    git("fetch", "-q", "origin")
+    # Остатки прошлой попытки — заново от origin/main.
+    run(["git", "worktree", "remove", "--force", str(wt)], cwd=main)
+    run(["git", "branch", "-D", NEIGHBOUR], cwd=main)
+    git("worktree", "add", "-q", "--no-track", "-b", NEIGHBOUR, str(wt), "origin/main")
+    readme = wt / "README.md"
+    readme.write_text(
+        readme.read_text().rstrip("\n")
+        + "\n\n## Лицензия\n\nКод песочницы — для контрольных сценариев канона.\n"
+    )
+    git("commit", "-qam", f"README: раздел «Лицензия» (соседний PR пробы Auto-fix, #{n})", cwd=wt)
+    report = b0_dir() / "neighbour-review.json"
+    run(["scripts/canon/review", str(report)], cwd=wt, check=True)
+    nbody = b0_dir() / "neighbour-body.md"
+    nbody.write_text(
+        f"Соседний PR пробы Auto-fix (а) для #{n} (alexkabchina-arch/workflow#153): "
+        "правка конца README, чтобы PR тикета стал конфликтным.\n"
+    )
+    run(
+        [
+            "scripts/canon/ship-finish",
+            "--title",
+            "README: раздел «Лицензия» (проба B0)",
+            "--body-file",
+            str(nbody),
+            "--review-report",
+            str(report),
+        ],
+        cwd=wt,
+        check=True,
+    )
+    say("Соседний PR открыт, жду его мёржа…")
+    for _ in range(WAIT_LIMIT // POLL):
+        res = run(["gh", "pr", "view", NEIGHBOUR, "--json", "state", "-q", ".state"])
+        if res.stdout.strip() == "MERGED":
+            break
+        time.sleep(POLL)
+    merged = res.stdout.strip() == "MERGED"
+    git("worktree", "remove", str(wt), cwd=main)
+    run(["git", "branch", "-D", NEIGHBOUR], cwd=main)
+    log({"cmd": "neighbour", "ticket": n, "state": res.stdout.strip()})
+    if not merged:
+        raise Stop("соседний PR не слит за 20 минут — проба (а) не состоялась")
+    return True
+
+
+def finish_task(st: dict, n: int) -> int:
+    pr = pr_view(n, "url") or {}
+    autofix = (
+        "включи Auto-fix на этом PR сам, без вопроса владельцу"
+        if SCENARIOS.get(n)
+        else "не включай и не предлагай"
+    )
+    task(
+        st,
+        "5/5 финиш",
+        f"PR: {pr.get('url', '?')}. 1) Привяжи PR к сессии: get_status, затем bind_pr. "
+        f"2) Auto-fix: {autofix}. 3) Жди мёржа.",
+        f"`{ME} wait {n}` ({LONG})",
+    )
+    return 0
+
+
+# --- wait / cleanup -------------------------------------------------------------------------
+
+
+def blocker(pr: dict) -> str | None:
+    if pr.get("mergeable") == "CONFLICTING" or pr.get("mergeStateStatus") == "DIRTY":
+        return "конфликт с main"
+    rollup = pr.get("statusCheckRollup") or []
+    for c in rollup:
+        if (c.get("conclusion") or c.get("state") or "").upper() in RED_CHECKS:
+            return f"красная проверка {c.get('name') or c.get('context')}"
+    done = all((c.get("status") or "COMPLETED") == "COMPLETED" for c in rollup)
+    marked = any(c.get("context") == "review" and c.get("state") == "SUCCESS" for c in rollup)
+    if pr.get("mergeable") == "MERGEABLE" and done and not marked:
+        return "нет отметки review на head"
+    return None
+
+
+def cmd_wait(n: int, _args) -> int:
+    st = load(n)
+    fields = "state,url,mergedAt,mergeable,mergeStateStatus,statusCheckRollup,headRefOid"
+    start, fails = time.time(), 0
+    log({"cmd": "wait", "ticket": n})
+    while time.time() - start < WAIT_LIMIT:
+        pr = pr_view(n, fields)
+        if pr is None:  # разовый сбой сети или лимит gh — не повод сходить с маршрута
+            fails += 1
+            if fails > 5:
+                raise Stop(f"PR ветки {pr_branch(n)} не найден (gh отказал 6 раз подряд)")
+            time.sleep(POLL)
+            continue
+        fails = 0
+        if pr["state"] == "CLOSED":
+            task(
+                st,
+                "PR закрыт",
+                "PR закрыт без мёржа. Отчёт об остановке: "
+                '`scripts/canon/ship-finish --unconfirmed "PR закрыт без мёржа"`.',
+                "конец хода",
+            )
+            return 1
+        if pr["state"] == "MERGED":
+            st["merged_at"] = pr["mergedAt"]
+            st["merge_seen"] = now()
+            task(
+                st,
+                "уборка",
+                f"PR слит ({pr['mergedAt']}). 1) Выйди из worktree: ExitWorktree, каталог "
+                "оставить (keep). 2) Из главного чекаута — уборка.",
+                f"`{ME} cleanup {n}`",
+            )
+            return 0
+        why = blocker(pr)
+        if why:
+            st.setdefault("blocked", []).append({"ts": now(), "why": why})
+            auto = SCENARIOS.get(n)
+            task(
+                st,
+                "PR не сольётся сам",
+                f"{why} ({pr['url']}). "
+                + (
+                    "Auto-fix включён — заверши ход: он разбудит сессию. Разбуженная сессия: "
+                    if auto
+                    else "Почини сам сейчас: "
+                )
+                + "конфликт — догон origin/main мёржем по A2.4 (смысл обеих правок), красная "
+                "проверка — исправление, коммит; нет отметки — ничего чинить не надо.",
+                f"`{ME} ship {n}` ({LONG}) — заново поставит отметку на новый head",
+            )
+            return 0
+        time.sleep(POLL)
+    task(
+        st,
+        "таймаут ожидания",
+        "PR не слит за 20 минут. Отчёт об остановке: "
+        '`scripts/canon/ship-finish --unconfirmed "PR не слит за 20 минут: …"`.',
+        "конец хода",
+    )
+    return 1
+
+
+def worktrees(main: Path) -> dict[str, str]:
+    out, path = {}, None
+    for line in git("worktree", "list", "--porcelain", cwd=main).splitlines():
+        if line.startswith("worktree "):
+            path = line[9:]
+            out[path] = ""
+        elif line.startswith("branch "):
+            out[path] = line[7:].removeprefix("refs/heads/")
+    return out
+
+
+def cmd_cleanup(n: int, _args) -> int:
+    main = main_checkout()
+    st = load(n)
+    pr = pr_view(n, "state,headRefOid,mergedAt")
+    if not pr or pr["state"] != "MERGED":
+        raise Stop(f"PR ветки ticket-{n} не слит — убирать нечего")
+    common_dir()  # закешировать до удаления worktree: cwd может быть внутри него
+    git("worktree", "prune", cwd=main)  # чужие устаревшие записи — до замера, не после
+    before = worktrees(main)
+    mine = [p for p, b in before.items() if is_ticket_branch(n, b)]
+    inside = any(Path.cwd().resolve().is_relative_to(Path(p).resolve()) for p in mine)
+    notes, kept = [], []
+    for p in mine:
+        res = run(["git", "worktree", "remove", p], cwd=main)
+        notes.append(f"worktree {p}: " + ("убран" if res.returncode == 0 else res.stderr.strip()))
+        if res.returncode != 0:
+            kept.append(before[p])
+    name = pr_branch(n)
+    ref = f"refs/heads/{name}"
+    sha = run(["git", "rev-parse", "--verify", "-q", ref], cwd=main).stdout.strip()
+    if sha and name in kept:
+        notes.append(f"ветка {name}: оставлена — её worktree не убран")
+    elif sha:
+        res = run(["git", "update-ref", "-d", ref, sha], cwd=main)
+        notes.append(f"ветка {name}: " + ("удалена" if res.returncode == 0 else res.stderr))
+        run(["git", "config", "--remove-section", f"branch.{name}"], cwd=main)
+    after = worktrees(main)
+    others_before = {p: b for p, b in before.items() if p not in mine}
+    touched = sorted(set(others_before) - set(after))
+    merged = datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00"))
+    delay = round((datetime.now(timezone.utc) - merged).total_seconds())
+    st["cleanup"] = {
+        "ts": now(),
+        "delay_s": delay,
+        "notes": notes,
+        "others_touched": touched,
+        "from_inside": inside,
+    }
+    save(st)
+    log({"cmd": "cleanup", "ticket": n, **st["cleanup"]})
+    say("\n".join(notes))
+    say(
+        f"Уборка через {delay} с после мёржа. Чужие worktree: "
+        + (f"ТРОНУТЫ {touched}" if touched else f"не тронуты ({len(others_before)})")
+    )
+    if kept:
+        say(
+            "Уборка не завершена: разбери причину выше (незакоммиченное или чужой файл в "
+            f"worktree), убери его и повтори `{ME} cleanup {n}`."
+        )
+        return 1
+    say("Конец маршрута. Итог владельцу — 2–3 строки: PR, что сделано, уборка.")
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="ticket", description="заглушка маршрута B0")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("start", "resume", "wait", "cleanup"):
+        sub.add_parser(name).add_argument("n", type=int)
+    ask = sub.add_parser("ask")
+    ask.add_argument("n", type=int)
+    ask.add_argument("question")
+    ask.add_argument("options", nargs="*")
+    ship = sub.add_parser("ship")
+    ship.add_argument("n", type=int)
+    ship.add_argument("--done")
+    ship.add_argument("--weakening")
+    ship.add_argument("--ready-for-human")
+    args = parser.parse_args(argv)
+    handlers = {
+        "start": cmd_start,
+        "ask": cmd_ask,
+        "resume": cmd_resume,
+        "ship": cmd_ship,
+        "wait": cmd_wait,
+        "cleanup": cmd_cleanup,
+    }
+    try:
+        return handlers[args.cmd](args.n, args)
+    except Stop as exc:
+        log({"cmd": args.cmd, "ticket": args.n, "error": str(exc)[:500]})
+        print(f"ticket: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    raise SystemExit(main())
