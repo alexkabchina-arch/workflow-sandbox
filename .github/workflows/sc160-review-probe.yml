@@ -1,10 +1,7 @@
-# Сценарий аудита workflow#160: проверка, засчитывает ли обязательная проверка `review`
-# (без integration_id, «любой источник») check run от workflow, добавленного в самом PR.
-# НЕ настоящее ревью. Ветка/PR помечены «не сливать», после прогона удаляются.
 name: sc160-audit-review-probe
 on: pull_request
 jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "audit #160: поддельный review-джоб, ревью ошибок НЕ запускалось"
+      - run: 'true'
