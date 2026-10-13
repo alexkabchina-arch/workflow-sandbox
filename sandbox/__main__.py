@@ -1,6 +1,7 @@
-"""CLI: python -m sandbox 3x100 1x49.90 --discount 10"""
+"""CLI: python -m sandbox 3x100 1x49.90 --discount 10 [--kop]"""
 
 import argparse
+from typing import NoReturn
 
 from sandbox import __version__
 from sandbox.cart import parse_item
@@ -10,7 +11,7 @@ from sandbox.money import format_rub, order_total_kop
 class OneLineErrorParser(argparse.ArgumentParser):
     """Любая ошибка ввода — одна строка «sandbox: error: <причина>» и код 2, без usage."""
 
-    def error(self, message: str):
+    def error(self, message: str) -> NoReturn:
         self.exit(2, f"{self.prog}: error: {message}\n")
 
 
@@ -29,6 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = OneLineErrorParser(prog="sandbox", description="Сумма заказа")
     parser.add_argument("items", nargs="+", help="позиции вида КОЛxЦЕНА (x или X), например 3x100")
     parser.add_argument("--discount", type=int, default=0, help="скидка, %%")
+    parser.add_argument("--kop", action="store_true", help="итог целым числом копеек, без «₽»")
     parser.add_argument("--version", action=VersionAction, help="показать версию и выйти")
     args = parser.parse_args(argv)
     try:
@@ -36,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
         total = order_total_kop(items, args.discount)
     except ValueError as exc:
         parser.error(str(exc))
-    print(format_rub(total))
+    print(total if args.kop else format_rub(total))
     return 0
 
 
