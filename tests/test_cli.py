@@ -40,12 +40,38 @@ def test_count_flag_adds_total_quantity_line(capsys, argv, out):
 
 
 @pytest.mark.parametrize(
+    ("argv", "out"),
+    [
+        # 5 % от 349,90 = 17,495 → скидка 17,49 (округление скидки вниз до копейки), итог 332,41
+        (["3x100", "1x49.90", "--loyal"], "332.41\u00a0₽\n"),
+        (["3x100", "1x49.90", "--loyal", "--discount", "3"], "332.41\u00a0₽\n"),
+        (["3x100", "1x49.90", "--loyal", "--discount", "10"], "314.91\u00a0₽\n"),
+        (["3x100", "1x49.90", "--loyal", "--kop"], "33241\n"),
+    ],
+)
+def test_loyal_flag_applies_larger_discount(capsys, argv, out):
+    assert main(argv) == 0
+    assert capsys.readouterr().out == out
+
+
+def test_help_names_loyal_discount(capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "200")  # справка флага — одной строкой
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    assert (
+        "постоянный клиент: скидка 5 %, с --discount — бо́льшая из двух" in capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize(
     "argv, reason",
     [
         (["0x100"], "количество должно быть положительным"),
         (["3"], "ожидался формат КОЛxЦЕНА, получено '3'"),
         (["3x100", "--discount", "101"], "скидка должна быть от 0 до 100 %"),
         (["3x100", "--discount", "101", "--kop"], "скидка должна быть от 0 до 100 %"),
+        (["3x100", "--discount", "-1", "--loyal"], "скидка должна быть от 0 до 100 %"),
         (["3x100", "1xabc", "--count"], "цена должна быть числом, получено 'abc'"),
         # parse_item пропускает количество в 4300 цифр, но int→str длиннее 4300 цифр — отказ
         (["9" * 4300 + "x1", "--kop"], "число слишком большое для вывода"),

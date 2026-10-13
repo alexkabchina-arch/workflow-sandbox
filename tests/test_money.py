@@ -54,3 +54,26 @@ def test_cli(capsys):
 def test_cli_thousands_separator(capsys):
     assert main(["1000x1000"]) == 0
     assert capsys.readouterr().out == "1\u00a0000\u00a0000.00\u00a0₽\n"
+
+
+@pytest.mark.parametrize(
+    ("discount_pct", "loyal", "expected"),
+    [
+        (0, False, 10000),
+        (10, False, 9000),
+        (0, True, 9500),
+        (3, True, 9500),  # бо́льшая из двух скидок (5 %), а не сумма 8 %
+        (5, True, 9500),
+        (10, True, 9000),
+        (100, True, 0),
+    ],
+)
+def test_loyal_gets_larger_of_two_discounts(discount_pct, loyal, expected):
+    assert order_total_kop([Item(1, 10000)], discount_pct, loyal=loyal) == expected
+
+
+@pytest.mark.parametrize("pct", [-1, 101])
+def test_bad_discount_is_error_even_for_loyal(pct):
+    # max(-1, 5) спрятал бы ошибку ввода
+    with pytest.raises(ValueError, match="скидка должна быть от 0 до 100 %"):
+        order_total_kop([Item(1, 100)], pct, loyal=True)
