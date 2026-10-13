@@ -1,4 +1,4 @@
-"""CLI: python -m sandbox 3x100 1x49.90 --discount 10 [--kop]"""
+"""CLI: python -m sandbox 3x100 1x49.90 --discount 10 [--kop] [--count]"""
 
 import argparse
 from typing import NoReturn
@@ -31,6 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("items", nargs="+", help="позиции вида КОЛxЦЕНА (x или X), например 3x100")
     parser.add_argument("--discount", type=int, default=0, help="скидка, %%")
     parser.add_argument("--kop", action="store_true", help="итог целым числом копеек, без «₽»")
+    parser.add_argument("--count", action="store_true", help="второй строкой — сумма количеств")
     parser.add_argument("--version", action=VersionAction, help="показать версию и выйти")
     args = parser.parse_args(argv)
     try:
@@ -39,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
     print(total if args.kop else format_rub(total))
+    if args.count:
+        print(f"позиций: {sum(item.qty for item in items)}")
     return 0
 
 

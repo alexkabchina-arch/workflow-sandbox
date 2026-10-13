@@ -25,6 +25,21 @@ def test_kop_flag_has_no_thousands_separator(capsys):
     assert capsys.readouterr().out == "123456\n"
 
 
+def test_count_flag_prints_total_quantity_on_second_line(capsys):
+    assert main(["3x100", "1x49.90", "--count"]) == 0
+    assert capsys.readouterr().out == "349.90 ₽\nпозиций: 4\n"
+
+
+def test_without_count_flag_output_is_one_line(capsys):
+    assert main(["3x100", "1x49.90"]) == 0
+    assert capsys.readouterr().out == "349.90 ₽\n"
+
+
+def test_count_flag_combines_with_kop(capsys):
+    assert main(["3x100", "1x49.90", "--kop", "--count"]) == 0
+    assert capsys.readouterr().out == "34990\nпозиций: 4\n"
+
+
 @pytest.mark.parametrize(
     "argv, reason",
     [
