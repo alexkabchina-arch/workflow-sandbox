@@ -1,6 +1,7 @@
 """CLI: python -m sandbox 3x100 1x49.90 --discount 10"""
 
 import argparse
+from importlib.metadata import version
 
 from sandbox.cart import parse_item
 from sandbox.money import format_rub, order_total_kop
@@ -17,6 +18,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = OneLineErrorParser(prog="sandbox", description="Сумма заказа")
     parser.add_argument("items", nargs="+", help="позиции вида КОЛxЦЕНА (x или X), например 3x100")
     parser.add_argument("--discount", type=int, default=0, help="скидка, %%")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {version('workflow-sandbox')}"
+    )
     args = parser.parse_args(argv)
     try:
         items = [parse_item(spec) for spec in args.items]

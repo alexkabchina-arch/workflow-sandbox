@@ -29,3 +29,12 @@ def test_bad_input_is_one_line_error_with_code_2(capsys, argv, reason):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == f"sandbox: error: {reason}\n"
+
+
+def test_version_prints_package_version_and_exits_0(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--version"])
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.out == "sandbox 0.1.0\n"
+    assert captured.err == ""
