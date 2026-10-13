@@ -2,7 +2,7 @@ from decimal import InvalidOperation, localcontext
 
 import pytest
 
-from sandbox.cart import Item, parse_item
+from sandbox.cart import Item, parse_item, total_qty
 
 
 def test_parse_item():
@@ -103,3 +103,7 @@ def test_parse_item_price_ignores_global_decimal_context():
     with localcontext() as ctx:
         ctx.prec = 3
         assert parse_item("1x12345.67") == Item(qty=1, price_kop=1234567)
+
+
+def test_total_qty_sums_quantities_not_items():
+    assert total_qty([Item(qty=3, price_kop=10000), Item(qty=1, price_kop=4990)]) == 4

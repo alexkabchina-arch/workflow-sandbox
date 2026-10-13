@@ -9,6 +9,7 @@
 ```bash
 python -m sandbox 3x100 1x49.90 --discount 10
 python -m sandbox 3x100 1x49.90 --discount 10 --kop   # 31491 — итог в копейках, без «₽»
+python -m sandbox 3x100 1x49.90 --count   # вторая строка «позиций: 4» — сумма количеств
 python -m sandbox --version   # sandbox 0.1.0
 ```
 
