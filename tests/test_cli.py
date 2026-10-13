@@ -42,7 +42,7 @@ def test_count_flag_adds_total_quantity_line(capsys, argv, out):
 @pytest.mark.parametrize(
     ("argv", "out"),
     [
-        # 5 % от 349,90 = 17,495 → 17,49 (вниз в пользу покупателя), итог 332,41
+        # 5 % от 349,90 = 17,495 → скидка 17,49 (округление скидки вниз до копейки), итог 332,41
         (["3x100", "1x49.90", "--loyal"], "332.41\u00a0₽\n"),
         (["3x100", "1x49.90", "--loyal", "--discount", "3"], "332.41\u00a0₽\n"),
         (["3x100", "1x49.90", "--loyal", "--discount", "10"], "314.91\u00a0₽\n"),
@@ -52,6 +52,16 @@ def test_count_flag_adds_total_quantity_line(capsys, argv, out):
 def test_loyal_flag_applies_larger_discount(capsys, argv, out):
     assert main(argv) == 0
     assert capsys.readouterr().out == out
+
+
+def test_help_names_loyal_discount(capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "200")  # справка флага — одной строкой
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    assert (
+        "постоянный клиент: скидка 5 %, с --discount — бо́льшая из двух" in capsys.readouterr().out
+    )
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ from typing import NoReturn
 
 from sandbox import __version__
 from sandbox.cart import parse_item, total_qty
-from sandbox.money import LOYAL_DISCOUNT_PCT, effective_discount_pct, format_rub, order_total_kop
+from sandbox.money import LOYAL_DISCOUNT_PCT, format_rub, order_total_kop
 
 
 class OneLineErrorParser(argparse.ArgumentParser):
@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         items = [parse_item(spec) for spec in args.items]
-        total = order_total_kop(items, effective_discount_pct(args.discount, loyal=args.loyal))
+        total = order_total_kop(items, args.discount, loyal=args.loyal)
     except ValueError as exc:
         parser.error(str(exc))
     # Вывод собирается целиком до печати: int→str длиннее sys.int_info.str_digits_check_threshold

@@ -2,12 +2,7 @@ import pytest
 
 from sandbox.__main__ import main
 from sandbox.cart import Item
-from sandbox.money import (
-    LOYAL_DISCOUNT_PCT,
-    effective_discount_pct,
-    format_rub,
-    order_total_kop,
-)
+from sandbox.money import format_rub, order_total_kop
 
 
 def test_total_without_discount():
@@ -64,25 +59,21 @@ def test_cli_thousands_separator(capsys):
 @pytest.mark.parametrize(
     ("discount_pct", "loyal", "expected"),
     [
-        (0, False, 0),
-        (10, False, 10),
-        (0, True, 5),
-        (3, True, 5),  # бо́льшая из двух, а не сумма 8 %
-        (10, True, 10),
-        (100, True, 100),
+        (0, False, 10000),
+        (10, False, 9000),
+        (0, True, 9500),
+        (3, True, 9500),  # бо́льшая из двух скидок (5 %), а не сумма 8 %
+        (5, True, 9500),
+        (10, True, 9000),
+        (100, True, 0),
     ],
 )
-def test_effective_discount_is_larger_of_two(discount_pct, loyal, expected):
-    assert effective_discount_pct(discount_pct, loyal=loyal) == expected
-
-
-def test_loyal_discount_is_5_pct():
-    # Размер — решение владельца в #89; help флага берёт его из константы
-    assert LOYAL_DISCOUNT_PCT == 5
+def test_loyal_gets_larger_of_two_discounts(discount_pct, loyal, expected):
+    assert order_total_kop([Item(1, 10000)], discount_pct, loyal=loyal) == expected
 
 
 @pytest.mark.parametrize("pct", [-1, 101])
-def test_effective_discount_rejects_bad_discount_even_for_loyal(pct):
+def test_bad_discount_is_error_even_for_loyal(pct):
     # max(-1, 5) спрятал бы ошибку ввода
     with pytest.raises(ValueError, match="скидка должна быть от 0 до 100 %"):
-        effective_discount_pct(pct, loyal=True)
+        order_total_kop([Item(1, 100)], pct, loyal=True)

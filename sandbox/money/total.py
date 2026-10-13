@@ -8,19 +8,12 @@ from sandbox.cart import Item
 LOYAL_DISCOUNT_PCT = 5
 
 
-def _check_discount(discount_pct: int) -> None:
+def order_total_kop(items: Iterable[Item], discount_pct: int = 0, *, loyal: bool = False) -> int:
+    # Проверка до max(): иначе max(-1, 5) молча превратил бы ошибку ввода в скидку 5 %
     if not 0 <= discount_pct <= 100:
         raise ValueError("скидка должна быть от 0 до 100 %")
-
-
-def effective_discount_pct(discount_pct: int, *, loyal: bool) -> int:
-    # Проверка до max(): иначе max(-1, 5) молча превратил бы ошибку ввода в скидку 5 %
-    _check_discount(discount_pct)
-    return max(discount_pct, LOYAL_DISCOUNT_PCT) if loyal else discount_pct
-
-
-def order_total_kop(items: Iterable[Item], discount_pct: int = 0) -> int:
-    _check_discount(discount_pct)
+    if loyal:
+        discount_pct = max(discount_pct, LOYAL_DISCOUNT_PCT)
     subtotal = sum(item.qty * item.price_kop for item in items)
     discount = subtotal * discount_pct // 100
     return subtotal - discount
