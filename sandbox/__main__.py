@@ -1,6 +1,4 @@
-"""CLI: python -m sandbox 3x100 1x49.90 --discount 10 [--loyal] [--kop] [--code] [--count]
-[--version]
-"""
+"""CLI суммы заказа: python -m sandbox 3x100 1x49.90 --discount 10; флаги — в --help."""
 
 import argparse
 from typing import NoReturn
