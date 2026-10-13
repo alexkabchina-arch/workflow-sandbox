@@ -7,8 +7,13 @@ requires-python = ">=3.12"
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
 # Сценарий 9 (workflow#11): закреплённые версии с известным типом обновления Dependabot.
-# В CI не ставятся (`.[dev]`).
-probe = ["requests==2.32.4", "packaging==23.2"]
+# В CI не ставятся (`.[dev]`). requests — намеренно ниже слитого #25: сценарий 18 (в)
+# (workflow#174) ждёт PR Dependabot patch 2.32.4 → 2.32.5. По строке на пакет — PR Dependabot
+# по разным пакетам не конфликтуют.
+probe = [
+    "requests==2.32.4",
+    "packaging==23.2",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
