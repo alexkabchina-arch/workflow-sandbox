@@ -1,0 +1,46 @@
+# Вендорен из канона alexkabchina-arch/workflow (`canon-sync`, `.canon.lock`): руками не править.
+#
+# Сторож отметки ревью (#163): обязательная проверка `review-guard` от GitHub Actions. Проверка
+# `review` в наборе правил засчитывается от любого источника, и PR с workflow, где есть джоб
+# `review`, сам ставил себе отметку. Сторож зелёный, только если отметку поставил `ship-finish`
+# (статус от учётной записи) или `dependabot-review` (статус со ссылкой на свой прогон);
+# check run `review` или статус `review` из другого источника — красный. Логика — в
+# `scripts/canon/review-guard`.
+#
+# `pull_request_target`: workflow и скрипт — из базовой ветки, код PR не выгружается и не
+# исполняется, подменить сторожа PR не может. Свой зелёный джоб `review-guard` в PR красного
+# сторожа не перекрывает: упавший check run с тем же именем держит мёрж (R2 аудита #160).
+#
+# Отметка часто приходит после старта сторожа: он ждёт её 2 минуты, а успешный статус `review`
+# от `ship-finish` (событие `status`) перезапускает упавший прогон сторожа — workflow
+# `review-guard-rerun.yml`. Статус от токена workflow событий не порождает, поэтому
+# `dependabot-review` перезапускает сторожа сам тем же шагом. Перезапуск — отдельным файлом: здесь
+# на каждое событие `status` появлялся бы пропущенный check run `review-guard`.
+#
+# Порядок установки: этот файл — в `main` раньше, чем `protect-main` сделает `review-guard`
+# обязательной (иначе проверка не появится и PR не сольётся); `protect-main` без него падает.
+name: review-guard
+
+on:
+  pull_request_target:
+
+permissions: {}
+
+jobs:
+  review-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: read
+      checks: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Источник отметки review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/canon/review-guard "$GITHUB_REPOSITORY" "$SHA" --wait 120

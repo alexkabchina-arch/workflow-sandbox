@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""ticket — маршрут тикета в коде: механику делает скрипт, суждение — агент по заданиям.
+
+    scripts/canon/ticket ship <N>       конец работы над тикетом: ревью, разбор, тесты, /verify,
+                                        догон базы, тело PR, финиш (`ticket_ship.py`)
+    scripts/canon/ticket status         таблица тикетов проекта (`ticket_status.py`)
+    scripts/canon/ticket start <N>      режим /start: старт сессии тикета, задание без вопросов в
+                                        чат (`ticket_start.py`)
+    scripts/canon/ticket ask <N>        вопрос владельцу комментарием в тикет, пауза до ответа
+                                        (`ticket_ask.py`)
+    scripts/canon/ticket wait <N>       ожидание мёржа PR и уборка сразу после него
+                                        (`ticket_wait.py`)
+
+Каркас: подкоманда `X` — модуль `ticket_X.py` рядом со скриптом, его функция
+`main(argv, core) -> int`; `core` — общий модуль `ticket_core.py` (состояние тикета, задания,
+команды профиля). Новая подкоманда — новый модуль, каркас не правится (решение
+`docs/decisions/2026-10-12-stage-b-plan.md` в каноне). Модули грузятся без правки `sys.path` и
+без `__pycache__` в вендоренном `scripts/canon/`.
+
+Каждый вызов делает механику до ближайшего шага с суждением, печатает одно задание и выходит.
+Последняя строка вывода — статус: `ticket: ход агента` (выполнить задание и вызвать снова),
+`ticket: готово`, `ticket: остановка` (ждём владельца); код выхода у всех трёх — 0. Код 1 — сбой
+механики (git, gh), 2 — ошибка аргументов. Как устроено — `docs/ticket.md` канона.
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import sys
+import types
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+
+def load(name: str) -> types.ModuleType:
+    path = HERE / f"{name}.py"
+    module = types.ModuleType(f"canon_{name}")
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    return module
+
+
+def commands() -> list[str]:
+    return sorted(
+        p.stem.removeprefix("ticket_") for p in HERE.glob("ticket_*.py") if p.stem != "ticket_core"
+    )
+
+
+def main(argv: list[str]) -> int:
+    known = commands()
+    if not argv or argv[0] not in known:
+        print(f"ticket: подкоманда — одна из: {', '.join(known)}", file=sys.stderr)
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    core = load("ticket_core")
+    try:
+        return load(f"ticket_{argv[0]}").main(argv[1:], core)
+    except core.Failure as exc:
+        print(f"ticket: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
