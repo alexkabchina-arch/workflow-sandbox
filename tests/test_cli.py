@@ -1,5 +1,11 @@
+import importlib
+import tomllib
+from importlib import metadata
+from pathlib import Path
+
 import pytest
 
+import sandbox
 from sandbox.__main__ import main
 
 
@@ -29,3 +35,29 @@ def test_bad_input_is_one_line_error_with_code_2(capsys, argv, reason):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == f"sandbox: error: {reason}\n"
+
+
+def test_version_prints_pyproject_version_and_exits_0(capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "10")  # строка не переносится по ширине терминала
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+    with pytest.raises(SystemExit) as exc:
+        main(["--version"])
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.out == f"sandbox {pyproject['project']['version']}\n"
+    assert captured.err == ""
+
+
+def test_without_package_metadata_cli_still_works(capsys, monkeypatch):
+    def not_installed(name):
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "version", not_installed)
+    try:
+        importlib.reload(sandbox)
+        assert sandbox.__version__ == "unknown"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(sandbox)
+    assert main(["3x100"]) == 0
+    assert capsys.readouterr().out == "300.00\u00a0₽\n"
