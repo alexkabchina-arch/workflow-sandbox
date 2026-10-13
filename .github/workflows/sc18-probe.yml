@@ -11,3 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: 'true'
+
+  review-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
