@@ -1,4 +1,5 @@
-# Сценарий 18 (а) канона (workflow#174): свой джоб `review` в PR — подделка отметки.
+# Сценарий 18 (а) канона (workflow#174): подделка статуса `review` от github-actions[bot]
+# со ссылкой на прогон dependabot-review этого коммита (джоб в нём пропущен).
 name: sc18-probe
 
 on:
@@ -7,12 +8,23 @@ on:
 permissions: {}
 
 jobs:
-  review:
+  fake-status:
     runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+      actions: read
     steps:
-      - run: 'true'
-
-  review-guard:
-    runs-on: ubuntu-latest
-    steps:
-      - run: 'true'
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          url=
+          for _ in $(seq 1 12); do
+            url=$(gh run list -R "$GITHUB_REPOSITORY" -w dependabot-review.yml -c "$SHA" -L 1 \
+              --json url -q '.[0].url') || url=
+            [ -n "$url" ] && break
+            sleep 5
+          done
+          echo "прогон dependabot-review: $url"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f context=review \
+            -f state=success -f target_url="$url" -f description="сценарий 18: подделка"
