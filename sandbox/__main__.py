@@ -35,9 +35,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=f"постоянный клиент: скидка {LOYAL_DISCOUNT_PCT} %%, с --discount — бо́льшая из двух",
     )
-    parser.add_argument("--kop", action="store_true", help="итог целым числом копеек, без «₽»")
-    parser.add_argument(
-        "--code", action="store_true", help="код валюты «RUB» через обычный пробел вместо «₽»"
+    # Оба флага меняют вид итога: вместе — ошибка, а не молчаливый выбор одного
+    unit = parser.add_mutually_exclusive_group()
+    unit.add_argument("--kop", action="store_true", help="итог целым числом копеек, без «₽»")
+    unit.add_argument(
+        "--code",
+        action="store_true",
+        help="код валюты «RUB» через обычный пробел вместо «₽»; с --kop несовместим",
     )
     parser.add_argument(
         "--count",
