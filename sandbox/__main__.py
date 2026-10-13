@@ -1,4 +1,6 @@
-"""CLI: python -m sandbox 3x100 1x49.90 --discount 10 [--loyal] [--kop] [--count] [--version]"""
+"""CLI: python -m sandbox 3x100 1x49.90 --discount 10 [--loyal] [--kop] [--code] [--count]
+[--version]
+"""
 
 import argparse
 from typing import NoReturn
@@ -37,6 +39,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--kop", action="store_true", help="итог целым числом копеек, без «₽»")
     parser.add_argument(
+        "--code", action="store_true", help="код валюты «RUB» через обычный пробел вместо «₽»"
+    )
+    parser.add_argument(
         "--count",
         action="store_true",
         help="второй строкой «позиций: K», K — сумма количеств (штук)",
@@ -51,7 +56,13 @@ def main(argv: list[str] | None = None) -> int:
     # Вывод собирается целиком до печати: int→str длиннее sys.int_info.str_digits_check_threshold
     # цифр — ValueError, и без этого stdout остался бы с частью вывода и traceback.
     try:
-        lines = [str(total) if args.kop else format_rub(total)]
+        if args.kop:
+            lines = [str(total)]
+        elif args.code:
+            # Меняется только хвост: U+00A0 и «₽»; разделитель тысяч остаётся неразрывным
+            lines = [format_rub(total).removesuffix("\u00a0₽") + " RUB"]
+        else:
+            lines = [format_rub(total)]
         if args.count:
             lines.append(f"позиций: {total_qty(items)}")
     except ValueError:
