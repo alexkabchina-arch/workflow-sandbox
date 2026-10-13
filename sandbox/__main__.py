@@ -1,6 +1,7 @@
 """CLI: python -m sandbox 3x100 1x49.90 --discount 10 [--kop]"""
 
 import argparse
+from typing import NoReturn
 
 from sandbox import __version__
 from sandbox.cart import parse_item
@@ -10,7 +11,7 @@ from sandbox.money import format_rub, order_total_kop
 class OneLineErrorParser(argparse.ArgumentParser):
     """Любая ошибка ввода — одна строка «sandbox: error: <причина>» и код 2, без usage."""
 
-    def error(self, message: str):
+    def error(self, message: str) -> NoReturn:
         self.exit(2, f"{self.prog}: error: {message}\n")
 
 

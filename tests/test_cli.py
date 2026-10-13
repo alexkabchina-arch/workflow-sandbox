@@ -19,12 +19,19 @@ def test_kop_flag_prints_integer_kopecks(capsys):
     assert capsys.readouterr().out == "31491\n"
 
 
+def test_kop_flag_has_no_thousands_separator(capsys):
+    # С --kop нет ни «₽», ни U+00A0 между тысячами, которые format_rub ставит от 1000 ₽
+    assert main(["1x1234.56", "--kop"]) == 0
+    assert capsys.readouterr().out == "123456\n"
+
+
 @pytest.mark.parametrize(
     "argv, reason",
     [
         (["0x100"], "количество должно быть положительным"),
         (["3"], "ожидался формат КОЛxЦЕНА, получено '3'"),
         (["3x100", "--discount", "101"], "скидка должна быть от 0 до 100 %"),
+        (["3x100", "--discount", "101", "--kop"], "скидка должна быть от 0 до 100 %"),
         (["1x0.005"], "цена точнее копейки: '0.005'"),
         (["3 0x1"], "количество должно быть целым числом, получено '3 0'"),
         (["1xabc"], "цена должна быть числом, получено 'abc'"),
