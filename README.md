@@ -11,6 +11,7 @@ python -m sandbox 3x100 1x49.90 --discount 10
 python -m sandbox 3x100 1x49.90 --discount 10 --kop   # 31491 — итог в копейках, без «₽»
 python -m sandbox 3x100 1x49.90 --count   # вторая строка «позиций: 4» — сумма количеств
 python -m sandbox 3x100 1x49.90 --loyal   # 332.41 ₽ — скидка постоянного клиента 5 %; с --discount — бо́льшая из двух
+python -m sandbox 3x100 --code   # 300.00 RUB — код валюты вместо «₽», см. «Флаги»
 python -m sandbox --version   # sandbox 0.1.0
 ```
 
@@ -24,3 +25,7 @@ python -m sandbox --version   # sandbox 0.1.0
 ## Лицензия
 
 Код песочницы — для контрольных сценариев канона.
+
+## Флаги
+
+- `--code` — вместо знака «₽» печатается код валюты `RUB` через обычный пробел: `python -m sandbox 3x100 --code` → `300.00 RUB`. Разделитель тысяч остаётся неразрывным пробелом. С `--kop` несовместим: ошибка и код 2.

@@ -42,6 +42,21 @@ def test_count_flag_adds_total_quantity_line(capsys, argv, out):
 @pytest.mark.parametrize(
     ("argv", "out"),
     [
+        (["3x100", "--code"], "300.00 RUB\n"),
+        (["3x100", "1x49.90", "--discount", "10", "--code"], "314.91 RUB\n"),
+        # Разделитель тысяч остаётся неразрывным, обычный пробел — только перед кодом
+        (["1x1234.56", "--code"], "1\u00a0234.56 RUB\n"),
+        (["3x100", "1x49.90", "--code", "--count"], "349.90 RUB\nпозиций: 4\n"),
+    ],
+)
+def test_code_flag_prints_currency_code_instead_of_sign(capsys, argv, out):
+    assert main(argv) == 0
+    assert capsys.readouterr().out == out
+
+
+@pytest.mark.parametrize(
+    ("argv", "out"),
+    [
         # 5 % от 349,90 = 17,495 → скидка 17,49 (округление скидки вниз до копейки), итог 332,41
         (["3x100", "1x49.90", "--loyal"], "332.41\u00a0₽\n"),
         (["3x100", "1x49.90", "--loyal", "--discount", "3"], "332.41\u00a0₽\n"),
@@ -77,6 +92,8 @@ def test_help_names_loyal_discount(capsys, monkeypatch):
         (["9" * 4300 + "x1", "--kop"], "число слишком большое для вывода"),
         (["9" * 4300 + "x0", "9" * 4300 + "x0", "--count"], "число слишком большое для вывода"),
         (["1x0.005"], "цена точнее копейки: '0.005'"),
+        (["3x100", "--code", "--kop"], "argument --kop: not allowed with argument --code"),
+        (["3x100", "--kop", "--code"], "argument --code: not allowed with argument --kop"),
         (["3 0x1"], "количество должно быть целым числом, получено '3 0'"),
         (["1xabc"], "цена должна быть числом, получено 'abc'"),
         (["3x100", "--discount", "abc"], "argument --discount: invalid int value: 'abc'"),
