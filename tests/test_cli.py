@@ -14,6 +14,11 @@ def test_valid_input_prints_total(capsys):
     assert capsys.readouterr().out == "314.91\u00a0₽\n"
 
 
+def test_kop_flag_prints_integer_kopecks(capsys):
+    assert main(["3x100", "1x49.90", "--discount", "10", "--kop"]) == 0
+    assert capsys.readouterr().out == "31491\n"
+
+
 @pytest.mark.parametrize(
     "argv, reason",
     [
