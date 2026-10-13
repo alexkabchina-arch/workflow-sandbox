@@ -71,3 +71,8 @@ def parse_item(spec: str) -> Item:
     if price < 0:
         raise ValueError("цена не может быть отрицательной")
     return Item(qty=qty, price_kop=int(price.scaleb(2, context=PRICE_CONTEXT)))
+
+
+def total_qty(items: list[Item]) -> int:
+    """Сумма количеств, а не число позиций: «3x100 1x49.90» → 4."""
+    return sum(item.qty for item in items)

@@ -1,10 +1,10 @@
-"""CLI: python -m sandbox 3x100 1x49.90 --discount 10 [--kop] [--count]"""
+"""CLI: python -m sandbox 3x100 1x49.90 --discount 10 [--kop] [--count] [--version]"""
 
 import argparse
 from typing import NoReturn
 
 from sandbox import __version__
-from sandbox.cart import parse_item
+from sandbox.cart import parse_item, total_qty
 from sandbox.money import format_rub, order_total_kop
 
 
@@ -31,7 +31,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("items", nargs="+", help="позиции вида КОЛxЦЕНА (x или X), например 3x100")
     parser.add_argument("--discount", type=int, default=0, help="скидка, %%")
     parser.add_argument("--kop", action="store_true", help="итог целым числом копеек, без «₽»")
-    parser.add_argument("--count", action="store_true", help="второй строкой — сумма количеств")
+    parser.add_argument(
+        "--count",
+        action="store_true",
+        help="второй строкой «позиций: K», K — сумма количеств (штук)",
+    )
     parser.add_argument("--version", action=VersionAction, help="показать версию и выйти")
     args = parser.parse_args(argv)
     try:
@@ -39,9 +43,15 @@ def main(argv: list[str] | None = None) -> int:
         total = order_total_kop(items, args.discount)
     except ValueError as exc:
         parser.error(str(exc))
-    print(total if args.kop else format_rub(total))
-    if args.count:
-        print(f"позиций: {sum(item.qty for item in items)}")
+    # Вывод собирается целиком до печати: int→str длиннее sys.int_info.str_digits_check_threshold
+    # цифр — ValueError, и без этого stdout остался бы с частью вывода и traceback.
+    try:
+        lines = [str(total) if args.kop else format_rub(total)]
+        if args.count:
+            lines.append(f"позиций: {total_qty(items)}")
+    except ValueError:
+        parser.error("число слишком большое для вывода")
+    print("\n".join(lines))
     return 0
 
 

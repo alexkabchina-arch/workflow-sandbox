@@ -25,19 +25,18 @@ def test_kop_flag_has_no_thousands_separator(capsys):
     assert capsys.readouterr().out == "123456\n"
 
 
-def test_count_flag_prints_total_quantity_on_second_line(capsys):
-    assert main(["3x100", "1x49.90", "--count"]) == 0
-    assert capsys.readouterr().out == "349.90 ₽\nпозиций: 4\n"
-
-
-def test_without_count_flag_output_is_one_line(capsys):
-    assert main(["3x100", "1x49.90"]) == 0
-    assert capsys.readouterr().out == "349.90 ₽\n"
-
-
-def test_count_flag_combines_with_kop(capsys):
-    assert main(["3x100", "1x49.90", "--kop", "--count"]) == 0
-    assert capsys.readouterr().out == "34990\nпозиций: 4\n"
+@pytest.mark.parametrize(
+    ("argv", "out"),
+    [
+        (["3x100", "1x49.90"], "349.90\u00a0₽\n"),
+        (["3x100", "1x49.90", "--count"], "349.90\u00a0₽\nпозиций: 4\n"),
+        (["3x100", "1x49.90", "--discount", "10", "--count"], "314.91\u00a0₽\nпозиций: 4\n"),
+        (["3x100", "1x49.90", "--kop", "--count"], "34990\nпозиций: 4\n"),
+    ],
+)
+def test_count_flag_adds_total_quantity_line(capsys, argv, out):
+    assert main(argv) == 0
+    assert capsys.readouterr().out == out
 
 
 @pytest.mark.parametrize(
@@ -47,6 +46,10 @@ def test_count_flag_combines_with_kop(capsys):
         (["3"], "ожидался формат КОЛxЦЕНА, получено '3'"),
         (["3x100", "--discount", "101"], "скидка должна быть от 0 до 100 %"),
         (["3x100", "--discount", "101", "--kop"], "скидка должна быть от 0 до 100 %"),
+        (["3x100", "1xabc", "--count"], "цена должна быть числом, получено 'abc'"),
+        # parse_item пропускает количество в 4300 цифр, но int→str длиннее 4300 цифр — отказ
+        (["9" * 4300 + "x1", "--kop"], "число слишком большое для вывода"),
+        (["9" * 4300 + "x0", "9" * 4300 + "x0", "--count"], "число слишком большое для вывода"),
         (["1x0.005"], "цена точнее копейки: '0.005'"),
         (["3 0x1"], "количество должно быть целым числом, получено '3 0'"),
         (["1xabc"], "цена должна быть числом, получено 'abc'"),
