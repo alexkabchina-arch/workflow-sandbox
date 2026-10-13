@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""review-guard — сторожевая проверка источника отметки ревью (#163).
+
+    review-guard <владелец/репозиторий> <sha> [--wait <секунды>]
+
+Обязательная проверка `review` в наборе правил засчитывается от любого источника: её ставят и
+`ship-finish`, и `dependabot-review`, привязать к одному нельзя. Поэтому PR, добавивший workflow с
+джобом `review`, сам ставил себе отметку и сливался без ревью (R1 аудита #160). Сторож —
+обязательная проверка `review-guard` от GitHub Actions: workflow `review-guard` запускает его по
+`pull_request_target`, то есть из ветки по умолчанию, — PR не подменит ни workflow, ни скрипт.
+
+Зелёный, только если отметка `review` на коммите — своя:
+
+- статус от учётной записи (`creator.type == "User"`) — его ставит `ship-finish`; workflow PR
+  ставит статусы от `github-actions[bot]`;
+- статус от `github-actions[bot]`, у которого `target_url` ведёт на прогон
+  `.github/workflows/dependabot-review.yml` по `pull_request_target` на этом же коммите, начатый
+  Dependabot (`actor` — `dependabot[bot]`), и шаг отметки в нём не пропущен. Прогон этого
+  workflow с пропущенным джобом есть у каждого PR: без проверки `actor` и шага подделка
+  сослалась бы на него.
+
+Красный сразу — check run с именем `review` (у отметок канона их нет: это джоб workflow) или
+статус `review` от другого источника, в том числе под честной отметкой. Успешной отметки нет —
+опрос раз в 10 секунд до `--wait`, потом красный: позже пришедшая отметка перезапускает сторожа
+(workflow `review-guard-rerun`, джоб перезапуска в `dependabot-review`).
+Только стандартная библиотека Python 3 и `gh`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CONTEXT = "review"
+DEPENDABOT_WORKFLOW = ".github/workflows/dependabot-review.yml"
+DEPENDABOT_JOB = "dependabot-review"
+DEPENDABOT_STEP = "Отметка ревью и авто-мёрж"
+DEPENDABOT = "dependabot[bot]"
+ACTIONS_BOT = "github-actions[bot]"
+POLL = 10  # секунд между опросами
+
+
+def gh_api(path: str, paginate: bool = False):
+    """Ответ `gh api`; с `paginate` — все страницы списка одним списком."""
+    pages = ["--paginate", "--slurp"] if paginate else []
+    result = subprocess.run(["gh", "api", *pages, path], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"gh api {path}: {result.stderr.strip()}")
+    data = json.loads(result.stdout or "null")
+    return [item for page in data for item in page] if paginate else data
+
+
+def dependabot_marked(run: dict, jobs: list, sha: str) -> bool:
+    """Прогон `dependabot-review` на коммите от Dependabot, и шаг отметки в нём не пропущен."""
+    if not (
+        (run.get("path") or "").split("@")[0] == DEPENDABOT_WORKFLOW
+        and run.get("event") == "pull_request_target"
+        and run.get("head_sha") == sha
+        and (run.get("actor") or {}).get("login") == DEPENDABOT
+    ):
+        return False
+    for job in jobs:
+        if job.get("name") != DEPENDABOT_JOB or job.get("conclusion") == "skipped":
+            continue
+        for step in job.get("steps") or []:
+            # Шаг ещё идёт (статус поставлен, авто-мёрж включается) — conclusion пока null.
+            if step.get("name") == DEPENDABOT_STEP and step.get("conclusion") != "skipped":
+                return True
+    return False
+
+
+def foreign_source(status: dict, repo: str, sha: str, run_of, server: str) -> str | None:
+    """Причина, почему статус `review` не от `ship-finish` и не от `dependabot-review`."""
+    creator = status.get("creator") or {}
+    login = creator.get("login") or "?"
+    if creator.get("type") == "User":
+        return None
+    if login == ACTIONS_BOT:
+        url = status.get("target_url") or ""
+        runs = rf"{re.escape(server.rstrip('/'))}/{re.escape(repo)}/actions/runs/(\d+)(?:/.*)?"
+        match = re.fullmatch(runs, url)
+        if match and dependabot_marked(*run_of(match.group(1)), sha):
+            return None
+        return f"статус review от {login} не из dependabot-review этого коммита"
+    return f"статус review от {login}"
+
+
+def verdict(repo: str, sha: str, statuses: list, check_runs: list, run_of, server: str) -> tuple:
+    """(True | False | None, пояснение); None — успешной отметки пока нет."""
+    if check_runs:
+        return False, "check run с именем review: у отметки канона их нет, его поставил workflow"
+    marks = [s for s in statuses if s.get("context") == CONTEXT]  # от новых к старым
+    for mark in marks:
+        reason = foreign_source(mark, repo, sha, run_of, server)
+        if reason:
+            return False, f"{reason}: отметку ставят только ship-finish и dependabot-review"
+    if marks and marks[0].get("state") == "success":
+        return True, f"отметка review от {marks[0]['creator']['login']}"
+    return None, "нет успешной отметки review"
+
+
+def guard(repo: str, sha: str, wait: int, gh=gh_api, sleep=time.sleep) -> int:
+    server = os.environ.get("GITHUB_SERVER_URL") or "https://github.com"
+    runs = {}
+
+    def run_of(run_id: str) -> tuple:
+        """(прогон, его джобы); джобы — на каждом опросе заново: шаг отметки мог дойти."""
+        if run_id not in runs:
+            runs[run_id] = gh(f"repos/{repo}/actions/runs/{run_id}")
+        jobs = gh(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100").get("jobs") or []
+        return runs[run_id], jobs
+
+    waited = 0
+    while True:
+        statuses = gh(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True)
+        checks = gh(f"repos/{repo}/commits/{sha}/check-runs?check_name={CONTEXT}&per_page=100")
+        ok, why = verdict(repo, sha, statuses, checks.get("check_runs") or [], run_of, server)
+        if ok is None and waited < wait:
+            sleep(POLL)
+            waited += POLL
+            continue
+        print(f"review-guard: {why}")
+        return 0 if ok else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="review-guard", description=__doc__.split("\n\n")[0])
+    parser.add_argument("repo", help="владелец/репозиторий")
+    parser.add_argument("sha", help="head-коммит PR")
+    parser.add_argument("--wait", type=int, default=0, help="сколько секунд ждать отметку")
+    args = parser.parse_args(argv)
+    try:
+        return guard(args.repo, args.sha, args.wait)
+    except RuntimeError as exc:
+        print(f"review-guard: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

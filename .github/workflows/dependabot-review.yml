@@ -23,6 +23,14 @@
 # проект делает по push в `main`, ждёт следующего обычного мёржа. Хуже всего — workflow с фильтром
 # по путям на lock-файлы, их меняет почти только Dependabot: в vps `build-images` и `warm-deps-cache`
 # (`pnpm-lock.yaml`), в ozon `cache-warm` — они фактически не запускаются (чек-лист переноса).
+#
+# Сторож `review-guard` (#163) засчитывает статус `review` от токена workflow, только если
+# `target_url` ведёт на прогон этого workflow по `pull_request_target` на том же коммите, начатый
+# Dependabot, с непропущенным шагом отметки. Статус от
+# токена workflow событий `status` не порождает — упавший до отметки прогон сторожа перезапускает
+# джоб `review-guard-rerun` (шаг тот же, что в `review-guard-rerun.yml`); право `actions: write` —
+# только у него, не у шагов со сторонним `dependabot/fetch-metadata`.
+#
 # PR Dependabot на `.github/` (экосистема `github-actions`) ждёт одобрения владельца (`CODEOWNERS`):
 # Dependabot — не владелец, одобрение код-оунера с его PR требуется.
 name: dependabot-review
@@ -37,6 +45,8 @@ permissions:
 
 jobs:
   dependabot-review:
+    outputs:
+      patch: ${{ steps.meta.outputs.update-type == 'version-update:semver-patch' }}
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.event.sender.login == 'dependabot[bot]'
@@ -64,5 +74,33 @@ jobs:
           fi
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
             -f state=success -f context=review \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             -f description="Dependabot ${UPDATE#version-update:semver-}: ревью ошибок не нужно, проверяет CI"
           gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --auto --squash --match-head-commit "$SHA"
+
+  review-guard-rerun:
+    needs: dependabot-review
+    if: needs.dependabot-review.outputs.patch == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Перезапуск сторожа
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          run=
+          for _ in 1 2 3 4 5 6; do
+            run=$(gh run list -R "$GITHUB_REPOSITORY" -w review-guard.yml -e pull_request_target \
+              -c "$SHA" -L 1 --json databaseId -q '.[0].databaseId') || run=
+            [ -n "$run" ] && break
+            sleep 10
+          done
+          if [ -z "$run" ]; then
+            echo "прогона сторожа на $SHA нет: он запустится сам и увидит отметку"
+            exit 0
+          fi
+          gh run watch "$run" -R "$GITHUB_REPOSITORY" --exit-status > /dev/null && exit 0
+          gh run rerun "$run" -R "$GITHUB_REPOSITORY" --failed

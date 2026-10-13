@@ -8,7 +8,7 @@
 
     claude -p --model claude-opus-5-5 --max-budget-usd <предел> --output-format stream-json \\
         --verbose --json-schema <схема находок> --disallowedTools=Agent,Workflow,Monitor \\
-        "/review xhigh origin/main...HEAD" < /dev/null
+        --append-system-prompt <предел заголовка> "/review xhigh origin/main...HEAD" < /dev/null
 
 Уровень и модель одни для любого диффа (итог разведки workflow#2). Дифф только из документов
 (`docs/**`, `*.md`) — ревью пропускается; конфиги, CI и всё под `.claude/` на любой глубине
@@ -137,11 +137,22 @@ SCHEMA = {
     "additionalProperties": False,
 }
 REPORT_TOOL = "ReportFindings"  # инструмент, которым `/review` отдаёт находки
+# Краткий заголовок находки длиннее 60 символов `ReportFindings` отклоняет, и модель повторяет вызов
+# (ретро A4: 5 ревью из 14) — предел называется заранее, в системном промпте: в аргументе `/review`
+# он слился бы с диапазоном диффа.
+SUMMARY_LIMIT = (
+    "Краткий заголовок находки (short_summary в ReportFindings) — не длиннее 60 символов: "
+    "длиннее инструмент отклоняет."
+)
 RETELLING = "structured_output"  # находки пересказаны моделью в ответе по схеме
 NO_CATEGORY = "без категории"  # тег находки без `category` в `<отчёт>.md`
 # Нет ответа на вопрос об ослаблении — не «нет ослабления»: решает сессия (`ship-finish`).
 NO_WEAKENING_ANSWER = "ревью не ответило на вопрос об ослаблении защиты — оценить дифф самому"
 PLAIN_NO = {"", "нет", "ослабления нет", "не ослабляет", "no", "none"}  # ответ «нет» словами
+
+
+def prompt(base: str) -> str:
+    return f"/review {LEVEL} {base}...HEAD"
 
 
 def is_docs(path: str) -> bool:
@@ -332,9 +343,8 @@ def run_review(report: Path, base: str, budget: str, scope: dict) -> dict:
     """
     events: list[dict] = []
     try:
-        data = claude_run.run_claude(
-            [f"/review {LEVEL} {base}...HEAD"], report, budget, SCHEMA, events
-        )
+        limit = ["--append-system-prompt", SUMMARY_LIMIT]
+        data = claude_run.run_claude([*limit, prompt(base)], report, budget, SCHEMA, events)
         items, source = findings(data, events, report)
     except claude_run.ChildError as exc:
         kept = keep_reported(events, report)

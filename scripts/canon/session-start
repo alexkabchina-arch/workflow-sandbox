@@ -22,13 +22,11 @@
    не обрыв (`ship-finish` ставит отметку последней), так владелец придерживает PR, и конфликт
    его не отдаёт сессии. PR, в worktree которого идёт
    сессия (замок `session-run`), не берётся. Есть такие — берётся первый (красные, затем
-   конфликтные, затем без отметки), тикет откладывается. Красный CI — возврат: комментарий
-   «возврат k/2 … на <sha>»; на тот же head второй раз не пишется. Третий возврат не
-   делается: метка `ready-for-human` и комментарий-форма (вопрос, логи, варианты,
-   рекомендация), PR пропускается, пока метка стоит. Владелец снял метку — ответ дан: счёт
-   возвратов начинается заново. PR без отметки — дозапуск `/ship`, конфликтный — `/ship` с
-   догоном базы мёржем; ни то, ни другое возвратом не считается. В PR есть «Отчёт об
-   остановке» — промпт велит прочитать его и ответ владельца.
+   конфликтные, затем без отметки), тикет откладывается. Красный CI — возврат: промпт с
+   упавшими проверками; PR берётся на каждом старте, пока CI красный, — счёта и предела нет,
+   на PR ничего не пишется. PR без отметки — дозапуск `/ship`, конфликтный — `/ship` с
+   догоном базы мёржем. В PR есть «Отчёт об остановке» — промпт велит прочитать его и ответ
+   владельца.
 3. Тикет: открыт, не назначен другому. Сессия тикета уже идёт (замок `session-run` в его
    worktree) — стоп.
 4. Worktree и ветка: уже есть worktree на ветке — он; иначе внутри главного
@@ -51,7 +49,8 @@
    его; занятый, с живой сессией или каталог самого старта — пропуск с сообщением), проектная
    `cleanup` для него и ветка. С новыми коммитами поверх слитого head, сбой git или `gh` на
    ветке — пропуск с сообщением. Ветка этого старта и главный чекаут не
-   трогаются.
+   трогаются. С убранной веткой снимается метка `in-progress` её тикета. Та же уборка сразу
+   после мёржа — `retire_merged` (её зовёт `ticket wait`).
 5. Метка `in-progress` и исполнитель — я: после worktree и `setup`, чтобы сбой на них не оставил
    тикет занятым без сессии.
 
@@ -92,22 +91,22 @@ SESSION_WORKTREES = ".claude/worktrees"
 SETUP = "scripts/session/setup"
 CLEANUP = "scripts/session/cleanup"
 REVIEW = "review"
-WAITING = "ready-for-human"
+GUARD = "review-guard"  # сторож отметки (#163): без отметки он красный — это не красный CI
 IN_PROGRESS = "in-progress"
 RED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
-MAX_RETURNS = 2
 # Замок сессии в личном каталоге git worktree: `session-run` держит его, пока идёт `claude`.
 SESSION_LOCK = "canon-session.lock"
 SESSION_BRANCH = re.compile(r"^ticket-\d+(-.+)?$")
-RETURN_RE = re.compile(r"^возврат (\d+)/\d+: красный CI на ([0-9a-f]{7})")
-FORM_MARK = f"{WAITING}: третий возврат не делается"
 PR_FIELDS = (
-    "number,title,url,headRefName,headRefOid,baseRefName,isDraft,labels,statusCheckRollup,"
+    "number,title,url,headRefName,headRefOid,baseRefName,isDraft,statusCheckRollup,"
     "autoMergeRequest,mergeable,mergeStateStatus"
 )
 # `mergeable` GitHub считает фоном: список отдаёт `UNKNOWN`, итог появляется через секунды.
 RECHECK_TRIES = 3
 RECHECK_PAUSE = 1.0
+# GitHub удаляет ветку слитого PR фоном: `ticket wait` перезапрашивает сервер.
+DELETE_TRIES = 3
+DELETE_PAUSE = 3.0
 # Первая строка отчёта об остановке — `REPORT_MARK` в `ship-finish`, менять вместе.
 REPORT_MARK = "Отчёт об остановке"
 PR_LIMIT = "200"
@@ -287,10 +286,11 @@ def cleanup(main: Path) -> set[str]:
     return pending
 
 
-def sync_main(main: Path) -> None:
+def sync_main(main: Path) -> bool:
     """Главный чекаут на `main` без правок — fast-forward к `origin/main`; иначе сообщение.
 
     Отставший `main` подсовывает `/code-review` старую базу. Старт это не останавливает.
+    True — догнан.
     """
     branch = subprocess.run(
         ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -300,15 +300,15 @@ def sync_main(main: Path) -> None:
     ).stdout.strip()
     if branch != "main":
         note(f"главный чекаут {main} не на main ({branch or 'detached HEAD'}) — не догнан")
-        return
+        return False
     try:
         dirty = run("git", "status", "--porcelain", "--untracked-files=no", cwd=main)
     except StartError as exc:
         note(f"главный чекаут {main} не догнан до origin/main: {exc}")
-        return
+        return False
     if dirty:
         note(f"главный чекаут {main}: незакоммиченные правки — не догнан до origin/main")
-        return
+        return False
     try:
         run("git", "merge", "-q", "--ff-only", "origin/main", cwd=main)
     except StartError as exc:
@@ -316,6 +316,8 @@ def sync_main(main: Path) -> None:
             f"главный чекаут {main} не догнан до origin/main (разошёлся или мешают "
             f"неотслеживаемые файлы): {exc}"
         )
+        return False
+    return True
 
 
 def sweep_merged(main: Path, keep: str, here: Path | None) -> set[str]:
@@ -390,7 +392,7 @@ def sweep_branch(branch: str, path: Path | None, main: Path, here: Path | None) 
         note(f"пропуск {branch}: в {busy} идёт сессия")
         return None
     if path is not None and here is not None and here.is_relative_to(path):
-        note(f"пропуск {branch}: из {path} запущен этот старт")
+        note(f"пропуск {branch}: из {path} идёт этот вызов (сессия ещё в worktree)")
         return None
     failed = None
     if path is not None:
@@ -417,7 +419,76 @@ def sweep_branch(branch: str, path: Path | None, main: Path, here: Path | None) 
         return failed
     run("git", "branch", "-q", "-D", branch)
     note(f"удалена ветка {branch} слитого PR {url}")
+    unmark_merged(branch)
     return failed
+
+
+def unmark_merged(branch: str) -> None:
+    """Метка `in-progress` тикета ветки снимается: PR слит, сессия кончилась (решение владельца
+    13.10, #156). Есть другая ветка того же тикета (локально или на сервере) — не снимается: там
+    может идти новая сессия. Сбой `gh` — сообщение, уборка идёт дальше."""
+    if not (match := re.match(r"^ticket-(\d+)", branch)):
+        return
+    number = match.group(1)
+    try:
+        refs = run(
+            "git",
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/",
+            "refs/remotes/origin/",
+        )
+        names = {r.removeprefix("origin/") for r in refs.split()} - {branch}
+        if any(re.match(rf"^ticket-{number}(-.+)?$", name) for name in names):
+            note(f"тикет #{number}: метка {IN_PROGRESS} оставлена — у тикета есть другая ветка")
+            return
+        issue = json.loads(run("gh", "issue", "view", number, "--json", "labels"))
+        if IN_PROGRESS in {lb["name"] for lb in issue.get("labels") or []}:
+            run("gh", "issue", "edit", number, "--remove-label", IN_PROGRESS)
+            note(f"тикет #{number}: метка {IN_PROGRESS} снята")
+    except (StartError, ValueError) as exc:
+        note(f"тикет #{number}: метка {IN_PROGRESS} не снята — {exc}")
+
+
+def retire_merged(branch: str, head: str, here: Path | None) -> tuple[bool, list[str]]:
+    """Уборка сразу после мёржа PR ветки с head `head` (`ticket wait`) — механикой старта.
+
+    Под блокировкой реестра: исчезнувшие worktree реестра, `git fetch --prune` (ветку на сервере
+    GitHub удаляет не мгновенно — до `DELETE_TRIES` повторов), догон главного чекаута
+    fast-forward, затем `sweep_branch` для этой ветки. Метка `in-progress` снимается и при сбое
+    уборки, и при пропуске worktree, где ещё сидит сессия (`here`), — если поверх слитого head нет
+    новых коммитов. Итог — (ветки больше нет, что не доделано).
+    """
+    main = Path(worktrees()[0]["path"])
+    problems = []
+    try:
+        with registry_lock():
+            cleanup(main)
+            for attempt in range(DELETE_TRIES):
+                if attempt:
+                    time.sleep(DELETE_PAUSE)
+                run("git", "fetch", "-q", "--prune", "origin")
+                if not has_ref(f"refs/remotes/origin/{branch}"):
+                    break
+            else:
+                problems.append(
+                    f"ветка {branch} ещё на сервере (выключено удаление веток при мёрже?) — "
+                    "worktree и ветка не убраны"
+                )
+            if not sync_main(main):
+                problems.append("главный чекаут не догнан до origin/main")
+            holders = {w.get("branch"): Path(w["path"]) for w in worktrees()}
+            if tip(f"refs/heads/{branch}") is not None:
+                if failed := sweep_branch(branch, holders.get(branch), main, here):
+                    problems.append(f"ресурсы {failed} не убраны ({CLEANUP})")
+    finally:
+        end = tip(f"refs/heads/{branch}")
+        if end is not None and git_ok("merge-base", "--is-ancestor", end, head, cwd=main):
+            unmark_merged(branch)  # ветка осталась, но работы сверх слитой в ней нет
+    gone = tip(f"refs/heads/{branch}") is None
+    if not gone and not problems:
+        problems.append(f"ветка {branch} не убрана (причина — выше)")
+    return gone, problems
 
 
 # --- PR автора ---
@@ -428,12 +499,14 @@ def is_red(item: dict) -> bool:
 
 
 def failed_checks(pr: dict) -> list[str]:
+    """Красные проверки; сторож без отметки — не красный CI, а «нет отметки» (её ставит финиш)."""
+    marked = is_marked(pr)
     return [
         f"{item.get('name') or item.get('context')}="
         f"{item.get('conclusion') or item.get('state')}"
         + (f" ({url})" if (url := item.get("detailsUrl") or item.get("targetUrl")) else "")
         for item in pr.get("statusCheckRollup") or []
-        if is_red(item)
+        if is_red(item) and (marked or item.get("name") != GUARD)
     ]
 
 
@@ -510,68 +583,10 @@ def attention() -> list[tuple[dict, bool]]:
     )
 
 
-def since_last_form(pr: dict) -> tuple[bool, list[str]]:
-    """(форма уже была, комментарии после последней формы)."""
+def has_stop_report(pr: dict) -> bool:
+    """В PR есть отчёт об остановке — признак тот же, что у `stop-check`."""
     comments = json.loads(run("gh", "pr", "view", str(pr["number"]), "--json", "comments"))
-    bodies = [c["body"] for c in comments["comments"]]
-    forms = [i for i, body in enumerate(bodies) if body.startswith(FORM_MARK)]
-    return bool(forms), bodies[forms[-1] + 1 :] if forms else bodies
-
-
-def waits_owner(pr: dict, had_form: bool, recent: list[str]) -> bool:
-    """Метка стоит и после формы возвратов не было — PR ждёт ответа владельца.
-
-    Метка без формы (перерасход ревью у `ship-finish`, сбой между меткой и формой) — не ожидание.
-    """
-    labeled = any(lb["name"] == WAITING for lb in pr.get("labels") or [])
-    return labeled and had_form and not any(RETURN_RE.match(b) for b in recent)
-
-
-def count_return(pr: dict, recent: list[str]) -> int | None:
-    """Номер возврата для красного head; None — возвраты исчерпаны, PR ушёл владельцу."""
-    number, sha = str(pr["number"]), pr["headRefOid"][:7]
-    seen = {}
-    for body in recent:
-        if m := RETURN_RE.match(body):
-            seen[m.group(2)] = int(m.group(1))
-    if sha in seen:
-        return seen[sha]
-    k = max(seen.values(), default=0) + 1
-    checks = failed_checks(pr)
-    if k > MAX_RETURNS:
-        run("gh", "pr", "edit", number, "--add-label", WAITING)
-        run("gh", "pr", "comment", number, "--body", human_form(pr, checks))
-        note(f"PR #{number}: возвраты исчерпаны — {WAITING}, сессия не запускается")
-        return None
-    body = f"возврат {k}/{MAX_RETURNS}: красный CI на {sha} — {', '.join(checks)}. "
-    body += "Сессия автора берёт PR в работу (session-start)."
-    run("gh", "pr", "comment", number, "--body", body)
-    return k
-
-
-def human_form(pr: dict, checks: list[str]) -> str:
-    lines = [
-        f"{FORM_MARK} — CI снова красный на {pr['headRefOid'][:7]} после {MAX_RETURNS} возвратов.",
-        "",
-        "**Вопрос:** как довести PR, если две сессии подряд не сделали CI зелёным?",
-        "",
-        "**Упавшие проверки (логи):**",
-        *(f"- {c}" for c in checks),
-        "",
-        "**Варианты:**",
-        "1. Разобрать причину и ответить комментарием здесь (гипотеза, куда смотреть), "
-        f"затем снять `{WAITING}` — следующий старт сессии возьмёт PR с ответом, "
-        "счёт возвратов начнётся заново.",
-        "2. Закрыть PR и переписать тикет: задача поставлена неверно или слишком велика.",
-        "3. Довести PR руками.",
-        "",
-        "**Сделано по умолчанию:** PR оставлен как есть, новая сессия на него не запущена; "
-        "стартовая команда пропускает PR, пока стоит метка.",
-        "",
-        "**Рекомендация:** вариант 1 — две неудачи подряд обычно означают, что сессии не хватает "
-        "знания о проекте или окружении, а не усилий; новая попытка без ответа повторит сбой.",
-    ]
-    return "\n".join(lines)
+    return any((c.get("body") or "").lstrip().startswith(REPORT_MARK) for c in comments["comments"])
 
 
 def pick_pr() -> dict | None:
@@ -579,24 +594,16 @@ def pick_pr() -> dict | None:
         if busy := session_busy(pr["headRefName"]):
             note(f"PR #{pr['number']}: в {busy} уже идёт сессия — пропущен")
             continue
-        had_form, recent = since_last_form(pr)
-        if waits_owner(pr, had_form, recent):
-            continue
-        k = count_return(pr, recent) if red else 0
-        if k is None:
-            continue
         sha, branch = pr["headRefOid"][:7], pr["headRefName"]
-        answered = (
-            " Владелец ответил в PR после третьей неудачи — прочитай ответ." if had_form else ""
-        )
-        if any(body.startswith(REPORT_MARK) for body in recent):
-            answered += " В PR есть отчёт об остановке — прочитай его и ответ владельца после него."
+        answered = ""
+        if has_stop_report(pr):
+            answered = " В PR есть отчёт об остановке — прочитай его и ответ владельца после него."
         catch_up = "догони базу мёржем (не rebase) по шагу /ship «Догон базы»"
         if red:
             conflict = f" Ветка ещё и в конфликте с main: {catch_up}." if is_conflicting(pr) else ""
             prompt = (
                 f"PR #{pr['number']} (ветка {branch}): красный CI на {sha} — "
-                f"{', '.join(failed_checks(pr))}; возврат {k}/{MAX_RETURNS}.{answered}{conflict} "
+                f"{', '.join(failed_checks(pr))}.{answered}{conflict} "
                 "Найди причину, исправь в этой ветке, затем /ship."
             )
         elif is_conflicting(pr):
