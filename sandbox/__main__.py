@@ -1,11 +1,11 @@
-"""CLI: python -m sandbox 3x100 1x49.90 --discount 10 [--kop] [--count] [--version]"""
+"""CLI: python -m sandbox 3x100 1x49.90 --discount 10 [--loyal] [--kop] [--count] [--version]"""
 
 import argparse
 from typing import NoReturn
 
 from sandbox import __version__
 from sandbox.cart import parse_item, total_qty
-from sandbox.money import format_rub, order_total_kop
+from sandbox.money import LOYAL_DISCOUNT_PCT, effective_discount_pct, format_rub, order_total_kop
 
 
 class OneLineErrorParser(argparse.ArgumentParser):
@@ -30,6 +30,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = OneLineErrorParser(prog="sandbox", description="Сумма заказа")
     parser.add_argument("items", nargs="+", help="позиции вида КОЛxЦЕНА (x или X), например 3x100")
     parser.add_argument("--discount", type=int, default=0, help="скидка, %%")
+    parser.add_argument(
+        "--loyal",
+        action="store_true",
+        help=f"постоянный клиент: скидка {LOYAL_DISCOUNT_PCT} %%, с --discount — бо́льшая из двух",
+    )
     parser.add_argument("--kop", action="store_true", help="итог целым числом копеек, без «₽»")
     parser.add_argument(
         "--count",
@@ -40,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         items = [parse_item(spec) for spec in args.items]
-        total = order_total_kop(items, args.discount)
+        total = order_total_kop(items, effective_discount_pct(args.discount, loyal=args.loyal))
     except ValueError as exc:
         parser.error(str(exc))
     # Вывод собирается целиком до печати: int→str длиннее sys.int_info.str_digits_check_threshold
