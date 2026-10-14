@@ -7,7 +7,7 @@
 Приложение — CLI, считающее сумму заказа со скидкой:
 
 ```bash
-python -m sandbox 3x100 1x49.90 --discount 10
+python -m sandbox 3x100 1x49.90 --discount 10   # скидка — целое число процентов
 python -m sandbox 3x100 1x49.90 --discount 10 --kop   # 31491 — итог в копейках, без «₽»
 python -m sandbox 3x100 1x49.90 --count   # вторая строка «позиций: 4» — сумма количеств
 python -m sandbox 3x100 1x49.90 --avg   # вторая строка «средняя цена: 87.48 ₽», см. «Флаги»
