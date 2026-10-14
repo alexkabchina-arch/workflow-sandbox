@@ -5,7 +5,7 @@ from typing import NoReturn
 
 from sandbox import __version__
 from sandbox.cart import parse_item, total_qty
-from sandbox.money import LOYAL_DISCOUNT_PCT, format_rub, order_total_kop
+from sandbox.money import LOYAL_DISCOUNT_PCT, avg_unit_price_kop, format_rub, order_total_kop
 
 
 class OneLineErrorParser(argparse.ArgumentParser):
@@ -48,6 +48,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="второй строкой «позиций: K», K — сумма количеств (штук)",
     )
+    parser.add_argument(
+        "--avg",
+        action="store_true",
+        help="второй строкой «средняя цена: X» — итог со скидкой на число штук, в формате итога",
+    )
     parser.add_argument("--version", action=VersionAction, help="показать версию и выйти")
     args = parser.parse_args(argv)
     try:
@@ -55,16 +60,22 @@ def main(argv: list[str] | None = None) -> int:
         total = order_total_kop(items, args.discount, loyal=args.loyal)
     except ValueError as exc:
         parser.error(str(exc))
+
+    def fmt(kop: int) -> str:
+        """Сумма в виде итога: --kop, --code или «₽»."""
+        if args.kop:
+            return str(kop)
+        if args.code:
+            # Меняется только хвост: U+00A0 и «₽»; разделитель тысяч остаётся неразрывным
+            return format_rub(kop).removesuffix("\u00a0₽") + " RUB"
+        return format_rub(kop)
+
     # Вывод собирается целиком до печати: int→str длиннее sys.int_info.str_digits_check_threshold
     # цифр — ValueError, и без этого stdout остался бы с частью вывода и traceback.
     try:
-        if args.kop:
-            lines = [str(total)]
-        elif args.code:
-            # Меняется только хвост: U+00A0 и «₽»; разделитель тысяч остаётся неразрывным
-            lines = [format_rub(total).removesuffix("\u00a0₽") + " RUB"]
-        else:
-            lines = [format_rub(total)]
+        lines = [fmt(total)]
+        if args.avg:
+            lines.append(f"средняя цена: {fmt(avg_unit_price_kop(total, total_qty(items)))}")
         if args.count:
             lines.append(f"позиций: {total_qty(items)}")
     except ValueError:

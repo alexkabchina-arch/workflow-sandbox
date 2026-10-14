@@ -69,6 +69,35 @@ def test_loyal_flag_applies_larger_discount(capsys, argv, out):
     assert capsys.readouterr().out == out
 
 
+@pytest.mark.parametrize(
+    ("argv", "out"),
+    [
+        # 349,90 / 4 = 87,475 → 87,48
+        (["3x100", "1x49.90", "--avg"], "349.90 ₽\nсредняя цена: 87.48 ₽\n"),
+        # Средняя — от итога со скидкой: 314,91 / 4 = 78,7275 → 78,73
+        (
+            ["3x100", "1x49.90", "--discount", "10", "--avg"],
+            "314.91 ₽\nсредняя цена: 78.73 ₽\n",
+        ),
+        # Примеры из решения владельца 14.10: половина копейки — вверх
+        (["1x0.01", "2x0.01", "--avg"], "0.03 ₽\nсредняя цена: 0.01 ₽\n"),
+        (["1x0.01", "1x0.02", "--avg"], "0.03 ₽\nсредняя цена: 0.02 ₽\n"),
+        # Формат — как у итога
+        (["3x100", "1x49.90", "--avg", "--kop"], "34990\nсредняя цена: 8748\n"),
+        (["3x100", "1x49.90", "--avg", "--code"], "349.90 RUB\nсредняя цена: 87.48 RUB\n"),
+        (["3x1000", "--avg"], "3 000.00 ₽\nсредняя цена: 1 000.00 ₽\n"),
+        # Средняя — второй строкой после итога, «позиций» — следом
+        (
+            ["3x100", "1x49.90", "--avg", "--count"],
+            "349.90 ₽\nсредняя цена: 87.48 ₽\nпозиций: 4\n",
+        ),
+    ],
+)
+def test_avg_flag_adds_average_unit_price_line(capsys, argv, out):
+    assert main(argv) == 0
+    assert capsys.readouterr().out == out
+
+
 def test_help_names_loyal_discount(capsys, monkeypatch):
     monkeypatch.setenv("COLUMNS", "200")  # справка флага — одной строкой
     with pytest.raises(SystemExit) as exc:
@@ -91,6 +120,8 @@ def test_help_names_loyal_discount(capsys, monkeypatch):
         # parse_item пропускает количество в 4300 цифр, но int→str длиннее 4300 цифр — отказ
         (["9" * 4300 + "x1", "--kop"], "число слишком большое для вывода"),
         (["9" * 4300 + "x0", "9" * 4300 + "x0", "--count"], "число слишком большое для вывода"),
+        # Итог 1 коп., а средняя по количеству в 4300 цифр — 0; падает уже строка «позиций»
+        (["1x0.01", "9" * 4300 + "x0", "--avg", "--count"], "число слишком большое для вывода"),
         (["1x0.005"], "цена точнее копейки: '0.005'"),
         (["3x100", "--code", "--kop"], "argument --kop: not allowed with argument --code"),
         (["3x100", "--kop", "--code"], "argument --code: not allowed with argument --kop"),
