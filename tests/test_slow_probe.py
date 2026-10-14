@@ -4,11 +4,11 @@ import os
 import time
 import unittest
 
-DEADLINE = 1791972726  # 14.10.2026 10:12 UTC
+DEADLINE = 1791978000  # 14.10.2026 11:40 UTC
 
 
 @unittest.skipUnless(
-    os.environ.get("GITHUB_HEAD_REF", "").startswith("ticket-114"), "только CI PR тикета 114"
+    os.environ.get("GITHUB_HEAD_REF", "").startswith("ticket-124"), "только CI PR тикета 124"
 )
 class SlowProbe(unittest.TestCase):
     def test_sleep_until_deadline(self):
