@@ -25,6 +25,9 @@ def test_kop_flag_prints_integer_kopecks(capsys):
         # Ровно минимум после скидки проходит (решение владельца в #113)
         (["3x100"], "300.00\u00a0₽\n"),
         (["1x333.34", "--discount", "10"], "300.01\u00a0₽\n"),
+        # Ровно 300 ₽ уже после скидки: 375 − 20 % и 315,78 − 5 % (скидка 15,78 вниз)
+        (["1x375", "--discount", "20"], "300.00\u00a0₽\n"),
+        (["1x315.78", "--loyal"], "300.00\u00a0₽\n"),
         (["1x300", "--kop"], "30000\n"),
     ],
 )
@@ -93,8 +96,9 @@ def test_loyal_flag_applies_larger_discount(capsys, argv, out):
             ["3x100", "1x49.90", "--discount", "10", "--avg"],
             "314.91\u00a0₽\nсредняя цена: 78.73\u00a0₽\n",
         ),
-        # Решение владельца 14.10: половина копейки — вверх; суммы — от минимума заказа (#113)
-        (["1x300.02", "2x0.01", "--avg"], "300.04\u00a0₽\nсредняя цена: 100.01\u00a0₽\n"),
+        # Решение владельца 14.10 (точное деление и половина копейки — вверх),
+        # суммы подняты до минимума заказа (#113)
+        (["1x300.01", "2x0.01", "--avg"], "300.03\u00a0₽\nсредняя цена: 100.01\u00a0₽\n"),
         (["1x300.01", "1x0.02", "--avg"], "300.03\u00a0₽\nсредняя цена: 150.02\u00a0₽\n"),
         # С --loyal тоже от итога со скидкой: 332,41 / 4 = 83,1025 → 83,10
         (["3x100", "1x49.90", "--loyal", "--avg"], "332.41\u00a0₽\nсредняя цена: 83.10\u00a0₽\n"),
@@ -122,6 +126,14 @@ def test_help_names_loyal_discount(capsys, monkeypatch):
     assert (
         "постоянный клиент: скидка 5 %, с --discount — бо́льшая из двух" in capsys.readouterr().out
     )
+
+
+def test_help_names_min_order(capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "200")  # описание — одной строкой
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    assert "Минимум — 300.00" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
