@@ -11,7 +11,7 @@ python -m sandbox 3x100 1x49.90 --discount 10   # 314.91 ₽; скидка — 
 python -m sandbox 3x100 1x49.90 --discount 10 --kop   # 31491 — итог в копейках, без «₽»
 python -m sandbox 3x100 1x49.90 --count   # вторая строка «позиций: 4» — сумма количеств (не число строк); с --kop итог в копейках
 python -m sandbox 3x100 1x49.90 --avg   # вторая строка «средняя цена: 87.48 ₽», см. «Флаги»
-python -m sandbox 3x100 1x49.90 --loyal   # 332.41 ₽ — скидка постоянного клиента 5 %; с --discount — бо́льшая из двух (`--loyal --discount 10` → `314.91 ₽`)
+python -m sandbox 3x100 1x49.90 --loyal   # 332.41 ₽ — скидка постоянного клиента 5 %; с --discount — бо́льшая из двух (`--loyal --discount 10` → `314.91 ₽`); скидки не складываются
 python -m sandbox 3x100 --code   # 300.00 RUB — код валюты вместо «₽», см. «Флаги»
 python -m sandbox --version   # sandbox 0.1.0
 ```
