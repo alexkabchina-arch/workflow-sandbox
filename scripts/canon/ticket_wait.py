@@ -11,6 +11,12 @@
   worktree — метка снята, задание выйти из worktree и вызвать снова из главного чекаута;
 - красный CI — задание починить и `ticket ship N` (отметка на новый head); в приложении с
   Auto-fix — конец хода, чинит разбуженная сессия;
+- сторож `review-guard` красный при стоящей отметке — не красный CI (сбой GitHub или отметка позже
+  его ожидания, #176): перезапуск упавшего прогона сторожа (`rerun_guard` из `session-start`), код
+  не правится, ожидание идёт дальше. Перезапуск не помог (третья попытка, прогон не сторожа
+  канона) — задание прочитать лог: причина в ветке — починка, иначе отчёт об остановке; круг, как
+  у красного CI. Сбой `gh` на перезапуске — повтор на следующем опросе, по таймауту — то же
+  задание;
 - конфликт с `main` или отставание (`BEHIND`, кругом не считается) — маршрут на догон базы,
   задание `ticket ship N` (A2.4); зелёный без отметки `review` — на финиш;
 - черновик, авто-мёрж выключен, закрыт — сразу «ждёт человека»;
@@ -80,6 +86,7 @@ class Wait:
         # Разбор PR и уборка — те же, что у старта: красный CI, отметка, конфликт с `main`.
         self.start = load_session_start()
         self.ship = f"scripts/canon/ticket ship {number}"
+        self.guard_error = ""  # сбой `gh` на последнем перезапуске сторожа
         self.again = f"scripts/canon/ticket wait {number}"
 
     def run(self, poll: float, timeout: float) -> int:
@@ -129,6 +136,8 @@ class Wait:
         head = pr.get("headRefOid") or ""
         if checks := self.start.failed_checks(pr):
             return self.red(head, checks)
+        if (guard := self.start.failed_guard(pr)) and (out := self.guard(head, guard)):
+            return out
         main_base = pr.get("baseRefName", "main") == "main"
         if self.start.is_conflicting(pr):
             return self.conflict(head)
@@ -187,6 +196,31 @@ class Wait:
         )
         return self.task("Красный CI", body)
 
+    def guard(self, head: str, item: dict):
+        """Сторож упал при стоящей отметке: перезапуск его прогона; не помог — задание по логу."""
+        core, guard = self.core, self.start.GUARD
+        try:
+            action, why = self.start.rerun_guard(item)
+        except self.start.StartError as exc:  # сбой `gh` — следующий опрос попробует снова
+            self.guard_error = f"перезапуск не удался — {exc}"
+            core.say(f"ticket wait: сторож {guard} не перезапущен — {exc}")
+            return None
+        self.guard_error = ""
+        if action == "stuck":
+            return self.guard_stuck(head, item, why)
+        if action == "rerun":
+            core.say(f"ticket wait: сторож {guard} упал при стоящей отметке — прогон перезапущен")
+        return None
+
+    def guard_stuck(self, head: str, item: dict, why: str):
+        k = self.round("guard", head)
+        if k > LIMIT:
+            return self.stop(
+                f"сторож {self.start.GUARD} красный при стоящей отметке {k}-й раз: {why}"
+            )
+        task = self.start.guard_task(item, why, f"`ticket ship {self.n}`")
+        return self.task("Сторож review-guard", f"{task} Круг {k} из {LIMIT}. {self.where()}")
+
     def conflict(self, head: str):
         k = self.round("conflict", head)
         if k > LIMIT:
@@ -206,6 +240,12 @@ class Wait:
         return self.out_waiting(line)
 
     def timed_out(self, pr: dict):
+        if guard := self.start.failed_guard(pr):
+            if self.guard_error:
+                return self.guard_stuck(pr.get("headRefOid") or "", guard, self.guard_error)
+            # Перезапуск только что ушёл, а сводка проверок ещё прежняя — CI идёт.
+            self.state["waiting"] = self.core.CI
+            return self.out_waiting(f"PR {self.state['pr']} ждёт: перезапуск сторожа review-guard")
         if running(pr):
             self.state["waiting"] = self.core.CI
             return self.out_waiting(f"PR {self.state['pr']} ждёт: CI идёт")

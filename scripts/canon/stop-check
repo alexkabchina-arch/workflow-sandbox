@@ -41,6 +41,7 @@ import sys
 from datetime import datetime
 
 REVIEW = "review"
+GUARD = "review-guard"  # сторож отметки: при стоящей отметке его перезапускает старт (#176)
 WAITING = "ready-for-human"
 ENFORCE = "CANON_ENFORCE_STOP"
 REPORT_MARK = "Отчёт об остановке"
@@ -98,10 +99,12 @@ def is_marked(pr: dict) -> bool:
 
 
 def red_checks(pr: dict) -> list[str]:
+    """Красные проверки, кроме сторожа: он красный от сбоя GitHub или поздней отметки, а не от
+    кода сессии — упавший прогон перезапускают `session-start` и `ticket wait` (#176)."""
     return [
         item.get("name") or item.get("context")
         for item in pr.get("statusCheckRollup") or []
-        if (item.get("conclusion") or item.get("state")) in RED
+        if (item.get("conclusion") or item.get("state")) in RED and item.get("name") != GUARD
     ]
 
 

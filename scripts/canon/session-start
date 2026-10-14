@@ -25,8 +25,13 @@
    конфликтные, затем без отметки), тикет откладывается. Красный CI — возврат: промпт с
    упавшими проверками; PR берётся на каждом старте, пока CI красный, — счёта и предела нет,
    на PR ничего не пишется. PR без отметки — дозапуск `/ship`, конфликтный — `/ship` с
-   догоном базы мёржем. В PR есть «Отчёт об остановке» — промпт велит прочитать его и ответ
-   владельца.
+   догоном базы мёржем. Сторож `review-guard` красный без отметки — PR без отметки; при стоящей
+   отметке — не красный CI (сбой GitHub или отметка позже его ожидания, #176): упавший прогон
+   сторожа перезапускается (`gh run rerun --failed`), код не правится, PR не берётся. Перезапуск
+   не помог — третья попытка прогона (перезапуски `review-guard-rerun` в счёте), сбой `gh` или
+   прогон не по `pull_request_target` (джоб ветки с тем же именем) — PR берётся с заданием
+   прочитать лог: причина в ветке — починка, иначе отчёт об остановке. В PR есть «Отчёт об
+   остановке» — промпт велит прочитать его и ответ владельца.
 3. Тикет: открыт, не назначен другому. Сессия тикета уже идёт (замок `session-run` в его
    worktree) — стоп.
 4. Worktree и ветка: уже есть worktree на ветке — он; иначе внутри главного
@@ -92,6 +97,8 @@ SETUP = "scripts/session/setup"
 CLEANUP = "scripts/session/cleanup"
 REVIEW = "review"
 GUARD = "review-guard"  # сторож отметки (#163): без отметки он красный — это не красный CI
+GUARD_ATTEMPTS = 3  # прогон сторожа и два перезапуска (#176)
+GUARD_RUN = re.compile(r"https://[^/]+/([^/]+/[^/]+)/actions/runs/(\d+)(?:/.*)?")
 IN_PROGRESS = "in-progress"
 RED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 # Замок сессии в личном каталоге git worktree: `session-run` держит его, пока идёт `claude`.
@@ -499,15 +506,62 @@ def is_red(item: dict) -> bool:
 
 
 def failed_checks(pr: dict) -> list[str]:
-    """Красные проверки; сторож без отметки — не красный CI, а «нет отметки» (её ставит финиш)."""
-    marked = is_marked(pr)
+    """Красные проверки, кроме сторожа: без отметки он — «нет отметки» (её ставит финиш), при
+    отметке — перезапуск его прогона (`failed_guard`, `rerun_guard`)."""
     return [
         f"{item.get('name') or item.get('context')}="
         f"{item.get('conclusion') or item.get('state')}"
         + (f" ({url})" if (url := item.get("detailsUrl") or item.get("targetUrl")) else "")
         for item in pr.get("statusCheckRollup") or []
-        if is_red(item) and (marked or item.get("name") != GUARD)
+        if is_red(item) and item.get("name") != GUARD
     ]
+
+
+def failed_guard(pr: dict) -> dict | None:
+    """Сторож красный при стоящей отметке: чаще всего сбой GitHub на его запросе или отметка,
+    пришедшая после его ожидания, — код ветки тут ни при чём (#176)."""
+    if not is_marked(pr):
+        return None
+    rollup = pr.get("statusCheckRollup") or []
+    return next((item for item in rollup if item.get("name") == GUARD and is_red(item)), None)
+
+
+def rerun_guard(item: dict) -> tuple[str, str]:
+    """Перезапуск упавшего прогона сторожа: (`rerun`, …) — перезапущен; (`wait`, …) — уже идёт
+    или зелёный; (`stuck`, причина) — перезапуск не поможет: попыток `GUARD_ATTEMPTS` больше нет
+    (в счёте все перезапуски, и `review-guard-rerun`) или прогон не от сторожа канона — джоб с тем
+    же именем из workflow ветки (сторож идёт только по `pull_request_target`). Сбой `gh` —
+    `StartError`."""
+    url = item.get("detailsUrl") or ""
+    match = GUARD_RUN.fullmatch(url)
+    if not match:
+        raise StartError(f"прогон сторожа {GUARD} не найден по ссылке {url!r}")
+    repo, run_id = match.groups()
+    fields = "attempt,status,conclusion,event"
+    info = json.loads(run("gh", "run", "view", run_id, "-R", repo, "--json", fields))
+    if info.get("event") != "pull_request_target":
+        return "stuck", f"прогон не от сторожа канона (событие {info.get('event')})"
+    if info.get("status") != "completed" or info.get("conclusion") == "success":
+        return "wait", "прогон идёт или уже зелёный"
+    if (info.get("attempt") or 1) >= GUARD_ATTEMPTS:
+        return "stuck", f"красный и после {GUARD_ATTEMPTS - 1} перезапусков"
+    run("gh", "run", "rerun", run_id, "-R", repo, "--failed")
+    return "rerun", "прогон перезапущен"
+
+
+def guard_task(item: dict, why: str, then: str) -> str:
+    """Задание по сторожу, которого перезапуск не поднял: причину видно только в логе прогона."""
+    url = item.get("detailsUrl") or "?"
+    return (
+        f"Сторож {GUARD} красный при стоящей отметке review: {why} ({url}). Прочитай лог прогона "
+        f"(`gh run view <id> --log-failed`, id — из ссылки). «check run с именем review», «статус "
+        "review от …» или прогон не от сторожа канона — причина в ветке (джоб или workflow с "
+        f"именем review либо {GUARD}): это красный CI, исправь в ветке, затем {then}. Иначе (сбой "
+        "GitHub, "
+        "«нет успешной отметки review») код не правь: опиши владельцу в `.ticket/stop.md`, что в "
+        "логе, и что прогон можно перезапустить кнопкой «Re-run failed jobs» по ссылке — зелёный "
+        f"сторож, и PR сольётся сам; затем {then} — он опубликует отчёт об остановке."
+    )
 
 
 def is_marked(pr: dict) -> bool:
@@ -570,6 +624,17 @@ def attention() -> list[tuple[dict, bool]]:
         if red or not is_marked(pr):
             found.append((pr, red))
             continue
+        if guard := failed_guard(pr):
+            try:
+                action, why = rerun_guard(guard)
+            except StartError as exc:
+                action, why = "stuck", f"перезапуск не удался — {exc}"
+            if action == "stuck":
+                pr["guard_stuck"] = guard_task(guard, why, "/ship")
+                found.append((pr, True))
+                continue
+            if action == "rerun":
+                note(f"PR #{pr['number']}: сторож {GUARD} упал при стоящей отметке — перезапущен")
         # Отметка без авто-мёржа — PR придержал владелец: конфликт его не отдаёт в `/ship`, иначе
         # `ship-finish` включил бы авто-мёрж снова. Перезапрос — только здесь: у остальных
         # конфликт меняет лишь порядок и промпт, а догон базы `/ship` делает всегда.
@@ -599,7 +664,9 @@ def pick_pr() -> dict | None:
         if has_stop_report(pr):
             answered = " В PR есть отчёт об остановке — прочитай его и ответ владельца после него."
         catch_up = "догони базу мёржем (не rebase) по шагу /ship «Догон базы»"
-        if red:
+        if task := pr.get("guard_stuck"):
+            prompt = f"PR #{pr['number']} (ветка {branch}), head {sha}.{answered} {task}"
+        elif red:
             conflict = f" Ветка ещё и в конфликте с main: {catch_up}." if is_conflicting(pr) else ""
             prompt = (
                 f"PR #{pr['number']} (ветка {branch}): красный CI на {sha} — "
