@@ -61,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    def fmt(kop: int) -> str:
+    def format_amount(kop: int) -> str:
         """Сумма в виде итога: --kop, --code или «₽»."""
         if args.kop:
             return str(kop)
@@ -73,11 +73,12 @@ def main(argv: list[str] | None = None) -> int:
     # Вывод собирается целиком до печати: int→str длиннее sys.int_info.str_digits_check_threshold
     # цифр — ValueError, и без этого stdout остался бы с частью вывода и traceback.
     try:
-        lines = [fmt(total)]
+        qty = total_qty(items)
+        lines = [format_amount(total)]
         if args.avg:
-            lines.append(f"средняя цена: {fmt(avg_unit_price_kop(total, total_qty(items)))}")
+            lines.append(f"средняя цена: {format_amount(avg_unit_price_kop(total, qty))}")
         if args.count:
-            lines.append(f"позиций: {total_qty(items)}")
+            lines.append(f"позиций: {qty}")
     except ValueError:
         parser.error("число слишком большое для вывода")
     print("\n".join(lines))
