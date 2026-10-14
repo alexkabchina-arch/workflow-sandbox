@@ -5,7 +5,13 @@ from typing import NoReturn
 
 from sandbox import __version__
 from sandbox.cart import parse_item, total_qty
-from sandbox.money import LOYAL_DISCOUNT_PCT, avg_unit_price_kop, format_rub, order_total_kop
+from sandbox.money import (
+    LOYAL_DISCOUNT_PCT,
+    avg_unit_price_kop,
+    check_min_order,
+    format_rub,
+    order_total_kop,
+)
 
 
 class OneLineErrorParser(argparse.ArgumentParser):
@@ -58,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         items = [parse_item(spec) for spec in args.items]
         total = order_total_kop(items, args.discount, loyal=args.loyal)
+        check_min_order(total)
         qty = total_qty(items)
         avg = avg_unit_price_kop(total, qty) if args.avg else None
     except ValueError as exc:
