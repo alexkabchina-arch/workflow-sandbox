@@ -1,9 +1,9 @@
 {
   "canon": "alexkabchina-arch/workflow",
-  "version": "f96f7c3",
-  "commit": "f96f7c346acfb8fb40ed6813335ca71034f4d981",
+  "version": "ae1feb1",
+  "commit": "ae1feb188fdfaef9c5134ec1942a9ec735dac00a",
   "files": {
-    ".claude/canon/process.md": "sha256:7f065b97b188b7860635b6cd9194027313c7f0b9816171de7d5ccaa480de36a6",
+    ".claude/canon/process.md": "sha256:5e87742d6783682a833a42122499287b8c95ee77bbae67911f2928207de9181a",
     ".claude/settings.base.json": "sha256:a3ae6695db7ca355b985edfb9ac585aa37ef08199b871f55fc553f73b8d27e1f",
     ".claude/settings.json": "sha256:a3ae6695db7ca355b985edfb9ac585aa37ef08199b871f55fc553f73b8d27e1f",
     ".claude/skills/code-review/SKILL.md": "sha256:47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50",
@@ -64,19 +64,19 @@
     "scripts/canon/claude_md_length.py": "sha256:7dfb3e57501e8618341c7562e5658c118f71d026c982285dc43c9c0104895019",
     "scripts/canon/claude_run.py": "sha256:c1852b2fd19190b974c81959678093bd542fe07188cc6e9a765744f1fcff6cd7",
     "scripts/canon/review": "sha256:cd7716238503c2872c76ec2e1e4bc9f2ed31cacbe2688709851d1960271a5253",
-    "scripts/canon/review-guard": "sha256:9e038e882ec4691ed533922463ff05ec6c46cf6937e12e4cbcca0f4fb44f91c4",
+    "scripts/canon/review-guard": "sha256:e7f7b81cd886f3db4dfd60f80ac47a665e277ac156b53062e45249163a9f296d",
     "scripts/canon/run-log": "sha256:a9b9a6c2c91f1eef2541adb45f9762795ba18d9ba16e4fd501428a5b69497846",
     "scripts/canon/session-run": "sha256:e6c48edd0ef282f806d91bbaeef91d665d926597ddb8f9d9d93270267696ac3b",
-    "scripts/canon/session-start": "sha256:c2c35616e7888107c2caef02b52925cfdcc1522964a3093b6510b4ecc07d12bd",
+    "scripts/canon/session-start": "sha256:cf030014eda5e145f31ca7f76607155954f953202ddbc789a42e799842ecf8f1",
     "scripts/canon/ship-finish": "sha256:75a45233e7225c0a5cada73c69bde2579311670b973a7cb89e88ef98bf6b6a6e",
-    "scripts/canon/stop-check": "sha256:24f645159d3c93fbab1abc2a6b833c0bca8b7e19ff984d5cb2c3f36223783643",
+    "scripts/canon/stop-check": "sha256:9ee6b274bfcadf2e7bb57fa208cf6bb794939fd515698efca82245739ff259b5",
     "scripts/canon/ticket": "sha256:afa5c45ff9330c51134bc7f8d44077de8ab6d4861214933a9f87513ecfff3e14",
     "scripts/canon/ticket_ask.py": "sha256:c29b995915892726c468f4013a1e0ffca20658c303c9a430d288fedbd5c58219",
     "scripts/canon/ticket_core.py": "sha256:0130b57144ed23e70e83a976d68202e8ca0a589709570188437b0132f09bbaae",
-    "scripts/canon/ticket_ship.py": "sha256:3ae8a34c7fade5c3de38a2a7616330d7dfac53b71b4560016de24a949f296e88",
+    "scripts/canon/ticket_ship.py": "sha256:4a5e5a0645726dea91f476f6f71b67c66b3ecd33d3741377a45886827c47e999",
     "scripts/canon/ticket_start.py": "sha256:dfa136fde5c661dee56121507934f746f1292b9aae2810738d60eabe481fe76a",
     "scripts/canon/ticket_status.py": "sha256:93cbb2b23c65164c5383bdbf6574c46cd9aca371016195bd5dbc79906816eafb",
-    "scripts/canon/ticket_wait.py": "sha256:d8d3ada26e34d682fe9e73eea455e32893c642a19ed5597792f2439a02e1a557",
+    "scripts/canon/ticket_wait.py": "sha256:62c3e696d468f8a8d34632b9e9d81f2dc2756857c9c11cf9bee53f9cb79e3911",
     "scripts/canon/verify": "sha256:770aa4c6ed949c97591eb74a9781267d92cdbd306bb7b6c058418d268133c849"
   }
 }

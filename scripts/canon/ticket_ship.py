@@ -11,7 +11,7 @@
 | разбор | находки и правило разбора | решения, исправления (`findings.md`) |
 | проверка разбора | все разобраны; тикеты техдолга и канона — сам | ответ владельца (`answer.md`) |
 | тесты и линтеры | блок `checks` профиля через `run-log` | починка (`checks.md`) |
-| `/verify` | критерии из тикета, `verify`, итог | FAIL — починить |
+| `/verify` | критерии из тикета и его комментариев, `verify`, итог | FAIL — починить |
 | догон базы | `git merge origin/main` | конфликт — разрешить (`sync.md`) |
 | тело PR | факты: Closes, тесты, ревью, `/verify`, догон | «Что сделано» (`summary.md`) |
 | финиш | `ship-finish`: push, PR, авто-мёрж, отметка ревью | привязка PR, Auto-fix, `ticket wait` |
@@ -46,6 +46,16 @@ DECISION = re.compile(rf"^(\d+)[.)]\s*({'|'.join(KINDS)}){DASH}(.*)$", re.I)
 WEAKENING = re.compile(rf"^ослабление{DASH}(.+)$", re.I)
 VERIFY = re.compile(rf"^/?verify{DASH}(не нужен|нужен){DASH}(.*)$", re.I)
 ITEM = re.compile(r"^(\d+)\. (.*)$")
+# Комментарии тикета в критериях `/verify` (#178): пометки маршрута (`ticket ask`) и подпись
+# вопроса — служебное, отчёт об остановке — не критерий. Предел — `docs/ticket.md`, раздел
+# `/verify`: критерии уходят в задание `claude` одним аргументом командной строки.
+OWN_MARK = re.compile(r"<!--\s*canon-ticket[^>]*-->")
+ASK_FOOTER = re.compile(r"\n-{3,}\s*\nОтвет — комментарием в этом тикете.*\Z", re.S)
+REPORT = re.compile(r"^[#*\s]*Отчёт об остановке")
+COMMENT_LIMIT = 4_000
+COMMENT_HEAD = 1_000  # длинный комментарий — начало и конец: критерии брифа стоят в конце
+COMMENTS_LIMIT = 20_000
+CUT = "[обрезано — полный текст в тикете]"
 
 RULE = """Правило разбора — по каждой находке одно решение (сверить находку с кодом):
 - исправлено — дефект вносит ветка: в изменённых строках или ветка делает его достижимым (новый
@@ -224,6 +234,33 @@ def review_items(md: str) -> dict[int, str]:
         else:
             number = None
     return items
+
+
+def comments_text(comments: list[dict]) -> str:
+    """Комментарии тикета для критериев `/verify`: решения, вопросы и ответы — по порядку, с датой.
+
+    Скрытые в GitHub (Hide — Outdated и т. п.) не идут: владелец их отозвал. Длинный комментарий
+    — начало и конец, середина вырезана; сверх общего предела отбрасываются ранние: позднее
+    решение владельца отменяет раннее, поэтому свежее важнее."""
+    kept = []
+    for c in comments:
+        body = (c.get("body") or "").strip()
+        if not body or c.get("isMinimized") or REPORT.match(body):
+            continue
+        body = ASK_FOOTER.sub("", OWN_MARK.sub("", body)).strip()
+        if not body:
+            continue
+        if len(body) > COMMENT_LIMIT:
+            tail_from = len(body) - (COMMENT_LIMIT - COMMENT_HEAD)
+            body = f"{body[:COMMENT_HEAD].rstrip()}\n{CUT}\n{body[tail_from:].lstrip()}"
+        when = (c.get("createdAt") or "")[:16].replace("T", " ")
+        kept.append(f"### {when} UTC\n\n{body}" if when else body)
+    total, start = 0, len(kept)
+    while start and total + len(kept[start - 1]) + 2 <= COMMENTS_LIMIT:
+        start -= 1
+        total += len(kept[start]) + 2
+    head = [f"{CUT}: ранние комментарии ({start}) не включены."] if start else []
+    return "\n\n".join(head + kept[start:])
 
 
 def triage_label(root: Path) -> str:
@@ -586,9 +623,13 @@ class Route:
         if not decision.get("needed") or (passed and self.docs_only_since(decision["head"])):
             st.go("sync")
             return None
-        issue = core.gh_json("issue", "view", str(self.n), "--json", "title,body") or {}
+        issue = core.gh_json("issue", "view", str(self.n), "--json", "title,body,comments") or {}
         criteria = st.dir / "verify-criteria.txt"
         text = f"Тикет #{self.n}: {issue.get('title', '')}\n\n{issue.get('body', '')}".rstrip()
+        if said := comments_text(issue.get("comments") or []):
+            text += (
+                f"\n\n## Комментарии тикета (по порядку; позднее решение отменяет раннее)\n\n{said}"
+            )
         if decision.get("why"):
             text += f"\n\nЧто проверить (решение сессии): {decision['why']}"
         criteria.write_text(text + "\n", encoding="utf-8")

@@ -23,6 +23,10 @@
 статус `review` от другого источника, в том числе под честной отметкой. Успешной отметки нет —
 опрос раз в 10 секунд до `--wait`, потом красный: позже пришедшая отметка перезапускает сторожа
 (workflow `review-guard-rerun`, джоб перезапуска в `dependabot-review`).
+Запрос к GitHub, ответивший сбоем (5xx, 429, лимит запросов, обрыв, `TIMEOUT` секунд без ответа),
+повторяется: `TRIES` попыток с паузой `PAUSE`; сбой во всех — код 2 и сообщение, что это сбой
+связи, а не подмена отметки (#176). Отказ 4xx (нет такого прогона, нет прав) не повторяется — код
+2 с текстом отказа: ответ GitHub от повтора не изменится.
 Только стандартная библиотека Python 3 и `gh`.
 """
 
@@ -43,14 +47,34 @@ DEPENDABOT_STEP = "Отметка ревью и авто-мёрж"
 DEPENDABOT = "dependabot[bot]"
 ACTIONS_BOT = "github-actions[bot]"
 POLL = 10  # секунд между опросами
+TRIES, PAUSE, TIMEOUT = 3, 5, 30  # попыток запроса к GitHub, секунд между ними и на ответ
+REFUSED = re.compile(r"HTTP 4(?!29)\d\d")  # отказ GitHub: повтор его не изменит
 
 
 def gh_api(path: str, paginate: bool = False):
-    """Ответ `gh api`; с `paginate` — все страницы списка одним списком."""
+    """Ответ `gh api`; с `paginate` — все страницы списка одним списком. Сбой — повтор."""
     pages = ["--paginate", "--slurp"] if paginate else []
-    result = subprocess.run(["gh", "api", *pages, path], capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"gh api {path}: {result.stderr.strip()}")
+    for attempt in range(1, TRIES + 1):
+        try:
+            result = subprocess.run(
+                ["gh", "api", *pages, path], capture_output=True, text=True, timeout=TIMEOUT
+            )
+        except subprocess.TimeoutExpired:
+            why = f"нет ответа за {TIMEOUT} с"
+        else:
+            if result.returncode == 0:
+                break
+            why = result.stderr.strip()
+            if REFUSED.search(why) and "rate limit" not in why.lower():
+                raise RuntimeError(f"GitHub отказал (gh api {path}): {why}")
+        print(f"review-guard: gh api {path}, попытка {attempt} из {TRIES}: {why}", file=sys.stderr)
+        if attempt < TRIES:
+            time.sleep(PAUSE)
+    else:
+        raise RuntimeError(
+            f"GitHub не ответил за {TRIES} попытки (gh api {path}: {why}). Это сбой связи, а не "
+            "подмена отметки: перезапусти прогон — gh run rerun <id прогона> --failed"
+        )
     data = json.loads(result.stdout or "null")
     return [item for page in data for item in page] if paginate else data
 
