@@ -24,6 +24,17 @@ def test_avg_exact_half_rounds_up():
     assert avg_unit_price_kop(3, 2) == 2
 
 
+def test_avg_of_zero_total():
+    # Скидка 100 %: итог 0 → средняя 0
+    assert avg_unit_price_kop(0, 3) == 0
+
+
+def test_refund_avg_mirrors_sale():
+    # Возврат 0,03 ₽ на 2 штуки: −1,5 коп. → −2, как у продажи 1,5 → 2
+    assert avg_unit_price_kop(-3, 2) == -2
+    assert avg_unit_price_kop(-1, 3) == 0
+
+
 def test_avg_exact_on_large_sum():
     # float на 10**17 теряет младшие цифры
     assert avg_unit_price_kop(10**17 + 2, 4) == 25 * 10**15 + 1

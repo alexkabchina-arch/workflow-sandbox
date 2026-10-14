@@ -46,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--count",
         action="store_true",
-        help="второй строкой «позиций: K», K — сумма количеств (штук)",
+        help="строкой после итога (и средней с --avg) «позиций: K», K — сумма количеств (штук)",
     )
     parser.add_argument(
         "--avg",
@@ -58,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         items = [parse_item(spec) for spec in args.items]
         total = order_total_kop(items, args.discount, loyal=args.loyal)
+        qty = total_qty(items)
+        avg = avg_unit_price_kop(total, qty) if args.avg else None
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -73,10 +75,9 @@ def main(argv: list[str] | None = None) -> int:
     # Вывод собирается целиком до печати: int→str длиннее sys.int_info.str_digits_check_threshold
     # цифр — ValueError, и без этого stdout остался бы с частью вывода и traceback.
     try:
-        qty = total_qty(items)
         lines = [format_amount(total)]
-        if args.avg:
-            lines.append(f"средняя цена: {format_amount(avg_unit_price_kop(total, qty))}")
+        if avg is not None:
+            lines.append(f"средняя цена: {format_amount(avg)}")
         if args.count:
             lines.append(f"позиций: {qty}")
     except ValueError:
