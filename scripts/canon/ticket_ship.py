@@ -19,8 +19,15 @@
 
 Пределы — два круга исправлений каждого вида (красные проверки, FAIL `/verify`, догон), третий —
 остановка. Новые коммиты после финиша (красный CI, конфликт) — тот же вызов: проверки, догон и
-отметка на новый head без второго ревью. `--again` — продолжить после остановки (владелец
-ответил «продолжай»). Как устроено и почему — `docs/ticket.md` канона.
+отметка на новый head без второго ревью; PR уже слит — маршрут с нуля (новая работа, новый PR).
+Под оркестратором (`CANON_ORCHESTRATOR=1`, #214) ревью ошибок сессия не гоняет: без отчёта —
+«код готов» (head в состоянии, шаг `ready`), отчёт кладёт оркестратор; финиш — `ship-finish
+--pr-only` (push и PR без авто-мёржа и отметки) и снова «код готов». Отметку ставит оркестратор.
+`--again` — продолжить после остановки (владелец ответил «продолжай»): метка `ready-for-human`
+снимается, остановка после финиша — снова финиш; после остановки на `/verify` решение владельца
+«verify — не нужен» (его комментарий в тикете или PR после отчёта; не `.ticket/reply.md` — его
+пишет сама сессия, #249) снимает признак — финиш без `/verify` (#236). Как устроено и почему —
+`docs/ticket.md` канона.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
 Только стандартная библиотека Python 3.
 """
@@ -28,13 +35,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
+import tempfile
 import types
 from pathlib import Path
 
 LIMIT = 2
+STOP_TAIL = 10  # строк вывода красной проверки в отчёте об остановке
+STOP_WIDTH = 300  # символов в строке хвоста: комментарий GitHub — до 65 536
+RUN_LOG_END = re.compile(r"^run-log: завершено с кодом \S+ · лог: ")
+TRACE = "verify: /verify оставил в рабочем дереве"  # след /verify; при коде 1 — в stderr
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 CANON_REPO = "alexkabchina-arch/workflow"
 LABEL = "ready-for-human"
 PROFILE = Path("docs/agents/profile.md")
@@ -45,17 +59,32 @@ DASH = r"\s*(?:[—–:-]+\s*)?"
 DECISION = re.compile(rf"^(\d+)[.)]\s*({'|'.join(KINDS)}){DASH}(.*)$", re.I)
 WEAKENING = re.compile(rf"^ослабление{DASH}(.+)$", re.I)
 VERIFY = re.compile(rf"^/?verify{DASH}(не нужен|нужен){DASH}(.*)$", re.I)
+# Решение владельца после остановки на `/verify` (#236): строка «verify — не нужен: почему» или
+# «verify — нужен» в его комментарии тикета или PR. Ответ из чата (`.ticket/reply.md`) — не
+# решение: файл пишет сама сессия (#249). Цитата (`>`) — не решение: владелец цитирует отчёт;
+# строка с вопросом («verify не нужен ли?») — тоже.
+DECIDED = re.compile(
+    r"^[ \t*_]*/?verify[ \t—–:-]*(не нужен|нужен)\b[*_]*[ \t—–:,.-]*([^\n]*)$", re.I | re.M
+)
+WAIVE_HINT = (
+    "Проверка не нужна — строка «verify — не нужен: почему» комментарием в тикете (или под этим "
+    "отчётом), затем «продолжай»: маршрут пойдёт на финиш без /verify."
+)
 ITEM = re.compile(r"^(\d+)\. (.*)$")
 # Комментарии тикета в критериях `/verify` (#178): пометки маршрута (`ticket ask`) и подпись
 # вопроса — служебное, отчёт об остановке — не критерий. Предел — `docs/ticket.md`, раздел
 # `/verify`: критерии уходят в задание `claude` одним аргументом командной строки.
 OWN_MARK = re.compile(r"<!--\s*canon-ticket[^>]*-->")
-ASK_FOOTER = re.compile(r"\n-{3,}\s*\nОтвет — комментарием в этом тикете.*\Z", re.S)
+ASK_FOOTER = re.compile(r"\n-{3,}\s*\n(?:@\S+\s+)?Ответ — комментарием в этом тикете.*\Z", re.S)
 REPORT = re.compile(r"^[#*\s]*Отчёт об остановке")
 COMMENT_LIMIT = 4_000
 COMMENT_HEAD = 1_000  # длинный комментарий — начало и конец: критерии брифа стоят в конце
 COMMENTS_LIMIT = 20_000
 CUT = "[обрезано — полный текст в тикете]"
+STRANGER_HEAD = (
+    "Заголовок и тело тикета не включены: автор тикета — не участник репозитория и может "
+    "переписать их в любой момент. Критерии — комментарии участников ниже."
+)
 
 RULE = """Правило разбора — по каждой находке одно решение (сверить находку с кодом):
 - исправлено — дефект вносит ветка: в изменённых строках или ветка делает его достижимым (новый
@@ -236,16 +265,24 @@ def review_items(md: str) -> dict[int, str]:
     return items
 
 
-def comments_text(comments: list[dict]) -> str:
+def comments_text(comments: list[dict], trusted, member=None) -> tuple[str, int]:
     """Комментарии тикета для критериев `/verify`: решения, вопросы и ответы — по порядку, с датой.
 
     Скрытые в GitHub (Hide — Outdated и т. п.) не идут: владелец их отозвал. Длинный комментарий
     — начало и конец, середина вырезана; сверх общего предела отбрасываются ранние: позднее
-    решение владельца отменяет раннее, поэтому свежее важнее."""
-    kept = []
+    решение владельца отменяет раннее, поэтому свежее важнее. Комментарии не участников
+    репозитория не идут; второе в ответе — их число (без скрытых и пустых)."""
+    kept, strangers = [], 0
     for c in comments:
         body = (c.get("body") or "").strip()
-        if not body or c.get("isMinimized") or REPORT.match(body):
+        if not body or c.get("isMinimized"):
+            continue
+        if not trusted(c):
+            strangers += 1
+            continue
+        if member is not None and not member(c):  # App — сессия и оркестратор, не владелец
+            continue
+        if REPORT.match(body):
             continue
         body = ASK_FOOTER.sub("", OWN_MARK.sub("", body)).strip()
         if not body:
@@ -260,7 +297,7 @@ def comments_text(comments: list[dict]) -> str:
         start -= 1
         total += len(kept[start]) + 2
     head = [f"{CUT}: ранние комментарии ({start}) не включены."] if start else []
-    return "\n\n".join(head + kept[start:])
+    return "\n\n".join(head + kept[start:]), strangers
 
 
 def triage_label(root: Path) -> str:
@@ -276,6 +313,14 @@ def triage_label(root: Path) -> str:
     return "needs-triage"
 
 
+def last_decision(text: str) -> tuple[bool, str] | None:
+    """Последнее решение о `/verify` в тексте: (снят ли, причина); строки с «?» — не решение."""
+    found = [m for m in DECIDED.finditer(text) if "?" not in m.group(0)]
+    if not found:
+        return None
+    return found[-1].group(1).lower() == "не нужен", found[-1].group(2).strip()
+
+
 def rollup_cost(path: Path) -> float:
     try:
         cost = json.loads(path.read_text(encoding="utf-8")).get("total_cost_usd")
@@ -287,7 +332,7 @@ def rollup_cost(path: Path) -> float:
 class Route:
     def __init__(self, number: int, core):
         self.n, self.core = number, core
-        self.cmd = f"scripts/canon/ticket ship {number}"
+        self.cmd = core.command("ship", number)
         self.state = core.State(number)
 
     # --- вывод ---
@@ -311,14 +356,124 @@ class Route:
             st.go("review")
         if again and st.step == "stopped":
             st["attempts"], st["wait"] = {}, None  # владелец ответил — круги и ожидания заново
-            st.go((st["stop"] or {}).get("step") or "review")
+            step = (st["stop"] or {}).get("step") or "review"
+            # Отчёт об остановке после финиша перевёл открытый PR в черновик и выключил авто-мёрж
+            # — снова финиш, как после остановки `ticket wait`: `ship-finish` вернёт то и другое
+            # (#190, п. 1). Слит (владелец слил черновик сам) — шаг «готово» как есть: итог или,
+            # если в ветке новые коммиты, маршрут с нуля. Только здесь: на шаге «готово»
+            # черновик без «продолжай» — придержанный владельцем PR, финиш снял бы придержку.
+            # Под оркестратором аналог «готово» — «код готов» после PR (#214): финиш `--pr-only`.
+            after_pr = step == "ready" and (st["ready"] or {}).get("reviewed")
+            if (step == "done" or after_pr) and not self.pr_merged():
+                step = "finish"
+            if self.stopped_on_verify() and (out := self.waive_verify()) is not None:
+                return core.emit(*out)  # шаг «остановка» как был: повтор `--again` пойдёт дальше
+            st.go(step)
             st["stop"] = None
+            self.unmark()
         for _ in range(30):
             out = self.advance()
             st.save()
             if out is not None:
                 return core.emit(*out)
         raise core.Failure("маршрут не сошёлся за 30 переходов")
+
+    def stopped_on_verify(self) -> bool:
+        """Остановка на `/verify`: на его шаге (BLOCKED, FAIL сверх предела, нет критериев) или
+        сессией на починке после его FAIL («починить нельзя» — `stop.md` на шаге проверок)."""
+        stop, decision = self.state["stop"] or {}, self.state["verify"] or {}
+        failed = stop.get("step") == "checks" and decision.get("verdict") == "FAIL"
+        return stop.get("step") == "verify" or failed
+
+    def waive_verify(self):
+        """Решение владельца «verify — не нужен» после остановки на `/verify` (#236): признак
+        «нужен» из разбора снимается законным путём. Голос владельца — только его комментарий
+        после отчёта об остановке в тикете или открытом PR ветки (участник, не App; не скрытый,
+        не служебный маршрута). Ответ из чата в `.ticket/reply.md` — не голос владельца: файл
+        пишет сама сессия, и headless-сессия после FAIL сняла бы себе `/verify` (#249). Последнее
+        слово решает: позднее «verify — нужен» отменяет раннее «не нужен». Пересказ сессией (её
+        файлы разбора, отчёта, «Что сделано») признак не снимает. Снят — до конца маршрута: и
+        после новых коммитов, и при новых критериях. Кортеж — задание: в ручном режиме лежит
+        ответ из чата, а решения в комментариях нет — молча гнать платный `/verify` нельзя,
+        владелец мог думать, что снял проверку; файл уходит в состояние, повтор идёт дальше."""
+        core, st = self.core, self.state
+        said = sorted(self.after_report(), key=lambda c: c.get("createdAt") or "")
+        found = None
+        for c in said:
+            body = (c.get("body") or "").strip()
+            if c.get("isMinimized") or not core.member(c) or not core.is_answer(body):
+                continue
+            if m := last_decision(body):
+                found = {"url": c.get("url"), "why": m[1]} if m[0] else None
+        if found:
+            found["url"] = found["url"] or f"тикет #{self.n}"
+            st["verify_off"] = found
+            st.save()
+        path = self.root / core.ANSWERS / "reply.md"
+        if core.orchestrated() or not core.read_answer(self.root, "reply.md"):
+            return None
+        core.keep(st, path, f"reply-{core.now()}.md")
+        if found:
+            return None
+        body = (
+            "В `.ticket/reply.md` ответ из чата: решение о /verify маршрут из чата не принимает — "
+            "файл пишет сама сессия (#249); файл убран в состояние маршрута. Владелец снял "
+            "проверку — попроси его написать строку «verify — не нужен: почему» комментарием в "
+            "тикете; сама сессия эту строку в тикет не пишет. Велит проверять или комментарий "
+            "уже есть — вызов:"
+        )
+        return (core.TURN, "Ответ из чата не принимается", body, (f"{self.cmd} --again",))
+
+    def after_report(self) -> list[dict]:
+        """Комментарии тикета и открытого PR ветки после последнего отчёта об остановке в каждом:
+        граница — сам отчёт, не часы машины. Где отчёта нет — оттуда ничего. Отчёт — только от
+        своих (`trusted`), как у Stop-хука и `session-start`: «Отчёт об остановке» постороннего
+        сдвинул бы границу за решение владельца (#249). Скрытый свой отчёт — тоже граница:
+        владелец прячет отработанный отчёт, а остановка от этого не раньше. Сбой сверки автора
+        — `Failure`, код 1 без перехода: «не свой» молча пустил бы платный `/verify`."""
+        core, n = self.core, str(self.n)
+        fields = ["--state", "open", "--json", "number"]
+        prs = core.gh_json("pr", "list", "--head", self.state["branch"], *fields) or []
+        sources = [("issue", n)] + [("pr", str(pr["number"])) for pr in prs[:1]]
+        found = []
+        for kind, ref in sources:
+            said = (core.gh_json(kind, "view", ref, "--json", "comments") or {}).get("comments")
+            said = said or []
+            at = next((i for i in reversed(range(len(said))) if self.own_report(said[i])), None)
+            if at is not None:
+                found += said[at + 1 :]
+        return found
+
+    def own_report(self, comment: dict) -> bool:
+        """Комментарий — отчёт об остановке от своих: участника или App."""
+        if not REPORT.match(comment.get("body") or ""):
+            return False
+        return self.core.trusted(comment, strict=True)
+
+    def unmark(self) -> None:
+        """Метка остановки — с тикета и открытого PR ветки: владелец ответил «продолжай», ждать
+        больше некого, как после ответа на `ticket ask` (#190). На PR метка остаётся, если на нём
+        и признак перерасхода ревью или `/verify` (комментарий `ready-for-human: …` финиша): это
+        свой сигнал владельцу, а финиш второй раз его не ставит. Сбой `gh` — не стоп: строкой
+        в выводе."""
+        core, n = self.core, str(self.n)
+
+        def labelled(item: dict) -> bool:
+            return any(label.get("name") == LABEL for label in item.get("labels") or [])
+
+        try:
+            if labelled(core.gh_json("issue", "view", n, "--json", "labels") or {}):
+                core.gh("issue", "edit", n, "--remove-label", LABEL)
+            fields = ["--state", "open", "--json", "number,labels"]
+            prs = core.gh_json("pr", "list", "--head", self.state["branch"], *fields) or []
+            for pr in [pr for pr in prs[:1] if labelled(pr)]:
+                number = str(pr["number"])
+                said = core.gh_json("pr", "view", number, "--json", "comments") or {}
+                bodies = [c.get("body") or "" for c in said.get("comments") or []]
+                if not any(body.startswith(f"{LABEL}: ") for body in bodies):
+                    core.gh("pr", "edit", number, "--remove-label", LABEL)
+        except core.Failure as exc:
+            core.say(f"ticket: метку {LABEL} снять не удалось — {exc}; сними руками")
 
     def elsewhere(self, here: str | None) -> int:
         path = self.core.worktree_of(self.n)
@@ -340,20 +495,27 @@ class Route:
     def advance(self):
         """Один переход: None — шаг пройден, дальше; кортеж — вывод и выход."""
         core, st = self.core, self.state
+        if (question := st["question"]) and core.orchestrated():
+            body = (
+                f"Вопрос владельцу ждёт ответа: {question['url']}. Чата нет: ответ владельца в "
+                "тикете забирает вызов; ответа нет — он велит закончить сессию:"
+            )
+            ask = core.command("ask", self.n)
+            return (core.TURN, f"Тикет #{self.n}: вопрос владельцу", body, (ask,))
         if question := st["question"]:  # вопрос `ticket ask` ждёт ответа — маршрут стоит
             body = (
-                f"Вопрос владельцу ждёт ответа: {question['url']}. Маршрут не идёт до ответа. "
+                f"{core.pending(question)}Маршрут не идёт до ответа. "
                 "Владелец ответил и написал «продолжай» — ответ из чата дословно в "
                 "`.ticket/reply.md`, затем вызов:"
             )
             st["waiting"] = core.OWNER
-            ask = f"scripts/canon/ticket ask {self.n}"
+            ask = core.command("ask", self.n)
             return (core.STOPPED, f"Тикет #{self.n}: ждём ответа", body, (ask,))
         if st.step == "stopped":
             where = (st["stop"] or {}).get("where", "?")
             body = (
-                f"Отчёт об остановке — {where}. Ждём владельца. Владелец ответил «продолжай» — "
-                "продолжить маршрут:"
+                f"Отчёт об остановке — {where}. Ждём владельца.{self.waive_task()} Владелец "
+                "ответил «продолжай» — продолжить маршрут:"
             )
             return (core.STOPPED, f"Тикет #{self.n}: остановка", body, (f"{self.cmd} --again",))
         if st.step != "stop" and core.read_answer(self.root, "stop.md"):
@@ -364,7 +526,9 @@ class Route:
                 return self.result()
             st["attempts"] = {}  # новый круг: красный CI или конфликт после финиша
             if self.pr_merged():
-                self.retire_review()  # отчёт покрывает код слитого PR — новая работа без ревью
+                # PR слит, а в ветке новые коммиты — новая работа: маршрут с нуля, а отчёт ревью
+                # покрывает только код слитого PR (#190, п. 5).
+                st.retire(self.root)
                 st.go("review")
                 return None
             st.go("checks")  # новые коммиты после финиша: проверки и отметка на новый head
@@ -408,15 +572,18 @@ class Route:
         data = self.core.gh_json("pr", "view", self.state["pr"], "--json", "state") or {}
         return data.get("state") == "MERGED"
 
-    def retire_review(self) -> None:
-        """Отчёт ревью — в сторону: следующий шаг `review` запустит ревью заново."""
-        report = self.state.dir / "review.json"
-        if report.exists():
-            report.replace(self.state.dir / f"review-{self.core.now()}.json")
-
     def step_review(self):
         core, st = self.core, self.state
         verdict = self.reviewed()
+        if verdict is None and core.orchestrated():
+            core.profile_checks(self.root / PROFILE)  # профиль без проверок — до оплаты ревью
+            return self.ready(reviewed=False)  # ревью ошибок гоняет оркестратор вне сессии
+        if verdict is not None and core.orchestrated():
+            if (st["review"] or {}).get("head") != verdict["head"]:  # новый отчёт оркестратора
+                for old in ("findings.md", "answer.md"):
+                    (self.root / core.ANSWERS / old).unlink(missing_ok=True)
+                st["asked"] = st["decisions"] = None
+                st["cost"]["review"] = verdict.get("cost_usd") or 0
         if verdict is None:
             core.profile_checks(self.root / PROFILE)  # профиль без проверок — до оплаты ревью
             st.dir.mkdir(parents=True, exist_ok=True)
@@ -591,7 +758,31 @@ class Route:
 
     @staticmethod
     def brief(result: dict) -> dict:
-        return {k: v for k, v in result.items() if k != "tail"}
+        """Запись проверки в состояние; у красной — хвост вывода для отчёта об остановке: без
+        итоговой строки `run-log` (путь к логу есть в `log`), без цвета, строки обрезаны (#182)."""
+        kept = {k: v for k, v in result.items() if k != "tail"}
+        if result["code"] != 0:
+            lines = [ln for ln in result["tail"].splitlines() if not RUN_LOG_END.match(ln)]
+            kept["tail"] = "\n".join(
+                ANSI.sub("", ln)[:STOP_WIDTH] for ln in lines[-STOP_TAIL:]
+            ).strip()
+        return kept
+
+    def local_paths(self, text: str) -> str:
+        """Текст для GitHub без путей машины сессии: worktree, главный чекаут, временный каталог,
+        домашний — отчёт об остановке владелец читает на GitHub, там они ничего не дают (#182)."""
+        names = {self.root: "", self.core.common_dir().parent: "<главный чекаут>"}
+        names[Path(tempfile.gettempdir())] = "<tmp>"
+        names[Path.home()] = "~"
+        pairs = []
+        for path, short in names.items():
+            for form in {str(path), str(path.resolve())}:
+                if form != "/":
+                    pairs.append((form, short))
+        for form, short in sorted(pairs, key=lambda pair: -len(pair[0])):
+            text = text.replace(f"{form}/", f"{short}/" if short else "")
+            text = text.replace(form, short or ".")
+        return text
 
     def recipe_touched(self, before: str) -> bool:
         """`/verify` менял рецепт `.claude/skills/run-*` — в дереве или своими коммитами."""
@@ -601,9 +792,21 @@ class Route:
             if core.git_ok("cat-file", "-e", f"{before}^{{commit}}")
             else ""
         )
+        # Строки `git status` целиком: `core.git` срезает пробел первой (` M путь` → `M путь`), и
+        # срез `[3:]` съедал у правки отслеживаемого рецепта начало пути (#190, п. 6).
         tree = core.git("status", "--porcelain", "--untracked-files=all")
-        paths = moved.splitlines() + [line[3:] for line in tree.splitlines()]
+        paths = moved.splitlines() + tree.splitlines()
         return any(".claude/skills/run-" in p for p in paths)
+
+    def trace_left(self, before: str) -> bool:
+        """След `/verify` не разобран: правка рецепта (файлом или коммитом), незакоммиченные правки
+        отслеживаемых файлов или коммиты поверх head до прогона (`before`), — после «продолжай»
+        общее задание о незакоммиченном предложило бы закоммитить их в PR тикета (#190, п. 6)."""
+        core = self.core
+        if self.dirty() or self.recipe_touched(before):
+            return True
+        known = core.git_ok("cat-file", "-e", f"{before}^{{commit}}")
+        return known and bool(core.git("diff", "--name-only", before, "HEAD"))
 
     def docs_only_since(self, sha: str | None) -> bool:
         if not sha:
@@ -616,22 +819,58 @@ class Route:
 
     # --- /verify ---
 
-    def step_verify(self):
-        core, st = self.core, self.state
-        decision = st["verify"] or {}
-        passed = decision.get("verdict") in ("PASS", "пропущено")
-        if not decision.get("needed") or (passed and self.docs_only_since(decision["head"])):
-            st.go("sync")
-            return None
-        issue = core.gh_json("issue", "view", str(self.n), "--json", "title,body,comments") or {}
-        criteria = st.dir / "verify-criteria.txt"
-        text = f"Тикет #{self.n}: {issue.get('title', '')}\n\n{issue.get('body', '')}".rstrip()
-        if said := comments_text(issue.get("comments") or []):
+    def verify_criteria(self, decision: dict) -> tuple[str, int, bool]:
+        """Критерии `/verify`, число отброшенных комментариев и «критериев тикета нет»: тикет
+        открыл не участник, а участники его не прокомментировали."""
+        core = self.core
+        head = core.issue_head(self.n)
+        if head["trusted"]:
+            text = f"Тикет #{self.n}: {head['title']}\n\n{head['body']}".rstrip()
+        else:  # #185: посторонний автор перепишет тело и после взятия в работу
+            text = f"Тикет #{self.n}\n\n{STRANGER_HEAD}"
+        issue = core.gh_json("issue", "view", str(self.n), "--json", "comments") or {}
+        said, strangers = comments_text(issue.get("comments") or [], core.trusted, core.member)
+        if said:
             text += (
                 f"\n\n## Комментарии тикета (по порядку; позднее решение отменяет раннее)\n\n{said}"
             )
         if decision.get("why"):
             text += f"\n\nЧто проверить (решение сессии): {decision['why']}"
+        return text, strangers, not head["trusted"] and not said
+
+    def criteria_changed(self) -> bool:
+        """Засчитанный итог `/verify` — на других критериях: тикет дополнили после проверки."""
+        decision = self.state["verify"] or {}
+        if self.state["verify_off"]:
+            return False
+        if not decision.get("needed") or decision.get("verdict") not in ("PASS", "пропущено"):
+            return False
+        text, *_ = self.verify_criteria(decision)
+        return decision.get("criteria") != hashlib.sha256(text.encode()).hexdigest()
+
+    def step_verify(self):
+        core, st = self.core, self.state
+        decision = st["verify"] or {}
+        if not decision.get("needed") or st["verify_off"]:
+            st.go("sync")
+            return None
+        text, strangers, empty = self.verify_criteria(decision)
+        if empty:  # без критериев тикета платный /verify проверил бы только решение сессии
+            return self.stop(
+                "тикет открыл не участник репозитория, его заголовок и тело не критерий, а "
+                "комментариев участников нет: критерии /verify — комментарием владельца в тикете"
+            )
+        # Итог засчитан, пока после него менялись только документы и критерии те же (#181):
+        # новый комментарий владельца после PASS — /verify заново. Пометка об отброшенных — вне
+        # суммы: посторонний комментарием не перезапустит платный /verify.
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        passed = decision.get("verdict") in ("PASS", "пропущено")
+        if passed and decision.get("criteria") == digest and self.docs_only_since(decision["head"]):
+            st.go("sync")
+            return None
+        criteria = st.dir / "verify-criteria.txt"
+        if strangers:
+            text += f"\n\nКомментарии не участников репозитория ({strangers}) не включены."
         criteria.write_text(text + "\n", encoding="utf-8")
         report = st.dir / "verify.json"
         before = core.head()
@@ -646,25 +885,28 @@ class Route:
         human = [x.split(mark, 1)[1] for x in lines if mark in x]
         if human:
             st["ready_for_human"] = human[0]
-        if res.returncode != 0:
-            return self.stop(f"/verify не состоялся (код {res.returncode}): {tail(res.stderr, 5)}")
-        left = [x for x in lines if x.startswith("verify: /verify оставил в рабочем дереве")]
+        left = [x for x in lines if x.startswith(TRACE)]
+        trace = {"line": left[0], "head": before} if left else None
+        if res.returncode != 0:  # след разбирается и тут — до отчёта об остановке (#190, п. 6)
+            errors = "\n".join(x for x in res.stderr.splitlines() if not x.startswith(TRACE))
+            why = f"/verify не состоялся (код {res.returncode}): {tail(errors, 5)}"
+            return self.stop(why, trace)
         if "verify: пропущено" in res.stdout:
             verdict = "пропущено"
         else:
             m = re.search(r"— (PASS|FAIL) \(", res.stdout)
             verdict = m.group(1) if m else None
         if verdict is None:
-            return self.stop("итог /verify не распознан: " + tail(res.stdout, 3))
+            return self.stop("итог /verify не распознан: " + tail(res.stdout, 3), trace)
         if left and self.recipe_touched(before):
             verdict = None  # рецепт менял сам /verify (файлом или коммитом) — итог не засчитан
-        decision.update(verdict=verdict, head=before)
+        decision.update(verdict=verdict, head=before, criteria=digest)
         st["verify"] = decision
         if verdict == "PASS":
             st["attempts"].pop("verify", None)
         if left:
             if st.attempt("verify_trace") > LIMIT:
-                return self.stop(f"/verify оставляет след в worktree: {left[0]}")
+                return self.stop(f"/verify оставляет след в worktree: {left[0]}", trace)
             failed = ""
             if verdict == "FAIL":
                 st.go("checks")  # после уборки и починки — тесты и /verify заново
@@ -790,6 +1032,9 @@ class Route:
         return f"Тесты и линтеры на `{checks.get('head', '?')[:7]}`: {results}"
 
     def verify_line(self) -> str:
+        if off := self.state["verify_off"]:
+            why = f": {off['why']}" if off.get("why") else ""
+            return f"/verify снят решением владельца ({off['url']}){why}"
         decision = self.state["verify"] or {}
         if not decision.get("needed"):
             return f"/verify не нужен: {decision.get('why', '')}"
@@ -833,13 +1078,18 @@ class Route:
         if not body.exists() or (st["heads"].get("body") != core.head()):
             st.go("checks")  # коммит после сборки тела — проверки, догон и тело заново
             return None
-        issue = core.gh_json("issue", "view", str(self.n), "--json", "title") or {}
-        args = ["--title", f"#{self.n}: {issue.get('title', '')}".rstrip(": ")]
+        if self.criteria_changed():
+            st.go("verify")  # владелец дополнил тикет после PASS — /verify и тело заново
+            return None
+        title = core.issue_head(self.n)["title"]  # у тикета постороннего — только номер
+        args = ["--title", f"#{self.n}: {title}".rstrip(": ")]
         args += ["--body-file", str(body), "--review-report", str(st.dir / "review.json")]
         if st["weakening"]:
             args += ["--weakening", st["weakening"]]
         if st["ready_for_human"]:
             args += ["--ready-for-human", st["ready_for_human"]]
+        if core.orchestrated():
+            args.insert(0, "--pr-only")  # отметку и авто-мёрж ставит оркестратор токеном App
         res = core.canon("ship-finish", *args)
         core.say(res.stdout.rstrip())
         if res.returncode != 0:
@@ -849,8 +1099,65 @@ class Route:
         st["finish_line"] = tail(res.stdout, 1)
         st["finished_head"] = core.head()
         st["attempts"] = {}
+        if core.orchestrated():
+            return self.ready(reviewed=True)
         st.go("done", core.CI)
         return self.result()
+
+    # --- код готов (под оркестратором) ---
+
+    def ready(self, reviewed: bool):
+        """Конец сессии под оркестратором: `reviewed` False — ветка ждёт его ревью ошибок, True
+        — разбор, проверки и PR сделаны, ждёт его отметки после CI."""
+        st = self.state
+        st["ready"] = {"head": self.core.head(), "reviewed": reviewed}
+        st.go("ready", self.core.ORCHESTRATOR)
+        return self.ready_result()
+
+    def step_ready(self):
+        core, st = self.core, self.state
+        ready = st["ready"] or {}
+        if not core.orchestrated():
+            # Тикет оркестратора доводит ручная сессия: ревью сама (если его не было) и полный
+            # финиш с отметкой — проверки на том же head не повторяются.
+            st.go("checks" if ready.get("reviewed") else "review")
+            return None
+        if not ready.get("reviewed"):
+            if self.reviewed() is not None:  # отчёт ревью оркестратора — разбор находок
+                st.go("review")
+                return None
+            return self.ready(reviewed=False)  # head мог смениться — запомнить новый
+        if ready.get("head") == core.head():
+            return self.ready_result()
+        st["attempts"] = {}  # новые коммиты после «код готов»: красный CI, догон базы
+        if self.pr_merged():
+            st.retire(self.root)
+            st.go("review")
+            return None
+        st.go("checks")
+        return None
+
+    def ready_result(self):
+        st, core = self.state, self.core
+        ready = st["ready"]
+        sha = ready["head"][:7]
+        if ready["reviewed"]:
+            body = (
+                f"PR: {st['pr']} — {st['finish_line']}\nНаходки разобраны, тесты и догон базы "
+                f"пройдены на `{sha}`; {self.verify_line()}. Отметку review и авто-мёрж "
+                "поставит оркестратор после CI; красный CI или конфликт он вернёт этой сессии "
+                "заданием."
+            )
+        else:
+            body = (
+                f"Ветка на `{sha}` готова к ревью ошибок. Его гоняет оркестратор вне сессии; "
+                "находки вернутся этой сессии заданием «разбери находки»."
+            )
+        body += (
+            "\nЗакончи сессию — ничего больше не делая, без итога владельцу и без `ticket wait`: "
+            "сессию возобновит оркестратор."
+        )
+        return (core.READY, f"Тикет #{self.n}: код готов", body, ())
 
     def result(self):
         st = self.state
@@ -869,61 +1176,98 @@ class Route:
             "Итог для владельца — передай одним сообщением:\n\n" + "\n".join(lines) + "\n\n"
             f"{BIND}\n\n{WAIT.format(long=self.core.LONG_CALL)}"
         )
-        wait = f"scripts/canon/ticket wait {self.n}"
+        wait = self.core.command("wait", self.n)
         return (self.core.DONE, f"Тикет #{self.n}: PR {st['pr']}", body, (wait,))
 
     # --- остановка ---
 
-    def stop(self, reason: str):
+    def stop(self, reason: str, trace: dict | None = None):
+        """Остановка; `trace` — след `/verify` в worktree (строка и head до прогона)."""
         st = self.state
-        st["stop"] = {"reason": reason, "step": st.step}
+        st["stop"] = {"reason": reason, "step": st.step, "trace": trace}
         st.go("stop")
         return self.step_stop()
 
     def step_stop(self):
         core, st = self.core, self.state
-        reason = st["stop"]["reason"]
+        reason, trace = st["stop"]["reason"], st["stop"].get("trace")
         question = core.read_answer(self.root, "stop.md")
         if not question:
+            first = (
+                f"Сначала след /verify в worktree — {trace['line']}\n{TRACE_TASK}\n"
+                if trace
+                else ""
+            )
             return self.turn(
                 "Отчёт об остановке",
-                f"Довести нельзя: {reason}.\nДопиши для владельца в `.ticket/stop.md`: вопрос на "
-                "языке поведения продукта, варианты и рекомендацию — без имён функций и файлов. "
-                "Данные маршрута (шаг, тесты, ревью, /verify) соберёт и опубликует скрипт.",
+                f"Довести нельзя: {reason}.\n{first}Допиши для владельца в `.ticket/stop.md`: "
+                "вопрос на языке поведения продукта, варианты и рекомендацию — без имён функций и "
+                "файлов. Данные маршрута (шаг, тесты, ревью, /verify) соберёт и опубликует скрипт.",
             )
-        text = self.stop_report(reason, question)
+        # След /verify — до отчёта (#190, п. 6): его правки дожили бы до «продолжай», а там общее
+        # задание о незакоммиченном предлагает закоммитить их в PR тикета. Не разобран за два
+        # круга — отчёт уходит и так, со строкой о нём: владельцу важнее узнать об остановке.
+        held = bool(trace) and self.trace_left(trace["head"])
+        if held and st.attempt("stop_trace") <= LIMIT:
+            body = (
+                f"Отчёт об остановке не опубликован: след /verify не разобран — {trace['line']}\n"
+                f"{TRACE_TASK}\n`.ticket/stop.md` уже есть."
+            )
+            return self.turn("Отчёт об остановке", body)
+        text = self.stop_report(reason, question, held)
         saved = st.dir / "stop-report.md"
         st.dir.mkdir(parents=True, exist_ok=True)
         saved.write_text(text, encoding="utf-8")
         where = self.publish_stop(text, saved)
         (self.root / core.ANSWERS / "stop.md").replace(st.dir / f"stop-{core.now()}.md")
         st["stop"]["where"] = where
+        st["stop"]["at"] = core.now()
         st.go("stopped", core.OWNER)
         body = (
             f"Отчёт об остановке — {where}, метка {LABEL}. Передай владельцу одним сообщением: "
-            f"{reason}; вопрос — в отчёте. Ответил «продолжай» — продолжить маршрут:"
+            f"{reason}; вопрос — в отчёте.{self.waive_task()} Ответил «продолжай» — продолжить "
+            "маршрут:"
         )
         return (core.STOPPED, f"Тикет #{self.n}: остановка", body, (f"{self.cmd} --again",))
 
-    def stop_report(self, reason: str, question: str) -> str:
+    def waive_task(self) -> str:
+        """Строка задания при остановке на `/verify`: решение владельца — только комментарием."""
+        if not self.stopped_on_verify():
+            return ""
+        if self.core.orchestrated():
+            return " " + WAIVE_HINT
+        return (
+            f" {WAIVE_HINT} Владелец снял проверку в чате — попроси его написать эту строку "
+            "комментарием: из чата маршрут её не принимает, сама сессия её в тикет не пишет."
+        )
+
+    def stop_report(self, reason: str, question: str, held: bool = False) -> str:
+        """Текст отчёта; `held` — след `/verify` так и не разобран."""
         st = self.state
-        lines = [f"Отчёт об остановке: {reason}", "", question, "", "## Данные маршрута", ""]
+        lines = [f"Отчёт об остановке: {reason}", "", question, ""]
         step = (st["stop"] or {}).get("step")
+        if self.stopped_on_verify():
+            lines += [WAIVE_HINT, ""]
+        lines += ["## Данные маршрута", ""]
         name = self.core.STEP_NAMES.get(step, step)
         lines.append(f"- Ветка `{st['branch']}`, head `{self.core.head()[:7]}`, шаг «{name}»")
         if st["review"]:
             lines.append(f"- {self.review_line()}")
         if run := st["checks_run"]:
-            results = "; ".join(
-                f"`{r['name']}` — код {r['code']}" + (f" (лог: {r['log']})" if r.get("log") else "")
-                for r in run["results"]
-            )
+            results = "; ".join(f"`{r['name']}` — код {r['code']}" for r in run["results"])
             lines.append(f"- Тесты и линтеры на `{run['head'][:7]}`: {results}")
         if st["verify"]:
             lines.append(f"- {self.verify_line()}")
+        if trace := (st["stop"] or {}).get("trace"):
+            left = trace["line"].removeprefix(f"{TRACE}:").strip()
+            lines.append(f"- След /verify в worktree: {left}" + ("; не разобран" if held else ""))
         total = sum(v for v in st["cost"].values() if isinstance(v, (int, float)))
         lines.append(f"- Расход: {total:.2f} USD")
-        return "\n".join(lines) + "\n"
+        for r in (run or {}).get("results", []):
+            if r.get("tail"):
+                fence = "~" * max([3, *(len(m) + 1 for m in re.findall(r"~{3,}", r["tail"]))])
+                lines += ["", f"Последние строки `{r['name']}`:", "", fence, r["tail"], fence]
+        return self.local_paths("\n".join(lines) + "\n")
 
     def publish_stop(self, text: str, saved: Path) -> str:
         """`ship-finish --unconfirmed`; не прошёл — то же кодом, без `gh pr merge` (#152):

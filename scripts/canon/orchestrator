@@ -1,0 +1,3339 @@
+#!/usr/bin/env python3
+"""orchestrator — оркестратор канона: сам ведёт сессии тикетов (спека #208; #216–#222).
+
+    <копия канона>/project/scripts/canon/orchestrator tick
+    <копия канона>/project/scripts/canon/orchestrator status   # «статус»
+    <копия канона>/project/scripts/canon/orchestrator pause    # «пауза»
+    <копия канона>/project/scripts/canon/orchestrator now      # «работай сейчас»
+    <копия канона>/project/scripts/canon/orchestrator service install|remove   # служба launchd
+
+Запуск — из главного чекаута проекта (служба `launchd` раз в минуту); сам скрипт — из своей
+**доверенной копии канона** на машине владельца (тег канона), а не из проекта: его скрипты рядом
+(`session-run`, `review`, `ship-finish`, `app-token`) — той же версии, и сессия их не подменит.
+Скрипт внутри проекта или его worktree — отказ (код 2).
+
+**Один такт** (`tick`): прочитать GitHub, своё состояние и время, решить, выполнить, записать.
+Такты идут по одному (замок `tick.lock`): ревью длится минуты, а служба зовёт такт раз в минуту.
+**Места** (#220) — сессии, идущие параллельно: `git config canon.agentSlots`, по умолчанию 2. По
+порядку:
+
+- Сверка процессов (#221, #241): живые `session-run` внутри песочницы проекта против записанных
+  запусков (метка `--run`); незаписанный (такт упал после запуска) — **осиротевший**: группа его
+  процессов внутри завершается, запуск — в состояние с расходом худшим случаем, тикет продолжает
+  ту же сессию возобновлением. Второй сессии на тикет нет: запуск пишется в состояние сразу после
+  старта.
+- Паузы (#221) — пересчёт: «пауза» владельца (`pause`, до `now`), вне окна расписания
+  (`canon.agentSchedule`: `ЧЧ:ММ-ЧЧ:ММ=места` через запятую, местное время), суточный потолок
+  (`canon.agentCeiling`, 20% недельного лимита: прирост доли недели за сутки), упор в лимит
+  подписки (до сброса окна), диск и память ниже порога. Любая — новые места не занимаются; кроме
+  паузы по ресурсам — и запуски начатых тикетов (ревью, возобновления) ждут. Доля лимита — из
+  `rate_limit_event` потоков и пинга `claude -p` без инструментов перед новым местом (разведка
+  #211). Упор в лимит — не сбой: тикет без отчёта первым в очередь, после сброса — та же сессия.
+
+Метка-команда (`agent:go`, `agent:stop`, `agent:retry`) — только от владельца (#248): её
+последнее событие `labeled` — от него, иначе метка снимается с причиной без упоминания; снятие
+метки-команды не владельцем — метка возвращается с причиной (`guard`).
+
+0. Команды владельца на тикетах, которые ведёт оркестратор (на чужом метка снимается с
+   комментарием, команда не выполняется; сбой команды — по тикету, остальной такт идёт); метка
+   команды снимается, как только команда выполнена:
+   - `agent:stop` — живой запуск сессии завершается всей группой процессов (агент, тесты,
+     dev-сервер: SIGTERM, через `KILL_WAIT` — SIGKILL), открытый PR — в черновик (не сольётся
+     авто-мёржем), отчёт об остановке; ветка и PR целы;
+   - `agent:retry` — с чистого листа: запуск завершается, открытый PR закрывается с комментарием,
+     ветка на сервере и локально, worktree с ресурсами, состояние маршрута и свой отчёт ревью
+     удаляются, тикет — в конец очереди новым. Шаги повторимы: сбой посреди — метка остаётся,
+     следующий такт доделает.
+1. Метка `agent:go` на открытом тикете: без `ready-for-agent` — комментарий с причиной, метка
+   снимается, тикет не берётся; с `in-progress` без своей сессии — пропуск (ручная сессия); иначе
+   `agent:queued` вместо `agent:go` и тикет — в конец очереди. На остановленном тикете —
+   продолжение: черновик PR снимается, метки остановки — тоже, тикет в очередь; заняв место, он
+   идёт с того же шага: остановлен на CI или мёрже — снова CI и отметка; иначе — та же сессия
+   (`session-run --resume`), без сессии — новая.
+1а. Тикет с вопросом владельцу (место он освободил): ответ — комментарий участника репозитория
+   после вопроса (поиск — `answers` из `ticket_ask.py`, как у самой сессии); есть — `agent:queued`
+   и в очередь **раньше новых** (за другими тикетами с ответом). Заняв место — та же сессия
+   (`session-run --resume`, маршрут сам находит ответ); сессии или её worktree нет — новая на той
+   же ветке, запись об этом в тикет. Возобновлённый запуск кончился, а вопрос всё ещё ждёт
+   (`claude --resume` не нашёл сессию, упал) — тоже новая сессия на той же ветке и запись в
+   тикет; новая не взяла ответ — отчёт об остановке. Вопроса среди своих комментариев нет —
+   отчёт об остановке.
+1б. PRD (#219) — тикет, на который ссылается раздел «Parent» открытых тикетов участников
+   репозитория: `agent:go` на нём держится, пока есть невзятые тикеты; его тикеты с
+   `ready-for-agent`, чьи блокирующие из «Blocked by» закрыты (или слиты в этом PRD), — в конец
+   очереди; без `ready-for-agent` или с тикетом либо меткой не от владельца — пропуск и строка в
+   сводке. Ни один тикет PRD не ведётся, а
+   ждущие есть — одна запись «PRD стоит» с упоминанием. Невзятых нет и ни один не ведётся — одна
+   сводка с упоминанием владельца: тикеты, меры, счёт `escaped-defect` (тикеты с меткой,
+   ссылающиеся на слитый тикет PRD или его PR); `agent:go` снимается. `agent:stop` на PRD или
+   снятая `agent:go` — очередь PRD снята, взятые тикеты идут. Тикет на остановке, закрытый на
+   GitHub, оркестратор больше не ведёт (PR слит — уборка и меры, как по слиянию).
+2. Каждое занятое место — шаг тикета на нём (сбой шага — по тикету, соседнее место идёт):
+   - **сессия** идёт — токен сессии обновляется, ждём; кончилась — по состоянию тикета маршрута:
+     «код готов» до ревью — ревью ошибок, затем возобновление той же сессии (`session-run
+     --resume`) — она разбирает находки, проходит проверки и открывает PR; «код готов» после PR —
+     к CI; вопрос — место свободно до ответа (п. 1а); опубликованный отчёт об остановке сессии
+     (шаг `stopped`) — место свободно до `agent:go`; иначе (и шаг `stop`, отчёт которого сессия не
+     дописала) — сессия без результата: отчёт об остановке оркестратора с причиной из конца
+     транскрипта (итог `result`, без него — последнее сообщение агента). Жива ли сессия — номер
+     процесса и время его старта (`ps -o lstart`): номер, занятый другим процессом, — не она.
+     Запуск дольше `RUN_TIME` (2 ч; ожидание ответа владельца в запуск не входит — с вопросом
+     сессия кончается) — группа процессов завершается, отчёт об остановке;
+   - **ревью ошибок** — скрипт `review` из этой копии канона в своём отдельном чекауте head
+     сессии (`git worktree add --detach`), не в worktree сессии, и `claude` с
+     `--setting-sources user` (обёртка `claude` первой на `PATH`): правки скриптов канона и
+     незакоммиченное в worktree сессии на отчёт не влияют, настройки и хуки проекта и ветки не
+     грузятся; что флаг отсекает и `CLAUDE.md` и скиллы ветки — проверит проба (#224). Ревью не
+     дольше `REVIEW_TIMEOUT` — иначе отчёт об остановке, а не вечный замок такта.
+     Отчёт — свой (`reviews/ticket-N.json`), по нему ставится отметка; сессии — его копия рядом
+     с состоянием тикета (`review.json`, `review.md`), где его ждёт маршрут: правка копии
+     отметку не меняет. Ревью одно на тикет: сессия кончилась до разбора — та же копия снова
+     (один раз), без второго прогона;
+   - **CI** — отметка `review` и авто-мёрж (`ship-finish --mark` токеном оркестратора) только
+     когда все проверки PR, кроме сторожа, зелёные, тесты маршрута пройдены ровно на head PR, head
+     worktree тот же, а head отчёта ревью этого круга — он сам или его предок. Красный CI —
+     **возврат**: та же сессия с заданием по CI (`session-run --resume --prompt`), в пределах
+     тикета, без второго ревью; возвратов не больше `RETURNS`, следующий красный — отчёт об
+     остановке. Закрытый PR, черновик или проверок нет дольше `CI_WAIT` — отчёт об остановке;
+   - **мёрж** — ждём слияния; красный CI — возврат, как на шаге CI; конфликт с `main`,
+     черновик, выключенный авто-мёрж или закрытый PR — отчёт об остановке; слит — уборка
+     механикой `session-start` (`retire_merged`: worktree, ветка, ресурсы, метка `in-progress`),
+     свой отчёт ревью удаляется, и комментарий в тикет без упоминания владельца с мерами:
+     сколько раз дёргали владельца, время от очереди до слияния, расход, PR;
+   - **догон основы** — `main` ушёл вперёд (слит тикет оркестратора или GitHub говорит
+     `BEHIND`), а head PR на шаге CI или мёржа не содержит `origin/main`: PR — в черновик
+     (старый head с отметкой не сольётся посреди догона), та же сессия с заданием «догони
+     основу»; конфликт сводит она по правилам шага маршрута «догон базы», ревью не
+     повторяется, черновик снимается перед отметкой. Та же основа не догнана — отчёт об
+     остановке.
+   Отчёт об остановке оркестратора — «Причина / Сделано / Доступно» с упоминанием владельца
+   (уведомление), метки `agent:stopped` и `ready-for-human` — до комментария: сбой меток не
+   повторит комментарий.
+3. Места свободны, очередь не пуста — тикеты очереди по порядку. Тикет занимает место, только
+   если его владения и флаги (строки `**Владения:**` и `**Флаги:**` брифа по образцу
+   `.claude/canon/ticket-ownership.md`, на момент старта) не пересекаются с владениями занятых
+   мест и тикетов, ждущих ответа владельца, и общего флага «миграция / ядро / экран» нет; тикет
+   без строк по образцу идёт один. Не может — ждёт и держит свои владения от тикетов позади
+   (кроме случая, когда его держит только тикет, ждущий ответа); следующий, не пересекаясь и с
+   ним, место берёт. Сбой — по тикету, очередь за ним идёт. Заняв место:
+   `agent:queued` снимается, `session-run N` с
+   `CANON_ORCHESTRATOR=1` (метку `in-progress` ставит `session-start`), `claude` — с
+   `--session-id` (id для возобновления) и потоком `--output-format stream-json --verbose`
+   (лог — `logs/ticket-N-<id сессии>-K.jsonl`; расход — из событий `result`, последний
+   `rate_limit_event` запоминается). Процесс — своей группой, такт его не ждёт. Тикет уходит из
+   очереди только после запуска: сбой меток, токенов или запуска оставляет его первым на
+   следующий такт.
+
+**Пределы** (решение 16.10, п. 10): каждый запуск — с `--max-budget-usd` наименьшим из
+`RUN_LIMIT` (30 USD) и остатка `TICKET_LIMIT` (60 USD) за вычетом расхода тикета по состоянию
+(сессии, ревью, дочерние прогоны маршрута); остатка нет — отчёт об остановке без запуска и без
+ревью. Запуск, кончившийся по `--max-budget-usd` (`error_max_budget_usd`) без «код готов»,
+вопроса или своего отчёта, — отчёт об остановке с пределом. Отдельного предела ходов нет.
+
+**Служба, «статус», caffeinate** (#222): `service install` — plist из образца
+`orchestrator.plist` рядом (этот Python и скрипт, главный чекаут, PATH установки, такт раз в
+минуту, при входе и после перезагрузки) в `~/Library/LaunchAgents` и `launchctl bootstrap`;
+`service remove` — `bootout` и plist удалён. `status` — строки `ticket status` со своим шагом,
+кого ждём и расходом; места, очередь, паузы с причинами; только читает. Пока есть занятые места,
+очередь или вопрос владельцу в рабочем окне, такт держит `caffeinate` со своим сроком; без
+них — отпускает. Mac — на зарядке, крышка открыта; обновление канона — сначала «пауза».
+
+**Граница — песочница проекта** (#223, #241; `docs/sandbox.md`): сессии идут внутри одной
+Docker Sandbox проекта (`sbx exec`), в клоне оркестратора `~/.canon/sandbox/<проект>-<хеш>/clone`;
+смонтированы ровно клон и копия канона только на чтение — иначе сбой: своё состояние, отчёты ревью,
+главный чекаут и токен оркестратора в песочницу не попадают. Запуск, возобновление, стоп, предел
+времени и сверка осиротевших — процессы `session-run` **внутри** (метка запуска `--run`, своя
+группа процессов); уборка worktree и ресурсов проекта после мёржа и при повторе — тоже изнутри
+(`session-run --retire`, `--discard`). Git в клоне сессий оркестратор на Mac не выполняет: head
+«код готов» сессия отправляет на GitHub изнутри (`git push` токеном сессии), ревью, отметка и
+догон — в своём клоне (`canon-orchestrator/repo`) по ветке с сервера; файлы клона (состояние
+маршрута, копия отчёта, токен сессии) — без перехода по символическим ссылкам. Образы проекта
+(`canon.sandboxImages`) собирает Mac (`canon.sandboxBuild`) и загружает в песочницу, когда образ
+сменился; база-шаблон (`canon.sandboxSeedFrom` → `canon.sandboxSeedInto`) — раз в сутки. Пауза
+по памяти — по памяти внутри песочницы.
+
+**Лицо агента** (`docs/github-app.md`): GitHub в такте — токеном оркестратора
+(`app-token issue --kind orchestrator`, `GH_TOKEN`); сессии — токен сессии App: его выдаёт Mac
+(`app-token refresh` в свой каталог), копия — в `.git/canon-session/token` клона, обёртки `gh` и
+git на него ставятся внутри (`app-token shims`); `sbx` идёт без токенов такта в окружении, а
+`sbx exec` передаёт внутрь только окружение сессии. App ID — `git config canon.agentAppId`; не
+задан — сбой (код 1): без App отметку поставить нечем.
+
+**Своё состояние** — `<общий каталог git>/canon-orchestrator/state.json` (рядом с состояниями
+тикетов `canon-ticket/`): очередь, места, тикеты (шаг, id сессии, номера процессов, логи, расход,
+сколько раз дёргали владельца), паузы с причинами, доля недельного лимита. Часы — `CANON_NOW`
+(ISO 8601, для тестов), иначе текущее время.
+Код выхода 0 — такт прошёл; 1 — сбой (`gh`, git, App, состояние); 2 — ошибка запуска.
+Как устроено — `docs/orchestrator.md` канона.
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import plistlib
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import types
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STATE_DIR = "canon-orchestrator"
+GO, QUEUED, STOPPED = "agent:go", "agent:queued", "agent:stopped"
+STOP, RETRY = "agent:stop", "agent:retry"
+COMMANDS = (GO, STOP, RETRY)  # метки-команды — только от владельца (#248)
+# События тикетов репозитория за такт (`guard`): страниц по 100 не больше — дальше старые
+# пропускаются. Своё снятие метки-команды помнится три разбора событий: его событие приходит на
+# следующем такте, запас — на задержку REST. Не по времени: Mac спит часами между тактами.
+EVENT_PAGES, OWN_KEEP = 10, 3
+READY_FOR_AGENT, HUMAN = "ready-for-agent", "ready-for-human"
+ESCAPED = "escaped-defect"  # тикет ускользнувшего дефекта со ссылкой на слитый тикет или PR
+# Места — сессии, идущие параллельно (решение 16.10): число — настройка проекта.
+SLOTS_KEY, SLOTS = "canon.agentSlots", 2
+# Флаги брифа (`.claude/canon/ticket-ownership.md`): тикеты с общим флагом параллельно не идут.
+FLAGS = ("миграция", "ядро", "экран")
+OWNS_LINE = re.compile(r"^\*\*Владения:\*\*(.*)$", re.M)
+FLAGS_LINE = re.compile(r"^\*\*Флаги:\*\*(.*)$", re.M)
+# Возвраты той же сессии по красному CI на тикет; следующий красный — отчёт об остановке.
+RETURNS = 2
+PULL = re.compile(r"/pull/(\d+)")
+APP_ID = "canon.agentAppId"
+# Окружение сессии — без токенов GitHub такта: у сессии только свой токен через обёртки.
+TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+STREAM = ["--output-format", "stream-json", "--verbose"]
+PR_FIELDS = (
+    "state,headRefOid,isDraft,statusCheckRollup,url,autoMergeRequest,mergeable,"
+    "mergeStateStatus,baseRefName,headRefName"
+)
+GREEN = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+TAIL = 600
+# Ревью Opus xhigh идёт 5–8 минут (`review`); час — заведомо зависание, а не долгий прогон.
+REVIEW_TIMEOUT = 3600
+AWAKE_FOR = REVIEW_TIMEOUT + 600  # срок `caffeinate`: такт с ревью ошибок его не переживёт
+# PR открыт, а проверок CI на нём так и нет — workflow не запустился; ждать дальше незачем.
+CI_WAIT = 1800
+# Пределы (решение 16.10, п. 10): USD в ценах API на запуск и на тикет, время запуска в секундах.
+RUN_LIMIT, TICKET_LIMIT, RUN_TIME = 30, 60, 2 * 3600
+REVIEW_LIMIT = 10  # предел скрипта `review` по умолчанию; меньше — когда остаток тикета меньше
+BUDGET_OUT = "error_max_budget_usd"  # `subtype` итога `claude -p`, упёршегося в `--max-budget-usd`
+# Группа процессов после SIGTERM: столько секунд на выход, потом SIGKILL.
+KILL_WAIT = 10
+# Расход подписки (#221, разведка #211): суточный потолок — доля недельного лимита за сутки
+# (настройка, на старте 20%); расписание — окна `ЧЧ:ММ-ЧЧ:ММ=места` через запятую, по местному
+# времени (нет настройки — круглые сутки, `canon.agentSlots` мест).
+CEILING_KEY, CEILING = "canon.agentCeiling", 0.20
+SCHEDULE_KEY = "canon.agentSchedule"
+WINDOW = re.compile(r"(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})=(\d+)")
+# Доля лимита старше этого (секунд) — перед новым местом пинг: `claude -p` без инструментов и
+# настроек отдаёт её `rate_limit_event` за ~0.02 USD.
+USAGE_FRESH = 600
+LIVE_TAIL = 256 * 1024  # хвост потока живого запуска, в котором ищется последний `rate_limit_event`
+PING = ["-p", "--model", "haiku", "--tools", "", "--setting-sources", "", "--strict-mcp-config"]
+PING_TIMEOUT = 120
+LIMIT_WAIT = 3600  # упор в лимит без времени сброса — пауза на час
+# Ресурсы перед новым местом (ГБ): диск Mac и память внутри песочницы (сессия с тестами — около
+# 1 ГБ: две ozon — 1,9 ГБ, прогон 19.10); ниже — пауза очереди с причиной; пороги — по пробе (#224).
+MIN_DISK_GB, MIN_MEMORY_GB = 10, 1.5
+# Песочница (#241): токен и обёртки сессии — в `.git` клона; свой клон оркестратора — для ревью,
+# отметки и догона по веткам с GitHub; образы проекта и база-шаблон — настройки проекта.
+INSIDE = Path(".git/canon-session")
+SESSION_CONFIG = ("canon.agentApp",)  # git config главного чекаута, нужный маршруту внутри
+STATE_LIMIT = 2**20  # файл клона больше — не читается (его пишет сессия)
+OWN_REPO = "repo"
+IMAGES_KEY, BUILD_KEY = "canon.sandboxImages", "canon.sandboxBuild"
+SEED_FROM_KEY, SEED_INTO_KEY = "canon.sandboxSeedFrom", "canon.sandboxSeedInto"
+BUILD_TIMEOUT = 1800  # сборка образа или перенос базы-шаблона дольше получаса — сбой
+INSIDE_TIMEOUT = 600  # уборка, push и прочие команды внутри песочницы
+SHA = re.compile(r"[0-9a-f]{40}")
+# Процессы `session-run` внутри песочницы (Python образа): номер, группа, аргументы, каталог.
+# Аргумент — путь скрипта; вывод — JSON-список. `ps` не ответил — код 1: живые сессии не принять
+# за мёртвые.
+PROCS = r"""
+import json, os, subprocess, sys
+script = sys.argv[1]
+res = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,pgid=,command="], capture_output=True,
+                     text=True)
+if res.returncode != 0:
+    sys.exit(f"ps: {res.stderr.strip()}")
+found = []
+for line in res.stdout.splitlines():
+    fields = line.split(None, 2)
+    if len(fields) < 3 or script + " " not in fields[2] + " ":
+        continue
+    pid, cwd = int(fields[0]), None
+    if os.path.isdir("/proc/self"):  # Linux песочницы; процесс кончился — каталога нет
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            pass
+    else:  # не Linux (тесты): lsof
+        try:
+            out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                                 capture_output=True, text=True).stdout
+        except OSError:
+            out = ""
+        names = [x[1:] for x in out.splitlines() if x.startswith("n")]
+        cwd = names[0] if names else None
+    args = (fields[2] + " ").split(script + " ", 1)[1].split()
+    found.append({"pid": pid, "pgid": int(fields[1]), "args": args,
+                  "cwd": os.path.realpath(cwd) if cwd else None})
+print(json.dumps(found))
+"""
+# Группа процессов внутри песочницы: SIGTERM, через `KILL_WAIT` — SIGKILL; код 0 — живых (не
+# зомби) в группе больше нет, 3 — пережили SIGKILL.
+KILL = r"""
+import os, signal, subprocess, sys, time
+pgid, wait = int(sys.argv[1]), float(sys.argv[2])
+def gone():
+    out = subprocess.run(["ps", "-A", "-o", "pgid=,stat="], capture_output=True, text=True)
+    if out.returncode != 0:
+        return False  # не узнать — не «завершена»
+    rows = [line.split() for line in out.stdout.splitlines()]
+    return not any(len(r) == 2 and r[0] == str(pgid) and not r[1].startswith("Z") for r in rows)
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        sys.exit(0)
+    except PermissionError:
+        pass
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        if gone():
+            sys.exit(0)
+        time.sleep(0.1)
+sys.exit(3)
+"""
+# Паузы: owner — «пауза» владельца, schedule — вне окна расписания, ceiling — суточный потолок,
+# limit — упор в лимит подписки, resources — диск и память. Любая — новые места не занимаются;
+# кроме resources — и запуски начатых тикетов (ревью, возобновления) ждут её конца.
+HOLDING = ("owner", "schedule", "ceiling", "limit")
+OWNER_PAUSE, OWNER_NOW = "pause.json", "now.json"  # команды владельца — файлами, без замка такта
+# Служба (#222): `launchd` пользователя зовёт такт раз в минуту (`StartInterval`), при входе и
+# после перезагрузки (`RunAtLoad`); образец plist — рядом со скриптом, лог — в своём каталоге.
+PLIST, SERVICE_LOG, LAUNCH_AGENTS = "orchestrator.plist", "service.log", "Library/LaunchAgents"
+SERVICE_TOOLS = ("git", "gh", "claude", "sbx")  # PATH службы — с установки: без них такт не пойдёт
+LOG_LIMIT = 5 * 2**20  # лог службы больше — в `service.log.1`
+# `caffeinate` (#222): Mac не спит, пока есть занятые места, очередь или вопрос владельцу в
+# рабочем окне. Срок `-t` (`AWAKE_FOR`, после `REVIEW_TIMEOUT`) — дольше ревью ошибок внутри
+# такта; без тактов (служба снята, такт упал) Mac снова уснёт; старше `AWAKE_RENEW` — новый.
+AWAKE = ["-i", "-m", "-s"]
+AWAKE_RENEW = 300
+# Ожидание конца паузы держит Mac, только если она кончится сама не позже этого (секунд).
+AWAKE_HORIZON = 12 * 3600
+PHASES = {
+    "queued": "очередь",
+    "session": "сессия",
+    "settle": "сессия",
+    "question": "вопрос",
+    "answer": "ответ на вопрос",
+    "ci": "CI",
+    "merge": "мёрж",
+}
+# Сбой одной команды владельца не роняет такт: остальные тикеты идут дальше.
+COMMAND_ERRORS = (OSError, subprocess.SubprocessError, ValueError, KeyError)
+RETRY_NOTE = (
+    "Оркестратор: владелец поставил `agent:retry` — тикет начинается с чистого листа: PR закрыт, "
+    "ветка, worktree и состояние удалены, тикет снова в очереди."
+)
+# Задания той же сессии (`session-run --resume --prompt`): «код готов» на том же head маршрут
+# сам не трогает — новый коммит делает сессия, дальше маршрут идёт от «код готов» (#214).
+CATCH_UP = """Оркестратор: `main` ушёл вперёд (слит соседний тикет) — догони основу тикета #{n}.
+В worktree тикета: `git fetch origin`, затем `git merge --no-edit origin/main`. Конфликт — по
+правилам шага маршрута «догон базы»:
+{conflict}
+Слияние закоммичено — вызов `{ship}` ({long}) и его задания — до {until}: маршрут прогонит тесты
+и `/verify` на новом head и обновит PR; ревью ошибок не повторяется. Вопрос владельцу — только
+`{ask}`."""
+CI_TASK = """Оркестратор: {why} — PR {pr} тикета #{n} вернулся тебе. Найди причину по логам
+(`gh pr checks`, `gh run view --log-failed`), почини в worktree тикета и закоммить (сообщение
+одной строкой `-m`). Затем вызов `{ship}` ({long}) и его задания — до {until}: маршрут прогонит
+тесты на новом head и обновит PR; второго ревью ошибок нет. Без владельца не починить — вопрос
+только `{ask}`."""
+
+
+def load(name: str, filename: str):
+    """Файл канона рядом со скриптом как модуль — без правки `sys.path` и без `__pycache__`."""
+    path = HERE / filename
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    return module
+
+
+start = load("canon_session_start_orchestrator", "session-start")
+core = start.core
+asks = load("canon_ticket_ask_orchestrator", "ticket_ask.py")
+table = load("canon_ticket_status_orchestrator", "ticket_status.py")  # строки «статуса»
+ship = load("canon_ticket_ship_orchestrator", "ticket_ship.py")  # правила конфликта догона
+sandbox = load("canon_sandbox_orchestrator", "sandbox")  # песочница проекта (#223)
+
+
+class Failure(Exception):
+    """Сбой такта (код выхода 1)."""
+
+
+def open_inside(root: Path, parts: tuple[str, ...], make: bool = False) -> int:
+    """Каталог клона песочницы — дескриптором, по одному звену без перехода по символическим
+    ссылкам (`O_NOFOLLOW`): клон правит сессия, и каталог, подменённый ссылкой, увёл бы запись
+    Mac в копию канона или в свой отчёт ревью. `make` — недостающие звенья создать."""
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            if make:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_inside(root: Path, rel: Path) -> bytes:
+    """Файл клона песочницы — без перехода по ссылкам (`open_inside`), без ожидания (FIFO не
+    повесит такт) и только обычный файл не больше `STATE_LIMIT`."""
+    fd = open_inside(root, rel.parent.parts)
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        file = os.open(rel.name, flags, dir_fd=fd)
+    finally:
+        os.close(fd)
+    with os.fdopen(file, "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > STATE_LIMIT:
+            raise OSError(f"{rel}: не обычный файл до {STATE_LIMIT // 1024} КБ")
+        return source.read(STATE_LIMIT + 1)
+
+
+def write_inside(root: Path, rel: Path, data: bytes, mode: int = 0o600) -> None:
+    """Файл клона песочницы атомарно и без перехода по ссылкам: временный файл рядом (`O_EXCL`,
+    `O_NOFOLLOW`) и замена имени — ссылка на месте файла заменяется, а не пишется насквозь."""
+    fd = open_inside(root, rel.parent.parts, make=True)
+    try:
+        tmp = f".{rel.name}.{uuid.uuid4().hex}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        with os.fdopen(os.open(tmp, flags, mode, dir_fd=fd), "wb") as out:
+            out.write(data)
+        os.replace(tmp, rel.name, src_dir_fd=fd, dst_dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+class Route(core.State):
+    """Состояние маршрута тикета в клоне песочницы (`.git/canon-ticket/N/state.json`) — чтение
+    файла, без git в клоне и без перехода по ссылкам. Только читается: пишет его сессия."""
+
+    def __init__(self, number: int, clone: Path):
+        self.number = number
+        self.clone = clone
+        self.rel = Path(".git") / core.STATE_DIR / str(number)
+        self.dir = clone / self.rel
+        self.path = self.dir / "state.json"
+        try:
+            self.data = json.loads(read_inside(clone, self.rel / "state.json"))
+        except FileNotFoundError:
+            self.data = self.blank()
+        except (OSError, ValueError) as exc:
+            raise core.Failure(f"файл состояния {self.path}: {exc}") from None
+        if not isinstance(self.data, dict):
+            raise core.Failure(f"файл состояния {self.path}: не объект JSON")
+        for key in ("heads", "attempts", "cost"):
+            if not isinstance(self.data.get(key), dict):
+                self.data[key] = {}
+        self.data.setdefault("step", None)
+        self.data.setdefault("waiting", core.AGENT)
+
+    def save(self) -> None:
+        raise core.Failure("состояние маршрута пишет сессия, не оркестратор")
+
+    def branch(self) -> str:
+        """Ветка тикета: из состояния, только если это ветка этого тикета (`ticket-N`,
+        `ticket-N-…`) — иначе `ticket-N`: имя пишет сессия, а push и отметка идут по нему."""
+        name = self.data.get("branch")
+        if isinstance(name, str) and start.SESSION_BRANCH.match(name):
+            if core.ticket_of(name) == self.number:
+                return name
+        return f"ticket-{self.number}"
+
+
+def now() -> datetime:
+    stamp = os.environ.get("CANON_NOW")
+    return datetime.fromisoformat(stamp) if stamp else datetime.now(timezone.utc)
+
+
+def stamp() -> str:
+    return now().isoformat(timespec="seconds")
+
+
+def say(text: str) -> None:
+    print(f"orchestrator: {text}", flush=True)
+
+
+def duration(since: str | None) -> str:
+    try:
+        seconds = int((now() - datetime.fromisoformat(since or "")).total_seconds())
+    except ValueError:
+        return "—"
+    minutes = max(seconds, 0) // 60
+    return f"{minutes // 60} ч {minutes % 60:02d} мин" if minutes >= 60 else f"{minutes} мин"
+
+
+def tail(text: str) -> str:
+    text = text.strip()
+    return text if len(text) <= TAIL else "…" + text[-TAIL:]
+
+
+def run(*cmd: str, cwd: Path | None = None, env: dict | None = None, timeout=None):
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.DEVNULL,
+    )
+
+
+# Жив ли запуск — номер процесса и время его старта (`ps -o lstart`): номер, отданный системой
+# другому процессу, — не наша сессия. Та же проверка — у ручного `session-start`.
+started_at, alive = start.started_at, start.run_alive
+
+
+def local_now() -> datetime:
+    """Местное время: сутки потолка и окна расписания."""
+    return now().astimezone()
+
+
+def local_midnight(days: int = 0) -> datetime:
+    """Местная полночь сегодня (+`days` суток) — по календарю, а не +24 ч: в день перевода часов
+    сутки не 24 часа."""
+    day = local_now().date() + timedelta(days=days)
+    return datetime(day.year, day.month, day.day).astimezone()
+
+
+def parse_time(text) -> datetime | None:
+    """Время ISO 8601 из своих файлов; без пояса — местное; не время — None (битый файл команды
+    не роняет такт)."""
+    try:
+        when = datetime.fromisoformat(str(text)) if text else None
+    except ValueError:
+        return None
+    return when.astimezone() if when is not None and when.tzinfo is None else when
+
+
+def moment(when: datetime) -> str:
+    """Время для причины паузы: «ДД.ММ ЧЧ:ММ» местного времени."""
+    return when.astimezone().strftime("%d.%m %H:%M")
+
+
+def seconds_since(since: str) -> float:
+    return (now() - datetime.fromisoformat(since)).total_seconds()
+
+
+def group_alive(pgid: int) -> bool:
+    """В группе процессов есть живой (не зомби) процесс — любого пользователя; `ps` не ответил
+    — считаем, что есть."""
+    res = run("ps", "-A", "-o", "pgid=,stat=")
+    if res.returncode != 0:
+        return True
+    for line in res.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == str(pgid) and not fields[1].startswith("Z"):
+            return True
+    return False
+
+
+def kill_group(pid: int) -> bool:
+    """Вся группа процессов запуска (агент, тесты, dev-сервер): SIGTERM, через `KILL_WAIT` —
+    SIGKILL. Итог — группы больше нет. `EPERM` macOS отвечает и на группу из одних зомби
+    (родитель их ещё не прибрал), и на живой процесс другого пользователя (`sudo`) — какой
+    случай, решает `ps`."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            if not group_alive(pid):
+                return True
+        deadline = time.monotonic() + KILL_WAIT
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                if not group_alive(pid):
+                    return True
+            time.sleep(0.1)
+    return False
+
+
+def exhausted(spent: float) -> bool:
+    """Предел тикета исчерпан: остатка не хватит и на центовый `--max-budget-usd`."""
+    return TICKET_LIMIT - spent < 0.01
+
+
+def ended(killed: bool | None) -> str:
+    """Итог `end_run` словами отчёта."""
+    return {
+        None: "сессия не шла",
+        True: "процессы сессии завершены",
+        False: "процессы сессии не завершились и за SIGKILL — проверь `ps`",
+    }[killed]
+
+
+def limit_name(run_: dict) -> str:
+    """Какой предел дал запуску его `--max-budget-usd`: запуска или остаток тикета."""
+    try:
+        budget = float(run_.get("budget") or RUN_LIMIT)
+    except ValueError:
+        budget = RUN_LIMIT
+    return (
+        f"предел тикета {TICKET_LIMIT} USD"
+        if budget < RUN_LIMIT
+        else f"предел запуска {RUN_LIMIT} USD"
+    )
+
+
+def stream_summary(log: Path, last_bytes: int | None = None) -> dict:
+    """Расход и итог запуска по потоку `stream-json` (`stream_text`); `last_bytes` — только хвост
+    (живой запуск: долю лимита — каждый такт, не читая весь поток)."""
+    try:
+        with open(log, "rb") as stream:
+            if last_bytes is not None and stream.seek(0, os.SEEK_END) > last_bytes:
+                stream.seek(-last_bytes, os.SEEK_END)
+                stream.readline()  # первая строка хвоста — обрывок
+            else:
+                stream.seek(0)
+            text = stream.read().decode("utf-8", errors="replace")
+    except OSError:
+        text = ""
+    return stream_text(text)
+
+
+def stream_text(stream: str) -> dict:
+    """Расход и итог по потоку `stream-json`: события `result`, последний `rate_limit_event`
+    (разведка #211) и упор в лимит подписки (`limit`: окно и сброс). Итога нет — причина из конца
+    транскрипта: последнее сообщение агента, иначе строки не JSON (ошибка CLI)."""
+    results, limit, noise, said = [], None, [], ""
+    for line in stream.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            noise.append(line)
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "result":
+            results.append(event)
+        elif event.get("type") == "rate_limit_event":
+            limit = event
+        elif event.get("type") == "assistant" and not event.get("parent_tool_use_id"):
+            # Только главный агент: фраза субагента — не причина конца сессии.
+            content = (event.get("message") or {}).get("content")
+            texts = [
+                c["text"]
+                for c in (content if isinstance(content, list) else [])
+                if isinstance(c, dict) and c.get("type") == "text" and str(c.get("text")).strip()
+            ]
+            said = texts[-1] if texts else said
+    costs = [
+        e["total_cost_usd"] for e in results if isinstance(e.get("total_cost_usd"), (int, float))
+    ]
+    last = results[-1] if results else {}
+    text = str(last.get("result") or "").strip() if last else (said or "\n".join(noise))
+    if last.get("subtype") and last.get("subtype") != "success":
+        text = f"subtype {last['subtype']}" + (f": {text}" if text else "")
+    # Упор в лимит (#211), по надёжности: `rate_limit_event` `rejected`; итог с ошибкой 429;
+    # текст «You've hit your». Код выхода 1 сам по себе — любая ошибка API.
+    info = (limit or {}).get("rate_limit_info") or {}
+    hit = None
+    if info.get("status") == "rejected":
+        hit = {"window": info.get("rateLimitType"), "resets": info.get("resetsAt")}
+    elif (last.get("is_error") and last.get("api_error_status") == 429) or str(
+        last.get("result") or ""
+    ).startswith("You've hit your"):
+        hit = {"window": None, "resets": None}
+    return {
+        "cost": max(costs) if costs else 0,
+        "subtype": last.get("subtype"),
+        "result": tail(text),
+        "rate_limit": limit,
+        "limit": hit,
+    }
+
+
+class Orchestrator:
+    def __init__(self):
+        try:
+            self.main = Path(start.worktrees()[0]["path"])
+        except start.StartError as exc:
+            raise Failure(str(exc)) from None
+        self.dir = Path(core.common_dir()) / STATE_DIR
+        self.path = self.dir / "state.json"
+        self.data = self.read()
+        self.app_id = core.run("git", "config", "--get", APP_ID).stdout.strip()
+        slots = core.run("git", "config", "--get", SLOTS_KEY).stdout.strip() or str(SLOTS)
+        if not slots.isdigit() or int(slots) < 1:
+            raise Failure(f"`git config {SLOTS_KEY}` — число мест от 1, а не {slots!r}")
+        self.slots = int(slots)
+        self.windows = schedule(core.run("git", "config", "--get", SCHEDULE_KEY).stdout.strip())
+        self.ceiling = ceiling(core.run("git", "config", "--get", CEILING_KEY).stdout.strip())
+        self.usage_checked = False  # доля лимита проверена перед новым местом в этом такте
+        # Команда маршрута в заданиях сессии — путём скрипта в репозитории проекта (в самом
+        # каноне — `project/scripts/canon`).
+        own = self.main / "project/scripts/canon/ticket"
+        self.ticket_cmd = "project/scripts/canon/ticket" if own.exists() else "scripts/canon/ticket"
+        self.repo = ""
+        self.opened: list[dict] | None = None  # открытые тикеты такта — для PRD
+        # Метки-команды на тикетах за такт (`guard`); не прочитаны — своё снятие помнится любое.
+        self.present: set[tuple[int, str]] = set()
+        self.guarded = False
+        self.env: dict | None = None  # окружение сессий такта — токен обновляется раз за такт
+        try:
+            self.box = sandbox.Sandbox()  # песочница проекта: имя, клон, монтирования
+        except sandbox.Failure as exc:
+            raise Failure(str(exc)) from None
+        self.clone = self.box.clone
+        self.reset()
+
+    def reset(self) -> None:
+        """Кэш такта: песочница (`sbx ls`), процессы внутри, свой клон, подготовка песочницы."""
+        self.entry: dict | None = None
+        self.procs: list[dict] | None = None
+        self.fetched = False
+        self.prepared = False
+
+    def route(self, n: int) -> Route:
+        """Состояние маршрута тикета — в клоне песочницы."""
+        return Route(n, self.clone)
+
+    # --- состояние ---
+
+    def read(self) -> dict:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            data = {}
+        except (OSError, ValueError) as exc:
+            raise Failure(f"своё состояние {self.path}: {exc}") from None
+        data.setdefault("queue", [])
+        if "slots" not in data:  # состояние одного места (#216–#219)
+            slot = data.get("slot")
+            data["slots"] = [] if slot is None else [int(slot)]
+        data.pop("slot", None)
+        data.setdefault("tickets", {})
+        data.setdefault("prds", {})
+        data.setdefault("pauses", {})
+        data.setdefault("own", [])  # свои снятия меток-команд: {n, label, at, seen}
+        data.setdefault("restored", [])  # метки-команды, возвращённые за владельца: [n, label]
+        return data
+
+    def save(self) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.data["updated"] = stamp()
+        fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=".state-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(self.data, out, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.path)
+
+    def ticket(self, n: int) -> dict:
+        return self.data["tickets"][str(n)]
+
+    def free(self, n: int) -> None:
+        """Место тикета свободно (если он его занимал)."""
+        if n in self.data["slots"]:
+            self.data["slots"].remove(n)
+
+    def occupy(self, n: int) -> None:
+        if n not in self.data["slots"]:
+            self.data["slots"].append(n)
+
+    def costs(self, t: dict, st) -> tuple[float, list[str]]:
+        """Расход тикета по состоянию в ценах API: сессии, ревью оркестратора, дочерние прогоны
+        маршрута (`/verify`); итог и части для комментария."""
+        sessions = sum(r.get("cost") or 0 for r in t["runs"])
+        review = t["cost"].get("review") or 0
+        route = {k: v for k, v in (st["cost"] or {}).items() if k != "review"}
+        route = {k: v for k, v in route.items() if isinstance(v, (int, float)) and v}
+        parts = [f"сессии {sessions:.2f}", f"ревью {review:.2f}"]
+        parts += [f"{k} {v:.2f}" for k, v in route.items()]
+        return sessions + review + sum(route.values()), parts
+
+    # --- лицо агента ---
+
+    def app_token(self, *args: str) -> str:
+        res = run(sys.executable, str(HERE / "app-token"), *args)
+        if res.returncode != 0:
+            raise Failure(f"app-token {args[0]}: {tail(res.stderr or res.stdout)}")
+        return res.stdout
+
+    def login(self) -> None:
+        """Токен оркестратора — для всего GitHub в такте."""
+        if not self.app_id:
+            raise Failure(
+                f"App не настроен (`git config {APP_ID}`): отметку review ставить нечем — "
+                "docs/github-app.md"
+            )
+        out = self.app_token("issue", "--kind", "orchestrator", "--app-id", self.app_id)
+        try:
+            data = json.loads(out)
+            token, self.repo = data["token"], data["repo"]
+        except (ValueError, KeyError, TypeError):
+            raise Failure("app-token issue: ответ не по формату") from None
+        os.environ["GH_TOKEN"] = token
+
+    def session_env(self) -> dict:
+        """Окружение сессии внутри песочницы — раз за такт (файл и обёртки у мест общие): свежий
+        токен сессии App выдаёт Mac (`app-token refresh` в свой каталог), копия — в
+        `.git/canon-session/token` клона (`write_inside`), обёртки `gh` и git на неё ставит
+        `app-token shims` копии канона внутри. Итог — только переменные для `sbx exec -e`:
+        окружения Mac и токена оркестратора в нём нет."""
+        if self.env is not None:
+            return dict(self.env)
+        file = self.dir / "session-token"
+        common = ["--kind", "session", "--repo", self.repo, "--app-id", self.app_id]
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.app_token("refresh", *common, "--file", str(file))
+        write_inside(self.clone, INSIDE / "token", file.read_bytes())
+        inside = self.clone / INSIDE
+        shims = ["--file", str(inside / "token"), "--dir", str(inside / "bin")]
+        res = self.inside("python3", str(HERE / "app-token"), "shims", *shims)
+        if res.returncode != 0:
+            raise Failure(f"app-token shims в песочнице: {tail(res.stderr or res.stdout)}")
+        env = {}
+        for line in res.stdout.splitlines():
+            if line.startswith("export "):
+                name, _, value = shlex.split(line[len("export ") :])[0].partition("=")
+                env[name] = value
+        # Настройки канона, нужные маршруту внутри (`canon.agentApp` — свои комментарии App), —
+        # в git config главного чекаута, а в клоне их нет: внутрь — окружением git, только по
+        # списку (`SESSION_CONFIG`): прочие `canon.*` (цели прода, команды шаблона) — за границу
+        # не идут.
+        count = int(env.get("GIT_CONFIG_COUNT") or 0)
+        for key in SESSION_CONFIG:
+            if value := self.config(key):
+                env[f"GIT_CONFIG_KEY_{count}"], env[f"GIT_CONFIG_VALUE_{count}"] = key, value
+                count += 1
+        if count:
+            env["GIT_CONFIG_COUNT"] = str(count)
+        env[core.ORCHESTRATED] = "1"
+        self.env = env
+        return dict(env)
+
+    # --- песочница (#241) ---
+
+    def sbx(self, *args: str, timeout: float | None = None) -> subprocess.CompletedProcess:
+        """`sbx` на Mac — без токенов GitHub такта в окружении."""
+        try:
+            return subprocess.run(
+                ["sbx", *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=without_tokens(),
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            raise Failure("нет `sbx` (Docker Sandboxes) на PATH — docs/sandbox.md") from None
+        except subprocess.TimeoutExpired:
+            raise Failure(f"sbx {args[0]}: дольше {timeout} с") from None
+
+    def sandbox_entry(self) -> dict:
+        """Песочница проекта — граница сессий: есть, и смонтировано ровно клон и копия канона
+        только на чтение (`sandbox up`). Иначе — сбой: запускать некуда, или в песочницу попали
+        бы своё состояние, отчёты ревью или главный чекаут. Раз за такт."""
+        if self.entry is not None:
+            return self.entry
+        res = self.sbx("ls", "--json")
+        if res.returncode != 0:
+            raise Failure(f"sbx ls: {tail(res.stderr or res.stdout)} (вход — `sbx login`)")
+        try:
+            boxes = json.loads(res.stdout)
+        except ValueError:
+            raise Failure("sbx ls: ответ не JSON") from None
+        name = self.box.name
+        entry = next((b for b in boxes if isinstance(b, dict) and b.get("name") == name), None)
+        if entry is None:
+            raise Failure(f"песочницы {name} нет — `sandbox up` (docs/sandbox.md)")
+        mounts = list(entry.get("workspaces") or [])
+        if mounts != self.box.mounts:
+            raise Failure(
+                f"песочница {name} смонтирована иначе ({', '.join(mounts)}), а нужно ровно "
+                f"{', '.join(self.box.mounts)} — граница не та: `sandbox rm`, затем `sandbox up`"
+            )
+        self.entry = entry
+        return entry
+
+    def running(self) -> bool:
+        return self.sandbox_entry().get("status") == "running"
+
+    def inside(
+        self,
+        *cmd: str,
+        workdir: Path | None = None,
+        env: dict | None = None,
+        timeout: float | None = INSIDE_TIMEOUT,
+    ) -> subprocess.CompletedProcess:
+        """Команда внутри песочницы (`sbx exec`; остановленную он поднимает): окружение — только
+        `env`, окружение Mac внутрь не идёт."""
+        args = ["exec", *(["-w", str(workdir)] if workdir else [])]
+        for key, value in (env or {}).items():
+            args += ["-e", f"{key}={value}"]
+        self.sandbox_entry()
+        res = self.sbx(*args, self.box.name, *cmd, timeout=timeout)
+        self.entry["status"] = "running"
+        return res
+
+    def inner(self) -> list[dict]:
+        """Процессы `session-run` этой копии канона внутри песочницы, в клоне проекта: номер и
+        группа внутри, тикет, метка запуска (`--run`), id сессии (`--session-id` или
+        `--resume`), предел. Песочница остановлена — процессов нет. Раз за такт (после стопа —
+        заново); список не получен — сбой: живые сессии не принять за мёртвые."""
+        if self.procs is not None:
+            return self.procs
+        if not self.running():
+            self.procs = []
+            return self.procs
+        res = self.inside("python3", "-c", PROCS, str(HERE / "session-run"), timeout=120)
+        try:
+            rows = json.loads(res.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            why = tail(res.stderr or res.stdout)
+            raise Failure(f"процессы песочницы не прочитаны: {why}") from None
+        clone, found = self.clone.resolve(), []
+        for row in rows:
+            args = row.get("args") or []
+            cwd = row.get("cwd")
+            # Песочница — одного проекта; каталог — страховка (и чужой клон в тестах).
+            if not args or not args[0].isdigit() or not cwd or not Path(cwd).is_relative_to(clone):
+                continue
+            found.append(
+                {
+                    "pid": row["pid"],
+                    "pgid": row["pgid"],
+                    "ticket": int(args[0]),
+                    "run": flag_value(args, "--run"),
+                    "session": flag_value(args, "--resume") or flag_value(args, "--session-id"),
+                    "resumed": "--resume" in args,
+                    "budget": flag_value(args, "--max-budget-usd"),
+                }
+            )
+        self.procs = found
+        return found
+
+    def proc_of(self, run_: dict) -> dict | None:
+        """Процесс запуска внутри песочницы — по метке запуска."""
+        tag = run_.get("run")
+        return next((p for p in self.inner() if tag and p["run"] == tag), None)
+
+    def live(self, run_: dict) -> bool:
+        """Запуск жив: его `sbx exec` на Mac (номер и время старта те же — до старта процесса
+        внутри идёт только он) или его процессы внутри песочницы (метка запуска)."""
+        return alive(run_) or ("run" in run_ and self.proc_of(run_) is not None)
+
+    def kill_inside(self, pgid: int) -> bool:
+        """Группа процессов внутри песочницы: SIGTERM, через `KILL_WAIT` — SIGKILL. Итог — группы
+        больше нет."""
+        res = self.inside(
+            "python3", "-c", KILL, str(pgid), str(KILL_WAIT), timeout=3 * KILL_WAIT + 60
+        )
+        self.procs = None
+        return res.returncode == 0
+
+    def end_group(self, run_: dict) -> bool:
+        """Запуск завершается всей группой процессов внутри песочницы (агент, тесты,
+        dev-сервер), затем его `sbx exec` на Mac. Итог — ни того, ни другого больше нет."""
+        done = True
+        if "run" in run_ and (proc := self.proc_of(run_)) is not None:
+            done = self.kill_inside(proc["pgid"])
+        if alive(run_):
+            done = kill_group(run_["pid"]) and done
+        return done
+
+    def worktree(self, n: int) -> Path | None:
+        """Worktree тикета в клоне (`.claude/worktrees/ticket-N` — его заводит `session-start`
+        под оркестратором) — по каталогу, без git в клоне."""
+        path = self.clone / start.SESSION_WORKTREES / f"ticket-{n}"
+        return path if (path / ".git").exists() else None
+
+    def own_repo(self, refetch: bool = False) -> Path:
+        """Свой клон оркестратора (`canon-orchestrator/repo`, адрес `origin` главного чекаута):
+        ревью, отметка и догон — по веткам с GitHub, а не из клона сессий. `git fetch --prune` —
+        раз за такт (`refetch` — снова: ветку только что отправили)."""
+        path = self.dir / OWN_REPO
+        if self.fetched and not refetch:
+            return path
+        if not (path / ".git").is_dir():
+            url = core.run("git", "-C", str(self.main), "remote", "get-url", "origin")
+            if url.returncode != 0 or not url.stdout.strip():
+                raise Failure("у главного чекаута нет `origin` — своему клону неоткуда взяться")
+            shutil.rmtree(path, ignore_errors=True)
+            res = run("git", "clone", "-q", url.stdout.strip(), str(path), env=without_tokens())
+            if res.returncode != 0:
+                raise Failure(f"свой клон не создан: {tail(res.stderr)}")
+        res = self.git("fetch", "-q", "--prune", "origin")
+        if res.returncode != 0:
+            raise Failure(f"git fetch в своём клоне: {tail(res.stderr)}")
+        self.fetched = True
+        return path
+
+    def git(self, *args: str) -> subprocess.CompletedProcess:
+        """git в своём клоне."""
+        return run("git", "-C", str(self.dir / OWN_REPO), *args, env=without_tokens())
+
+    def remote_tip(self, branch: str) -> str:
+        """Head ветки на сервере по своему клону (после `fetch`); нет — пусто."""
+        res = self.git("rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}")
+        return res.stdout.strip() if res.returncode == 0 else ""
+
+    def ancestor(self, older: str, newer: str) -> bool:
+        return self.git("merge-base", "--is-ancestor", older, newer).returncode == 0
+
+    def checkout(self, kind: str, n: int, head: str, branch: str | None = None) -> Path:
+        """Свой чекаут head в своём клоне: `review` — отсоединённый, `mark` — на ветке тикета
+        (`ship-finish --mark` сверяет ветку на сервере с ней). Прошлый на этом месте — убран."""
+        path = self.dir / kind / f"ticket-{n}"
+        self.drop_checkout(path)
+        how = ["-B", branch] if branch else ["--detach"]
+        res = self.git("worktree", "add", "-q", "--force", *how, str(path), head)
+        if res.returncode != 0:
+            raise Failure(f"свой чекаут {head[:7]} не создан: {tail(res.stderr)}")
+        return path
+
+    def drop_checkout(self, path: Path) -> None:
+        self.git("worktree", "remove", "--force", str(path))
+        shutil.rmtree(path, ignore_errors=True)
+        self.git("worktree", "prune")
+
+    def publish(self, n: int, st: Route) -> str | None:
+        """Head «код готов» — на GitHub, чтобы ревью шло по ветке с сервера: `git push` изнутри
+        песочницы, из worktree тикета, токеном сессии, без force. Итог — причина сбоя или
+        None."""
+        head, branch = (st["ready"] or {}).get("head"), st.branch()
+        if not isinstance(head, str) or not SHA.fullmatch(head):
+            return f"head «код готов» в состоянии маршрута — не коммит: {head!r}"
+        worktree = self.worktree(n)
+        if worktree is None:
+            return "worktree тикета в клоне песочницы нет"
+        refspec = f"{head}:refs/heads/{branch}"
+        res = self.inside(
+            "git", "push", "-q", "origin", refspec, workdir=worktree, env=self.session_env()
+        )
+        if res.returncode != 0:
+            return f"`git push origin {refspec}` в песочнице: {tail(res.stderr or res.stdout)}"
+        self.own_repo(refetch=True)
+        if (tip := self.remote_tip(branch)) != head:
+            return f"ветка {branch} на сервере — {tip[:7] or 'нет'}, а не head {head[:7]}"
+        return None
+
+    def cleanup_inside(self, n: int, *args: str) -> subprocess.CompletedProcess:
+        """Уборка тикета изнутри песочницы — `session-run N --retire <head>` или `--discard`
+        копии канона: git клона, worktree и ресурсы проекта трогает только песочница."""
+        cmd = ["python3", str(HERE / "session-run"), str(n), *args]
+        return self.inside(*cmd, workdir=self.clone, env=self.session_env())
+
+    def prepare(self) -> None:
+        """Перед первым запуском такта: образы проекта и база-шаблон в песочнице (`images`,
+        `seed`)."""
+        if isinstance(self.prepared, Failure):
+            raise self.prepared  # сбой подготовки — один раз на такт, не на каждый тикет
+        if self.prepared:
+            return
+        try:
+            self.images()
+        except Failure as exc:
+            self.prepared = exc
+            raise
+        self.seed()
+        self.prepared = True
+
+    def images(self) -> None:
+        """Образы проекта (`canon.sandboxImages`, через запятую) — с Mac: сборка внутри не
+        проходит (прокси подменяет TLS, разведка #210). Сначала `canon.sandboxBuild` в своём
+        клоне на `origin/main` (кэш Docker пересоберёт только при смене зависимостей), затем образ
+        загружается внутрь (`docker save` → `docker load`), если его id на Mac сменился с прошлой
+        загрузки или внутри его нет. Сбой — сбой запуска: тикет остаётся в очереди."""
+        images = [x.strip() for x in self.config(IMAGES_KEY).split(",") if x.strip()]
+        if not images:
+            return
+        record = self.data.setdefault("sandbox", {})
+        own = self.own_repo()
+        base = self.git("rev-parse", "origin/main").stdout.strip()
+        build = self.config(BUILD_KEY)
+        on_mac = all(
+            run("docker", "image", "inspect", image, env=without_tokens()).returncode == 0
+            for image in images
+        )
+        if build and (record.get("built") != base or not on_mac):  # main тот же — сборка не нужна
+            res = self.git("checkout", "-q", "--force", "--detach", "origin/main")
+            if res.returncode != 0:
+                raise Failure(f"свой клон на origin/main: {tail(res.stderr)}")
+            try:
+                res = subprocess.run(
+                    ["sh", "-c", build],
+                    cwd=own,
+                    env=without_tokens(),
+                    capture_output=True,
+                    text=True,
+                    timeout=BUILD_TIMEOUT,
+                    stdin=subprocess.DEVNULL,
+                )
+            except subprocess.TimeoutExpired:
+                raise Failure(f"сборка образов дольше {BUILD_TIMEOUT // 60} мин") from None
+            if res.returncode != 0:
+                raise Failure(f"сборка образов (`{BUILD_KEY}`): {tail(res.stderr or res.stdout)}")
+            record["built"] = base
+        loaded = record.setdefault("images", {})
+        for image in images:
+            res = run("docker", "image", "inspect", "-f", "{{.Id}}", image, env=without_tokens())
+            if res.returncode != 0:
+                raise Failure(f"образа {image} на Mac нет: {tail(res.stderr)}")
+            have = res.stdout.strip()
+            inner = self.inside("docker", "image", "inspect", "-f", "{{.Id}}", image)
+            if loaded.get(image) == have and inner.returncode == 0:
+                continue
+            save = subprocess.Popen(
+                ["docker", "save", image], stdout=subprocess.PIPE, env=without_tokens()
+            )
+            try:
+                load = subprocess.run(
+                    ["sbx", "exec", "-i", self.box.name, "docker", "load"],
+                    stdin=save.stdout,
+                    capture_output=True,
+                    text=True,
+                    env=without_tokens(),
+                    timeout=BUILD_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                save.kill()
+                raise Failure(f"образ {image} не загружен за {BUILD_TIMEOUT // 60} мин") from None
+            finally:
+                save.stdout.close()
+            if save.wait() != 0 or load.returncode != 0:
+                raise Failure(f"образ {image} не загружен в песочницу: {tail(load.stderr)}")
+            loaded[image] = have
+            say(f"образ {image} загружен в песочницу ({have[:19]})")
+
+    def seed(self) -> None:
+        """База-шаблон на места — раз в местные сутки, перед первым запуском: вывод
+        `canon.sandboxSeedFrom` (на Mac, в главном чекауте — шаблон у Docker владельца) — на вход
+        `canon.sandboxSeedInto` (внутри песочницы, в клоне). Сбой — строка, не сбой запуска:
+        сессия идёт со старым шаблоном или без него; повтор — в следующие сутки."""
+        source, target = self.config(SEED_FROM_KEY), self.config(SEED_INTO_KEY)
+        record = self.data.setdefault("sandbox", {})
+        today = local_now().date().isoformat()
+        if not (source and target) or record.get("seeded") == today:
+            return
+        record["seeded"] = today
+        dump = subprocess.Popen(
+            ["sh", "-c", source], cwd=self.main, stdout=subprocess.PIPE, env=without_tokens()
+        )
+        try:
+            load = subprocess.run(
+                ["sbx", "exec", "-i", "-w", str(self.clone), self.box.name, "sh", "-c", target],
+                stdin=dump.stdout,
+                capture_output=True,
+                text=True,
+                env=without_tokens(),
+                timeout=BUILD_TIMEOUT,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            dump.kill()
+            load = subprocess.CompletedProcess([], 1, "", str(exc))
+        finally:
+            dump.stdout.close()
+        if dump.wait() != 0 or load.returncode != 0:
+            why = tail(load.stderr or load.stdout) or f"код {dump.returncode}"
+            return say(f"база-шаблон в песочницу не перенесена — {why}; сессии — без свежей")
+        say("база-шаблон перенесена в песочницу")
+
+    def config(self, key: str) -> str:
+        return core.run("git", "-C", str(self.main), "config", "--get", key).stdout.strip()
+
+    def sandbox_memory(self) -> float | None:
+        """Доступная память внутри песочницы (`MemAvailable`); песочница остановлена, её нет или
+        ответа нет — None: пауза по памяти — только по замеру."""
+        try:
+            if not self.running():
+                return None
+            res = self.inside("cat", "/proc/meminfo", timeout=60)
+        except Failure:
+            return None
+        return meminfo_available(res.stdout)
+
+    # --- GitHub ---
+
+    def comment(self, n: int, body: str) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=".comment-", suffix=".md")
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(body)
+        try:
+            core.gh("issue", "comment", str(n), "--body-file", tmp)
+        finally:
+            os.unlink(tmp)
+
+    def labels(self, n: int, add: tuple[str, ...] = (), remove: tuple[str, ...] = ()) -> None:
+        """Метки тикета. Снятие метки-команды, которая стоит (`present`), запоминается до
+        вызова: его событие `unlabeled` от App — своё, а не снятие команды сессией (`guard`)."""
+        args = [x for label in add for x in ("--add-label", label)]
+        args += [x for label in remove for x in ("--remove-label", label)]
+        for label in remove:
+            if (n, label) in self.present or (label in COMMANDS and not self.guarded):
+                self.data["own"].append({"n": n, "label": label, "at": stamp()})
+                self.present.discard((n, label))
+            if [n, label] in self.data["restored"]:
+                self.data["restored"].remove([n, label])
+        core.gh("issue", "edit", str(n), *args)
+        self.present |= {(n, label) for label in add if label in COMMANDS}
+
+    # --- такт ---
+
+    def tick(self) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with open(self.dir / "tick.lock", "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                say("идёт прошлый такт — этот пропущен")
+                return
+            self.data = self.read()
+            self.opened = self.env = None
+            self.present, self.guarded = set(), False
+            self.usage_checked = False
+            self.reset()
+            self.rotate_log()
+            # До App и долгих шагов (ревью ошибок): сбой `login` не уронит Mac в сон. Запись —
+            # сразу: иначе после сбоя `login` следующий такт поставил бы второй `caffeinate`.
+            awake = self.try_keep_awake()
+            self.save()
+            self.login()
+            errors = [awake] if awake else []
+            try:
+                errors += self.reconcile()
+                self.review_pauses()
+                errors += self.guard()
+                errors += self.commands()
+                errors += self.closed_stopped()
+                errors += self.intake()
+                errors += self.answered()
+                errors += self.prd_queue()
+                for n in list(self.data["slots"]):
+                    if n not in self.data["slots"]:
+                        continue
+                    try:  # сбой шага — по тикету: соседнее место идёт дальше
+                        self.advance(n)
+                    except (Failure, core.Failure, start.StartError, *COMMAND_ERRORS) as exc:
+                        errors.append(f"#{n}: {exc}")
+                        say(f"#{n}: шаг на месте не выполнен — {exc}")
+                errors += self.fill()
+            finally:
+                if awake := self.try_keep_awake():
+                    errors.append(awake)
+                self.save()
+            if errors:
+                raise Failure("; ".join(errors))
+
+    # --- надёжность ---
+
+    def reconcile(self) -> list[str]:
+        """Записанные запуски — против живых процессов `session-run` внутри песочницы (метка
+        запуска `--run`). Живой записанный — своя сессия (тикет снова на месте, если состояние
+        его потеряло). Живой незаписанный — **осиротевший** (такт упал после запуска, не записав
+        его): вся его группа процессов внутри завершается, запуск — в состояние с расходом худшим
+        случаем (его `--max-budget-usd`), тикет продолжает ту же сессию возобновлением со своего
+        шага. Второй сессии на тикет так не бывает: новая не начнётся, пока жива старая. Тикетов
+        нет — песочница не спрашивается; сбой — по тикету."""
+        errors, known = [], set()
+        if not self.data["tickets"]:
+            return errors
+        try:
+            procs = self.inner()
+        except Failure as exc:
+            return [f"сверка процессов песочницы: {exc}"]
+        for key, t in self.data["tickets"].items():
+            # Свой — любой записанный запуск, и с `ended`: группа, пережившая SIGKILL, уже
+            # записана и второй раз в расход не идёт.
+            known |= {r["run"] for r in t["runs"] if r.get("run")}
+            last = t["runs"][-1] if t["runs"] else None
+            if last and "ended" not in last and t["phase"] == "session" and self.live(last):
+                self.occupy(int(key))
+        for proc in procs:
+            n = proc["ticket"]
+            # Без метки `--run` — не запуск сессии (уборка `--retire`, `--discard`), чужой тикет —
+            # не трогаем.
+            if not proc["run"] or proc["run"] in known or str(n) not in self.data["tickets"]:
+                continue
+            t = self.ticket(n)
+            last = t["runs"][-1] if t["runs"] else None
+            try:
+                if not self.kill_inside(proc["pgid"]):
+                    raise Failure(f"процессы осиротевшей сессии {proc['pid']} пережили SIGKILL")
+                if last and "ended" not in last and self.live(last):
+                    # Записанный запуск тикета жив — лишний процесс (его могла запустить сама
+                    # сессия) только завершается: ни запуска в расход, ни второй очереди.
+                    say(f"#{n}: лишний процесс session-run (pid {proc['pid']}) завершён")
+                    continue
+                say(f"#{n}: осиротевшая сессия (pid {proc['pid']}) — процессы завершены")
+                self.adopt(n, self.ticket(n), proc)
+            except (Failure, core.Failure, *COMMAND_ERRORS) as exc:
+                errors.append(f"#{n} осиротевшая сессия: {exc}")
+                say(f"#{n}: осиротевшая сессия не разобрана — {exc}")
+        return errors
+
+    def adopt(self, n: int, t: dict, proc: dict) -> None:
+        """Запуск осиротевшей сессии — в состояние; тикет — к возобновлению той же сессии:
+        с шага «сессия» — первым в очередь (место — по правилам очереди); в очереди — там же;
+        на CI или мёрже шаг сам решит, что запускать. Предел из командной строки — только число
+        до `RUN_LIMIT` (процесс внутри могла запустить сама сессия), иначе — `RUN_LIMIT`."""
+        try:
+            given = float(proc["budget"] or "nan")
+        except ValueError:
+            given = float("nan")
+        budget = proc["budget"] if 0 < given <= RUN_LIMIT else str(RUN_LIMIT)
+        pattern = f"ticket-{n}-{(proc['session'] or '')[:8]}-*"
+        logs = sorted((self.dir / "logs").glob(pattern), key=lambda p: p.stat().st_mtime)
+        t["runs"].append(
+            {
+                "run": proc["run"],
+                "session": proc["session"],
+                "pid": None,  # номер внутри песочницы — не процесс Mac
+                "log": str(logs[-1]) if logs and proc["session"] else "",
+                "started": stamp(),
+                "ended": stamp(),
+                "budget": budget,
+                "resumed": proc["resumed"],
+                "cost": float(budget),
+                "cost_estimated": True,
+                "orphan": True,
+            }
+        )
+        if proc["session"]:
+            t["session"] = proc["session"]
+        if t["phase"] == "session":
+            self.requeue(n, t)
+
+    def requeue(self, n: int, t: dict) -> None:
+        """Тикет прерван не по своей вине (упор в лимит, осиротевшая сессия) — место свободно,
+        тикет первым в очереди: заняв место, возобновит ту же сессию с её шага."""
+        self.free(n)
+        t.update(phase="queued", requeued=stamp())
+        if n in self.data["queue"]:
+            self.data["queue"].remove(n)
+        self.data["queue"].insert(0, n)
+        self.labels(n, add=(QUEUED,))
+
+    # --- расход подписки и паузы ---
+
+    def set_pause(self, kind: str, reason: str, until: datetime | None = None) -> None:
+        """Пауза с причиной — в своё состояние (её показывает «статус»)."""
+        old = self.data["pauses"].get(kind) or {}
+        if old.get("reason") != reason:
+            say(f"пауза — {reason}")
+        self.data["pauses"][kind] = {
+            "reason": reason,
+            "until": until.isoformat(timespec="seconds") if until else None,
+            "since": old.get("since") or stamp(),
+        }
+
+    def clear_pause(self, kind: str) -> None:
+        if self.data["pauses"].pop(kind, None) is not None:
+            say(f"пауза снята ({kind})")
+
+    def review_pauses(self) -> None:
+        """Паузы на начало такта: истёкшие — сняты; «пауза» владельца, окно расписания, суточный
+        потолок, диск и память — заново по факту."""
+        for kind, pause in list(self.data["pauses"].items()):
+            until = parse_time(pause.get("until"))
+            if pause.get("until") and (until is None or now() >= until):
+                self.clear_pause(kind)
+        if self.owner_file(OWNER_NOW) is not None and self.override_until() is None:
+            (self.dir / OWNER_NOW).unlink(missing_ok=True)  # истёк или битый
+        if (paused := self.owner_file(OWNER_PAUSE)) is not None:
+            since = parse_time(paused.get("since"))
+            when = f" с {moment(since)}" if since else ""
+            self.set_pause("owner", f"пауза владельца{when} — снимет «работай сейчас»")
+        else:
+            self.clear_pause("owner")
+        if self.capacity() == 0:
+            until = self.boundary()
+            self.set_pause("schedule", f"вне окна расписания: мест 0 до {moment(until)}", until)
+        else:
+            self.clear_pause("schedule")
+        self.check_ceiling()
+        self.check_resources()
+
+    def owner_file(self, name: str) -> dict | None:
+        """Команда владельца («пауза», «работай сейчас») — файл в своём каталоге; нет — None."""
+        try:
+            data = json.loads((self.dir / name).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            data = {}
+        return data if isinstance(data, dict) else {}
+
+    def override_until(self) -> datetime | None:
+        """До какого времени действует «работай сейчас»; нет, истёк или файл битый — None."""
+        until = parse_time((self.owner_file(OWNER_NOW) or {}).get("until"))
+        return until if until is not None and now() < until else None
+
+    def capacity(self) -> int:
+        """Мест сейчас: окно расписания по местному времени; без расписания или после «работай
+        сейчас» — `canon.agentSlots`; вне окон — 0."""
+        if not self.windows or self.override_until() is not None:
+            return self.slots
+        current = local_now()
+        minute = current.hour * 60 + current.minute
+        for begin, end, places in self.windows:
+            through_midnight = end <= begin
+            if (begin <= minute < end) or (through_midnight and (minute >= begin or minute < end)):
+                return places
+        return 0
+
+    def boundary(self) -> datetime | None:
+        """Ближайшая граница окна расписания (начало или конец); расписания нет — None."""
+        if not self.windows:
+            return None
+        # Местное время без пояса: в день перевода часов граница — по часам на стене.
+        current = local_now().replace(second=0, microsecond=0, tzinfo=None)
+        minute = current.hour * 60 + current.minute
+        edges = {edge % (24 * 60) for begin, end, _ in self.windows for edge in (begin, end)}
+        step = min((edge - minute - 1) % (24 * 60) + 1 for edge in edges)
+        return (current + timedelta(minutes=step)).astimezone()
+
+    def observe(
+        self,
+        event: dict | None,
+        rejected: bool = True,
+        since: str | None = None,
+        ping: bool = False,
+    ) -> None:
+        """`rate_limit_event` потока: доля недельного лимита — в своё состояние; точка отсчёта
+        суток — первое значение суток или после сброса недели, но не из запуска, начатого до
+        полуночи (`since`): его вчерашний расход выпал бы из потолка — отсчёт даст пинг.
+        Свежесть доли (`at`) ставит только пинг: событие потока могло прийти час назад.
+        `rejected` (упор в лимит) — пауза до сброса окна."""
+        info = (event or {}).get("rate_limit_info") or {}
+        week = (info.get("unifiedWindows") or {}).get("seven_day") or {}
+        value, resets = week.get("utilization"), week.get("resetsAt")
+        if isinstance(value, (int, float)):
+            usage = self.data.get("usage") or {}
+            if usage.get("resets") == resets and usage.get("week", 0) > value:
+                value = usage["week"]  # потоки двух мест: доля аккаунта только растёт
+            at = stamp() if ping else usage.get("at")
+            self.data["usage"] = {"week": value, "resets": resets, "at": at}
+            day = self.data.get("day") or {}
+            today = local_now().date().isoformat()
+            started = parse_time(since)
+            old_run = started is not None and started < local_midnight()
+            if day.get("resets") != resets or (day.get("date") != today and not old_run):
+                self.data["day"] = {"date": today, "base": value, "resets": resets}
+        if rejected and info.get("status") == "rejected":
+            self.limit_pause(info.get("rateLimitType"), info.get("resetsAt"))
+
+    def hit_limit(self, hit: dict | None) -> None:
+        """Упор в лимит из итога потока (`stream_text`): пауза, если её ещё не поставило
+        событие `rejected` того же потока (`observe` — со временем сброса)."""
+        if hit and "limit" not in self.data["pauses"]:
+            self.limit_pause(hit["window"], hit["resets"])
+
+    def limit_pause(self, window: str | None, resets) -> None:
+        """Упор в лимит подписки — пауза до сброса окна (без него — `LIMIT_WAIT`); не сбой."""
+        if isinstance(resets, (int, float)):
+            until = datetime.fromtimestamp(resets, timezone.utc).astimezone()
+        else:
+            until = now() + timedelta(seconds=LIMIT_WAIT)
+        what = f" (окно `{window}`)" if window else ""
+        self.set_pause("limit", f"лимит подписки{what} — до сброса {moment(until)}", until)
+
+    def check_ceiling(self) -> None:
+        """Суточный потолок: доля недели за сутки (от точки отсчёта) ≥ `canon.agentCeiling` —
+        пауза до следующих суток; ниже (неделя сбросилась, потолок подняли) — пауза снята."""
+        usage, day = self.data.get("usage") or {}, self.data.get("day") or {}
+        if day.get("date") != local_now().date().isoformat() or "week" not in usage:
+            return
+        spent = usage["week"] - day["base"]
+        if spent < self.ceiling - 1e-9:  # доли с шагом 0.01: 0.30 − 0.10 в float — чуть меньше 0.2
+            return self.clear_pause("ceiling")
+        midnight = local_midnight(days=1)
+        self.set_pause(
+            "ceiling",
+            f"суточный потолок {self.ceiling:.0%} недельного лимита: за сутки {spent:.0%} — "
+            f"до суток {moment(midnight)}",
+            midnight,
+        )
+
+    def fresh_usage(self) -> None:
+        """Перед новым местом — свежая доля лимита: старше `USAGE_FRESH` или точки отсчёта этих
+        суток нет — пинг `claude -p` без инструментов и настроек; затем снова суточный потолок."""
+        at = (self.data.get("usage") or {}).get("at")
+        today = (self.data.get("day") or {}).get("date") == local_now().date().isoformat()
+        if at and today and seconds_since(at) <= USAGE_FRESH:
+            return self.check_ceiling()
+        real = shutil.which("claude", path=self.plain_path())
+        if real is None:
+            raise Failure("не найден `claude` на PATH — доля лимита подписки не проверена")
+        cmd = [real, *PING, *STREAM, "ok"]
+        try:
+            res = run(*cmd, cwd=self.dir, env=without_tokens(), timeout=PING_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise Failure(f"пинг лимита подписки не ответил за {PING_TIMEOUT} с") from None
+        summary = stream_text(res.stdout)
+        self.observe(summary["rate_limit"], ping=True)
+        self.hit_limit(summary["limit"])
+        if summary["rate_limit"] is None and not summary["limit"]:
+            raise Failure(f"пинг лимита подписки без `rate_limit_event`: {summary['result']}")
+        self.check_ceiling()
+
+    def plain_path(self) -> str:
+        """PATH без своих обёрток (`review-bin`, `bin`)."""
+        own = {str(self.dir / "review-bin"), str(self.dir / "bin")}
+        paths = os.environ.get("PATH", "").split(os.pathsep)
+        return os.pathsep.join(p for p in paths if p not in own)
+
+    def check_resources(self) -> None:
+        """Свободный диск Mac и доступная память внутри песочницы (у неё свой предел памяти, а
+        сессии идут в ней) ниже порога — пауза очереди с причиной."""
+        problems = []
+        disk = free_gb("DISK", lambda: shutil.disk_usage(self.main).free)
+        if disk is not None and disk < MIN_DISK_GB:
+            problems.append(f"мало места на диске: свободно {disk:.1f} ГБ, нужно {MIN_DISK_GB}")
+        memory = free_gb("MEMORY", self.sandbox_memory)
+        if memory is not None and memory < MIN_MEMORY_GB:
+            problems.append(
+                f"мало памяти в песочнице: доступно {memory:.1f} ГБ, нужно {MIN_MEMORY_GB}"
+            )
+        if problems:
+            self.set_pause("resources", "; ".join(problems))
+        else:
+            self.clear_pause("resources")
+
+    def hold(self, n: int, what: str) -> bool:
+        """Пауза держит и запуски начатых тикетов (кроме паузы по ресурсам): `what` ждёт её конца,
+        шаг тикета повторится на следующем такте."""
+        found = [p for k, p in self.data["pauses"].items() if k in HOLDING]
+        if found:
+            say(f"#{n}: {what} ждёт конца паузы — {found[0]['reason']}")
+        return bool(found)
+
+    def owner_pause(self) -> None:
+        """«Пауза» владельца: новые тикеты не брать, начатые — до ближайшей остановки (конца
+        запуска); снимает «работай сейчас»."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        (self.dir / OWNER_NOW).unlink(missing_ok=True)
+        write_json(self.dir / OWNER_PAUSE, {"since": stamp()})
+        say("пауза: новые тикеты не берутся, начатые идут до конца своего запуска")
+
+    def owner_now(self) -> None:
+        """«Работай сейчас»: «пауза» снята, расписание переопределено до ближайшей границы окна
+        (`canon.agentSlots` мест). Суточный потолок, лимит подписки и ресурсы — не снимает."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        (self.dir / OWNER_PAUSE).unlink(missing_ok=True)
+        if (until := self.boundary()) is not None:
+            write_json(self.dir / OWNER_NOW, {"until": until.isoformat(timespec="seconds")})
+            return say(f"работай сейчас: {self.slots} мест до {moment(until)}, пауза снята")
+        say("работай сейчас: пауза снята")
+
+    # --- служба, «статус», caffeinate (#222) ---
+
+    def awake_needed(self) -> bool:
+        """Mac нужен бодрым: занято место, или есть очередь либо вопрос владельцу (его ответ
+        берёт такт) в рабочем окне — мест по расписанию больше нуля и каждая пауза кончится сама
+        не позже `AWAKE_HORIZON`. «Пауза» владельца и нехватка ресурсов — без срока: не держат."""
+        if self.data["slots"]:
+            return True
+        waiting = any(t.get("phase") == "question" for t in self.data["tickets"].values())
+        if not (self.data["queue"] or waiting) or self.capacity() == 0:
+            return False
+        horizon = now() + timedelta(seconds=AWAKE_HORIZON)
+        for pause in self.data["pauses"].values():
+            until = parse_time(pause.get("until"))
+            if until is None or until > horizon:
+                return False
+        return True
+
+    def keep_awake(self) -> None:
+        """`caffeinate`, пока Mac нужен бодрым (`awake_needed`); не нужен — отпущен. Срок у него
+        свой (`AWAKE_FOR`, дольше ревью ошибок внутри такта): старше `AWAKE_RENEW` — такт ставит
+        новый и отпускает старый, а без тактов Mac снова уснёт сам. Зовётся в начале такта (до
+        App и долгих шагов) и в конце; битая запись `awake` — как её нет."""
+        need = self.awake_needed()
+        old = self.data.get("awake")
+        try:
+            live = old if isinstance(old, dict) and alive(old) else None
+            recent = live is not None and seconds_since(live["started"]) < AWAKE_RENEW
+        except (KeyError, TypeError, ValueError):
+            live, recent = None, False
+        if need and recent:
+            return
+        self.release_awake(live)
+        self.data.pop("awake", None)
+        if not need:
+            return
+        real = shutil.which("caffeinate", path=self.plain_path())
+        if real is None:
+            return say("нет `caffeinate` — Mac может уснуть посреди работы")
+        proc = subprocess.Popen(
+            [real, *AWAKE, "-t", str(AWAKE_FOR)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.data["awake"] = {
+            "pid": proc.pid,
+            "pid_started": started_at(proc.pid),
+            "started": stamp(),
+        }
+        if old is None:
+            say("caffeinate: Mac не уснёт, пока есть работа")
+
+    def try_keep_awake(self) -> str | None:
+        """`keep_awake` без падения такта: итог — текст сбоя или None."""
+        try:
+            self.keep_awake()
+        except COMMAND_ERRORS as exc:
+            return f"caffeinate: {exc}"
+        return None
+
+    def release_awake(self, entry: dict | None) -> None:
+        """Отпустить `caffeinate` записи `awake` (если он ещё тот же процесс)."""
+        if isinstance(entry, dict) and alive(entry):
+            try:
+                os.kill(entry["pid"], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    def rotate_log(self) -> None:
+        """Лог службы больше `LOG_LIMIT` — в `service.log.1` (прошлый затирается): `launchd`
+        открывает файл заново на каждый такт, следующий пишет в новый."""
+        log = self.dir / SERVICE_LOG
+        try:
+            if log.stat().st_size > LOG_LIMIT:
+                log.replace(log.with_name(SERVICE_LOG + ".1"))
+        except OSError:
+            pass
+
+    def status(self) -> None:
+        """«Статус» владельцу: тикеты оркестратора строками `ticket status` (шаг маршрута, PR,
+        CI — живые из GitHub) со своим шагом, кого ждём и расходом; места, очередь, паузы с
+        причинами, доля лимита подписки, служба. Только читает: ни замка такта, ни токена App."""
+        rows = []
+        for key in sorted(self.data["tickets"], key=int):
+            n, t = int(key), self.data["tickets"][key]
+            st = self.route(n)
+            ticket, step, wait, url, _, checks, _, since = table.row(core, st.data)
+            if t["phase"] == "queued":
+                wait, since = "место", duration(t.get("requeued") or t.get("queued"))
+            elif t["phase"] in ("question", "stopped"):
+                wait = "владелец"
+            spent, _ = self.costs(t, st)
+            if st.step is None:
+                step = "—"
+            row = (ticket, self.where(n, t), step, wait, url, checks, f"{spent:.2f} USD", since)
+            rows.append(tuple(cell(x) for x in row))
+        header = ("Тикет", "Оркестратор", "Шаг маршрута", "Ждём", "PR", "CI", "Расход", "На шаге")
+        if rows:
+            table.table(core, header, rows)
+        else:
+            say("тикетов нет")
+        busy = ", ".join(f"#{n}" for n in self.data["slots"])
+        places = self.capacity()
+        print(
+            f"\nМеста: занято {len(self.data['slots'])} из {places}"
+            + (f" ({busy})" if busy else "")
+        )
+        queue = ", ".join(f"#{n}" for n in self.data["queue"])
+        print(f"Очередь: {queue or 'пусто'}")
+        for p in self.data["prds"]:
+            print(f"Очередь PRD: #{p}")
+        print("Пауза: " + ("; ".join(self.current_pauses().values()) or "нет"))
+        if (until := self.override_until()) is not None:
+            print(f"Работай сейчас: до {moment(until)}")
+        usage, day = self.data.get("usage") or {}, self.data.get("day") or {}
+        if isinstance(usage.get("week"), (int, float)):
+            today = ""
+            if day.get("date") == local_now().date().isoformat():
+                spent = usage["week"] - day["base"]
+                today = f", за сутки {spent:.0%} из потолка {self.ceiling:.0%}"
+            at = parse_time(usage.get("at"))
+            print(
+                f"Лимит подписки: неделя {usage['week']:.0%}{today}"
+                + (f" (замер {moment(at)})" if at else "")
+            )
+        last = parse_time(self.data.get("updated"))
+        print(f"Последний такт: {moment(last) if last else 'не было'}")
+        print(f"Служба: {self.service_state()}")
+        print(f"Песочница: {self.sandbox_state()}")
+        awake = self.data.get("awake")
+        held = isinstance(awake, dict) and alive(awake)
+        print(f"Mac не уснёт: {'да (caffeinate)' if held else 'нет'}")
+
+    def sandbox_state(self) -> str:
+        """Песочница проекта для «статуса»: имя и `running`/`stopped`, или почему её нет."""
+        try:
+            return f"{self.box.name} — {self.sandbox_entry().get('status')}"
+        except Failure as exc:
+            return str(exc)
+
+    def current_pauses(self) -> dict[str, str]:
+        """Паузы на сейчас для «статуса»: истёкшие (`until` прошло) не показываются; «пауза»
+        владельца — по её файлу; пауза расписания — по окну сейчас и «работай сейчас»: такт
+        применит их на своей минуте, а «статус» не должен врать до него."""
+        pauses = {}
+        for kind, pause in self.data["pauses"].items():
+            until = parse_time(pause.get("until"))
+            if pause.get("until") and (until is None or now() >= until):
+                continue
+            pauses[kind] = pause["reason"]
+        if self.owner_file(OWNER_PAUSE) is None:
+            pauses.pop("owner", None)
+        else:
+            pauses.setdefault("owner", "пауза владельца — снимет «работай сейчас»")
+        if self.capacity() > 0:
+            pauses.pop("schedule", None)
+        else:
+            until = self.boundary()
+            pauses.setdefault("schedule", f"вне окна расписания: мест 0 до {moment(until)}")
+        return pauses
+
+    def where(self, n: int, t: dict) -> str:
+        """Шаг тикета у оркестратора для «статуса»: место, место в очереди, вопрос, остановка."""
+        phase = t.get("phase")
+        if phase == "queued" and n in self.data["queue"]:
+            return f"очередь {self.data['queue'].index(n) + 1}"
+        if phase == "stopped":
+            reason = " ".join(str(t.get("reason") or "").split())
+            return "остановлен: " + (reason if len(reason) <= 60 else reason[:60] + "…")
+        name = PHASES.get(phase, phase or "—")
+        return f"место, {name}" if n in self.data["slots"] else name
+
+    def service_label(self) -> str:
+        """Метка службы `launchd`: своя у каждого проекта — копия канона одна на машине."""
+        slug = re.sub(r"[^A-Za-z0-9-]+", "-", self.main.name).strip("-") or "project"
+        digest = hashlib.sha1(str(self.main).encode("utf-8")).hexdigest()[:8]
+        return f"canon.orchestrator.{slug}-{digest}"
+
+    def service_plist(self) -> Path:
+        return Path.home() / LAUNCH_AGENTS / f"{self.service_label()}.plist"
+
+    def service_target(self) -> tuple[str, str]:
+        """Домен пользователя `launchd` и полное имя службы в нём."""
+        domain = f"gui/{os.getuid()}"
+        return domain, f"{domain}/{self.service_label()}"
+
+    def launchctl(self, *args: str) -> subprocess.CompletedProcess:
+        try:
+            return run("launchctl", *args)
+        except OSError as exc:
+            raise Failure(f"launchctl: {exc}") from None
+
+    def service_loaded(self) -> bool:
+        return self.launchctl("print", self.service_target()[1]).returncode == 0
+
+    def service_state(self) -> str:
+        """Стоит ли служба — по `launchctl print`, а не по файлу plist."""
+        try:
+            loaded = self.service_loaded()
+        except Failure:
+            return "неизвестно (нет `launchctl`)"
+        if loaded:
+            return "стоит"
+        if self.service_plist().exists():
+            return "не загружена (plist есть) — `orchestrator service install`"
+        return "не стоит"
+
+    def service_unload(self) -> None:
+        """`launchctl bootout` и ожидание, пока служба выгрузится (`bootout` идущего задания
+        кончается не сразу); не стояла — не сбой; не выгрузилась за `KILL_WAIT` — сбой."""
+        self.launchctl("bootout", self.service_target()[1])
+        deadline = time.monotonic() + KILL_WAIT
+        while self.service_loaded():
+            if time.monotonic() >= deadline:
+                raise Failure(f"служба {self.service_label()} не снялась (`launchctl bootout`)")
+            time.sleep(0.2)
+
+    def tick_lock(self):
+        """Замок такта для команд службы: `bootout` убил бы идущий такт посреди ревью ошибок,
+        не дав ему записать состояние, — сначала дождаться его конца."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        lock = open(self.dir / "tick.lock", "a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            say("идёт такт — ждём его конца (ревью ошибок — до часа)")
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        return lock
+
+    def service_install(self) -> None:
+        """Служба ставится (или переставляется) одной командой: plist из образца рядом со
+        скриптом — этот Python и эта копия канона, главный чекаут проекта, PATH установки (без
+        своих обёрток), лог в своём каталоге; затем `launchctl bootstrap` в домен пользователя.
+        Под замком такта: прошлая версия снимается не посреди такта."""
+        path = self.plain_path()
+        missing = [tool for tool in SERVICE_TOOLS if shutil.which(tool, path=path) is None]
+        if missing:
+            names = ", ".join(f"`{tool}`" for tool in missing)
+            raise Failure(
+                f"нет {names} на PATH — такт службы их не нашёл бы; поставьте и повторите"
+            )
+        try:
+            data = plistlib.loads((HERE / PLIST).read_bytes())
+        except (OSError, plistlib.InvalidFileException) as exc:
+            raise Failure(f"образец службы {HERE / PLIST}: {exc}") from None
+        log = str(self.dir / SERVICE_LOG)
+        data.update(
+            Label=self.service_label(),
+            ProgramArguments=[sys.executable, str(HERE / "orchestrator"), "tick"],
+            WorkingDirectory=str(self.main),
+            StandardOutPath=log,
+            StandardErrorPath=log,
+        )
+        data.setdefault("EnvironmentVariables", {})["PATH"] = path
+        plist = self.service_plist()
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        domain, target = self.service_target()
+        with self.tick_lock():
+            self.service_unload()  # прошлая версия
+            plist.write_bytes(plistlib.dumps(data))
+            self.launchctl("enable", target)
+            res = self.launchctl("bootstrap", domain, str(plist))
+            if res.returncode != 0:
+                raise Failure(f"launchctl bootstrap: {tail(res.stderr or res.stdout)}")
+        say(f"служба стоит: такт раз в минуту, при входе и после перезагрузки; лог — {log}")
+        say("снять — `orchestrator service remove`; Mac — на зарядке, крышка открыта")
+
+    def service_remove(self) -> None:
+        """Служба снимается одной командой: под замком такта `launchctl bootout`, plist
+        удалён. Уже снята — не сбой. `caffeinate` не отпускается: сессии, начатые раньше,
+        доживают свой запуск, а он кончится сам (`AWAKE_FOR`)."""
+        with self.tick_lock():
+            self.service_unload()
+            self.service_plist().unlink(missing_ok=True)
+        say("служба снята: такты больше не идут; сессии, начатые раньше, доживут свой запуск")
+
+    def commands(self) -> list[str]:
+        """`agent:stop` и `agent:retry` на тикетах, которые ведёт оркестратор. Тикет не его (ручная
+        сессия, уже слит) — метка снимается с комментарием: иначе она сработала бы на тикете,
+        когда его позже возьмут. Сбой команды — по тикету: метка остаётся (следующий такт
+        повторит), остальной такт идёт; итог — сбои для кода выхода."""
+        errors = []
+        for label, act in ((STOP, self.halt), (RETRY, self.retry)):
+            query = ["--label", label, "--state", "open", "--json", "number", "--limit", "100"]
+            for issue in sorted(
+                core.gh_json("issue", "list", *query) or [], key=lambda i: i["number"]
+            ):
+                n = issue["number"]
+                try:
+                    if self.refused(n, label):
+                        continue
+                    if str(n) in self.data["tickets"]:
+                        act(n, self.ticket(n))
+                    elif str(n) in self.data["prds"]:
+                        self.prd_command(n, label)
+                    else:
+                        self.labels(n, remove=(label,))
+                        self.comment(
+                            n,
+                            f"Оркестратор: метка `{label}` снята — тикет не ведёт оркестратор "
+                            "(ручная сессия или уже слит), команда не выполнена.",
+                        )
+                        say(f"#{n}: {label} — тикет не ведёт оркестратор, метка снята")
+                except (Failure, core.Failure, start.StartError, *COMMAND_ERRORS) as exc:
+                    errors.append(f"#{n} {label}: {exc}")
+                    say(f"#{n}: {label} не выполнена — {exc}")
+        return errors
+
+    def end_run(self, t: dict) -> bool | None:
+        """Живой запуск — завершить всей группой процессов; итог запуска — в состояние. Итог:
+        None — запуск не шёл, True — завершён, False — группа пережила SIGKILL. У завершённого
+        итога `result` в потоке нет — расход записывается худшим случаем, его
+        `--max-budget-usd`: иначе стоп и продолжение обходили бы предел тикета."""
+        if not t["runs"]:
+            return None
+        last = t["runs"][-1]
+        killed = self.end_group(last) if self.live(last) else None
+        self.finish_run(t, last)
+        if killed is not None:
+            budget = float(last.get("budget") or RUN_LIMIT)
+            last.update(cost=max(last.get("cost") or 0, budget), cost_estimated=True)
+        return killed
+
+    def draft(self, st, on: bool) -> None:
+        """Открытый PR тикета — в черновик (`on`) или из него. Черновик не сливается и с
+        включённым авто-мёржем: остановленный PR не сольётся сам; `ship-finish --mark` черновик
+        снимает."""
+        if not st["pr"]:
+            return
+        pr = self.pr(st)
+        if pr.get("state") == "OPEN" and bool(pr.get("isDraft")) != on:
+            core.gh("pr", "ready", st["pr"], *(["--undo"] if on else []))
+
+    def halt(self, n: int, t: dict) -> None:
+        """`agent:stop`: запуск завершается, открытый PR — в черновик, отчёт об остановке; ветка
+        и PR сохраняются. Уже остановленный (другой причиной — авто-мёрж мог остаться включён) —
+        черновик и снять метку."""
+        st = self.route(n)
+        self.draft(st, True)
+        if t["phase"] == "stopped":
+            return self.labels(n, remove=(STOP,))
+        if n in self.data["queue"]:
+            self.data["queue"].remove(n)
+        last = t["runs"][-1] if t["runs"] else None
+        if t["phase"] == "session" and last and "ended" not in last and not self.live(last):
+            # Сессия кончилась между тактами, её итог ещё не разобран: свой отчёт сессии — без
+            # второго; иначе стоп с шагом `settle` — `agent:go` разберёт итог без нового запуска.
+            self.finish_run(t, last)
+            if st.step == "stopped":
+                self.labels(n, add=(STOPPED,), remove=(STOP,))
+                t.update(phase="stopped", resume="session", pings=t["pings"] + 1)
+                return self.free(n)
+            t["phase"] = "settle"
+            why = f"сессия уже кончилась (шаг маршрута «{st.step}»), её итог не разобран"
+        elif t["phase"] == "question":
+            why = "сессия кончилась с вопросом и ждала ответа владельца"
+        else:
+            why = ended(self.end_run(t))
+        self.stop(n, t, f"владелец поставил `{STOP}` — {why}", remove=(STOP, QUEUED))
+
+    def retry(self, n: int, t: dict) -> None:
+        """`agent:retry`: с чистого листа. Каждый шаг повторим — сбой посреди оставляет метку, и
+        следующий такт доделает."""
+        if self.end_run(t) is False:
+            raise Failure(f"#{n}: процессы сессии не завершились и за SIGKILL — повтор не начат")
+        st = self.route(n)
+        spent, _ = self.costs(t, st)  # прошлая попытка — в мерах сводки PRD, не в пределе тикета
+        branch = st.branch()
+        if st["pr"] and self.pr(st).get("state") == "OPEN":
+            core.gh("pr", "close", st["pr"], "--comment", RETRY_NOTE)
+        self.own_repo()
+        remote = self.git("ls-remote", "--exit-code", "origin", f"refs/heads/{branch}")
+        if remote.returncode == 0:
+            core.gh("api", "-X", "DELETE", f"repos/{self.repo}/git/refs/heads/{branch}")
+        elif remote.returncode != 2:  # 2 — ссылки нет; прочее — сбой, а не «ветки нет»
+            raise Failure(f"#{n}: ветка {branch} на сервере не проверена: {tail(remote.stderr)}")
+        # Worktree с ресурсами проекта, ветка и состояние маршрута — изнутри песочницы.
+        res = self.cleanup_inside(n, "--discard")
+        if res.returncode != 0:
+            raise Failure(f"#{n}: уборка в песочнице: {tail(res.stderr or res.stdout)}")
+        for suffix in (".json", ".md"):
+            self.own_report(n).with_suffix(suffix).unlink(missing_ok=True)
+        self.labels(n, add=(QUEUED,), remove=(RETRY, STOPPED, HUMAN, start.IN_PROGRESS))
+        if n in self.data["queue"]:
+            self.data["queue"].remove(n)
+        self.data["queue"].append(n)
+        before = t.get("before") or {}
+        renewed = fresh(prd=t.get("prd"))
+        renewed["before"] = {
+            "pings": before.get("pings", 0) + t["pings"],
+            "runs": before.get("runs", 0) + len(t["runs"]),
+            "cost": round(before.get("cost", 0) + spent, 4),
+        }
+        self.data["tickets"][str(n)] = renewed
+        self.free(n)
+        say(f"#{n}: повтор — с чистого листа, в очереди")
+
+    def resume_stopped(self, n: int, t: dict) -> None:
+        """`agent:go` на остановленном: черновик PR снят, метки остановки — тоже, тикет в очередь;
+        шаг, на котором он встал, помнит `resume`. Остановлен, ожидая ответа на вопрос, — снова
+        ждёт ответа (метка `ready-for-human` остаётся): запуск без ответа был бы впустую."""
+        if t.get("resume") == "question":
+            self.labels(n, remove=(GO, STOPPED))
+            t["phase"] = "question"
+            t.pop("resume", None)
+            return say(f"#{n}: продолжение после остановки — снова ждёт ответа на вопрос")
+        if t.get("behind"):  # основа ушла: черновик держит старый head до догона (`catch_up`)
+            t["undraft"] = True
+        else:
+            self.draft(self.route(n), False)
+        self.labels(n, add=(QUEUED,), remove=(GO, STOPPED, HUMAN))
+        t.update(phase="queued", requeued=stamp())
+        if n not in self.data["queue"]:
+            self.data["queue"].append(n)
+        say(f"#{n}: продолжение после остановки — в очереди")
+
+    def labeler(self, n: int, label: str) -> dict:
+        """Кто поставил метку: автор последнего события `labeled` с ней (REST, все страницы по
+        100); события нет — пустой."""
+        actor, page = {}, 1
+        while True:
+            path = f"repos/{self.repo}/issues/{n}/events?per_page=100&page={page}"
+            batch = core.gh_json("api", path) or []
+            for event in batch:
+                if (
+                    event.get("event") == "labeled"
+                    and (event.get("label") or {}).get("name") == label
+                ):
+                    actor = event.get("actor") or {}
+            if len(batch) < 100:
+                return actor
+            page += 1
+
+    def is_owner(self, actor: dict) -> bool:
+        """Автор события — пользователь-владелец репозитория."""
+        return actor.get("login") == self.repo.split("/")[0] and actor.get("type") == "User"
+
+    def guard(self) -> list[str]:
+        """Снятие метки-команды не владельцем — метка возвращается, в тикете причина без
+        упоминания (решение владельца 19.10 в #248): токен сессии App снял бы `agent:stop`
+        владельца до такта, и сессия шла бы дальше. Снятие владельцем — как раньше. Новые
+        события — по всему репозиторию (`issues/events`, от новых к старым) после последнего
+        разобранного (`events` в состоянии); первый такт только запоминает, где история
+        кончилась. Своё снятие (`own`, три разбора) — не чужое. Возвращается только метка,
+        которую последней поставил владелец: метку App, снятую им же, возвращать незачем. Сбой —
+        повтор на следующем такте с того же события; итог — сбои."""
+        commands = {}
+        try:
+            for label in COMMANDS:
+                query = ["--label", label, "--state", "open", "--json", "number", "--limit", "100"]
+                for issue in core.gh_json("issue", "list", *query) or []:
+                    commands.setdefault(issue["number"], set()).add(label)
+                    self.present.add((issue["number"], label))
+            self.guarded = True
+            fresh_events = self.new_events()
+        except (Failure, core.Failure, *COMMAND_ERRORS) as exc:
+            say(f"события меток не прочитаны — {exc}")
+            return [f"события меток: {exc}"]
+        keep = list(self.data["own"])
+        errors = []
+        for event in fresh_events:
+            label = (event.get("label") or {}).get("name")
+            n = (event.get("issue") or {}).get("number")
+            actor = event.get("actor") or {}
+            if event.get("event") != "unlabeled" or label not in COMMANDS or not n:
+                continue
+            if self.is_owner(actor):
+                continue
+            own = next((o for o in keep if (o["n"], o["label"]) == (n, label)), None)
+            if own is not None and actor.get("type") == "Bot":
+                keep.remove(own)
+                continue
+            if label in commands.get(n, ()):
+                continue  # уже снова стоит
+            try:
+                if not self.is_owner(self.labeler(n, label)):
+                    continue  # ставил не владелец: снятие команды не отменяет
+                who = actor.get("login") or "неизвестно кто"
+                self.labels(n, add=(label,))
+                if [n, label] not in self.data["restored"]:
+                    self.data["restored"].append([n, label])
+                commands.setdefault(n, set()).add(label)
+                self.comment(
+                    n,
+                    f"Оркестратор: метка `{label}` возвращена — её снял `{who}`, а не владелец "
+                    "репозитория. Снять команду может только владелец.",
+                )
+                say(f"#{n}: {label} снял {who}, не владелец — метка возвращена")
+            except (Failure, core.Failure, *COMMAND_ERRORS) as exc:
+                errors.append(f"#{n} снятие {label}: {exc}")
+                say(f"#{n}: снятие {label} не разобрано — {exc}")
+        for o in keep:
+            o["seen"] = o.get("seen", 0) + 1
+        self.data["own"] = [o for o in keep if o["seen"] < OWN_KEEP]
+        if fresh_events:
+            self.data["events"] = max(e["id"] for e in fresh_events)
+        return errors
+
+    def new_events(self) -> list[dict]:
+        """События тикетов репозитория после последнего разобранного — от старых к новым. Первый
+        раз — пусто, запоминается последнее."""
+        last, found, page = self.data.get("events"), [], 1
+        while page <= EVENT_PAGES:
+            path = f"repos/{self.repo}/issues/events?per_page=100&page={page}"
+            batch = core.gh_json("api", path) or []
+            if last is None:
+                self.data["events"] = max((e["id"] for e in batch), default=0)
+                return []
+            found += [e for e in batch if e["id"] > last]
+            if len(batch) < 100 or any(e["id"] <= last for e in batch):
+                break
+            page += 1
+        return sorted(found, key=lambda e: e["id"])
+
+    def refused(self, n: int, label: str) -> bool:
+        """Метка-команда (`agent:go`, `agent:stop`, `agent:retry`) не принята — True: команда —
+        только от владельца (решение 16.10: команды пульта — владельца), то есть её последнее
+        событие `labeled` — от пользователя-владельца репозитория. Токен сессии App
+        (`issues: write`) и посторонний метку поставить могут — такая снимается с причиной в
+        тикете, без упоминания. События не видно (REST ещё не отдал) — метка не трогается,
+        следующий такт проверит снова: пропавшее событие не доказывает чужого автора."""
+        actor = self.labeler(n, label)
+        if [n, label] in self.data["restored"] and actor.get("type") == "Bot":
+            return False  # вернул сам оркестратор за владельца (`guard`)
+        if not actor.get("login"):
+            say(f"#{n}: {label} — автор метки не найден в событиях, проверка на следующем такте")
+            return True
+        if self.is_owner(actor):
+            return False
+        who = actor["login"]
+        self.labels(n, remove=(label,))  # до комментария: сбой меток его не повторит
+        self.comment(
+            n,
+            f"Оркестратор: метка `{label}` снята — её поставил `{who}`, а не владелец "
+            "репозитория. Команды оркестратору даёт только владелец; команда не выполнена.",
+        )
+        say(f"#{n}: {label} от {who}, не от владельца — метка снята")
+        return True
+
+    def intake(self) -> list[str]:
+        """`agent:go` на тикетах → очередь (`agent:queued`) или отказ с причиной. Сбой — по тикету
+        (метка остаётся, следующий такт повторит), остальной такт идёт; итог — сбои."""
+        query = ["--label", GO, "--state", "open", "--json", "number,labels", "--limit", "100"]
+        found = core.gh_json("issue", "list", *query) or []
+        errors = []
+        for issue in sorted(found, key=lambda i: i["number"]):
+            n = issue["number"]
+            try:
+                self.take(n, label_names(issue))
+            except (Failure, core.Failure, *COMMAND_ERRORS) as exc:
+                errors.append(f"#{n} {GO}: {exc}")
+                say(f"#{n}: {GO} не разобрана — {exc}")
+        return errors
+
+    def take(self, n: int, names: list[str]) -> None:
+        if str(n) in self.data["prds"]:
+            return  # PRD ведётся: `agent:go` держится до сводки
+        led = str(n) in self.data["tickets"]
+        prd = not led and bool(self.children(n))
+        if not led and not prd and READY_FOR_AGENT in names and start.IN_PROGRESS in names:
+            # До проверки автора: ручная сессия идёт часами, метка держится — без запроса в такт.
+            return say(
+                f"#{n}: {start.IN_PROGRESS} без сессии оркестратора — ручная сессия, пропуск"
+            )
+        if self.refused(n, GO):
+            return
+        if prd:
+            self.data["prds"][str(n)] = {"queued": stamp(), "taken": [], "done": {}}
+            return say(f"#{n}: PRD — его тикеты пойдут по «Blocked by»")
+        if led:
+            if self.ticket(n)["phase"] == "stopped":
+                self.resume_stopped(n, self.ticket(n))
+            else:  # уже ведём: метка (ответ на вопрос ею) иначе отменила бы будущую остановку
+                self.labels(n, remove=(GO,))
+                say(f"#{n}: {GO} — тикет уже ведётся, метка снята")
+            return
+        if READY_FOR_AGENT not in names:
+            self.labels(n, remove=(GO,))  # до комментария: сбой меток его не повторит
+            self.comment(
+                n,
+                f"Оркестратор: тикет не взят — нет метки `{READY_FOR_AGENT}`: он не готов "
+                f"для агента. Метка `{GO}` снята; когда тикет будет готов — "
+                f"`{READY_FOR_AGENT}` и снова `{GO}`.",
+            )
+            return say(f"#{n}: без {READY_FOR_AGENT} — не взят")
+        self.labels(n, add=(QUEUED,), remove=(GO,))
+        self.data["queue"].append(n)
+        self.data["tickets"][str(n)] = fresh()
+        say(f"#{n}: в очереди")
+
+    def answered(self) -> list[str]:
+        """Тикеты с вопросом владельцу: ответ в тикете — в очередь раньше новых, за другими
+        тикетами с ответом. Тикет закрыт — оркестратор его больше не ведёт. Сбой `gh` и сверки
+        автора — по тикету (повтор на следующем такте), остальной такт идёт; итог — сбои."""
+        errors = []
+        for key, t in list(self.data["tickets"].items()):
+            if t["phase"] != "question":
+                continue
+            n = int(key)
+            try:
+                st = self.route(n)
+                question = st["question"]
+                fields = "state,comments"
+                found = core.gh_json("issue", "view", str(n), "--json", fields) or {}
+                if found.get("state") == "CLOSED":
+                    self.forget(n, t, None, self.costs(t, st)[0])
+                    say(f"#{n}: тикет закрыт, ожидая ответа, — больше не ведём")
+                    continue
+                if question:  # вопроса в маршруте нет — ответ взят (ручная сессия): продолжение
+                    comments = found.get("comments") or []
+                    try:
+                        replies, _ = asks.answers(
+                            core, question, comments, strict=True, strangers=False
+                        )
+                    except asks.NoQuestion:
+                        self.stop(n, t, f"вопрос сессии {question['url']} не найден в тикете")
+                        continue
+                    if not replies:
+                        continue
+                self.labels(n, add=(QUEUED,))
+            except (core.Failure, *COMMAND_ERRORS) as exc:
+                errors.append(f"#{n} ответ на вопрос: {exc}")
+                say(f"#{n}: ответ на вопрос не проверен — {exc}")
+                continue
+            t.update(phase="queued", resume="answer", requeued=stamp())
+            queue = self.data["queue"]
+            ahead = 0  # за тикетами с ответом, но раньше новых
+            while ahead < len(queue) and self.waits_answer(queue[ahead]):
+                ahead += 1
+            queue.insert(ahead, n)
+            say(f"#{n}: владелец ответил — в очереди первым")
+        return errors
+
+    def waits_answer(self, n: int) -> bool:
+        """Тикет в очереди после ответа владельца — его место раньше новых."""
+        t = self.data["tickets"].get(str(n)) or {}
+        return t.get("phase") == "queued" and t.get("resume") == "answer"
+
+    def fill(self) -> list[str]:
+        """Свободные места — тикетам очереди по порядку (`blockers`). Тикет, которому сейчас
+        нельзя, ждёт, а следующий за ним место берёт, если не пересекается и с ним: ждущий держит
+        свои владения от тикетов позади, иначе широкий тикет или тикет без владений обгоняли бы
+        без конца. Не держит — когда его держит только тикет, ждущий ответа владельца: ответа
+        можно ждать долго. Сбой — по тикету: он остаётся в очереди на своём месте, следующие идут;
+        итог — сбои."""
+        errors, ahead, told, unchecked = [], [], False, False
+        capacity = self.capacity()
+        for n in list(self.data["queue"]):
+            if len(self.data["slots"]) >= capacity:
+                break
+            if n not in self.data["queue"]:
+                continue
+            if str(n) not in self.data["tickets"]:
+                self.data["queue"].remove(n)
+                continue
+            try:
+                if found := self.blockers(n, ahead):
+                    say(f"#{n}: ждёт места — {found[0][1]}")
+                    if not all(self.waits_owner(o) for o, _ in found):
+                        ahead.append(n)
+                    continue
+            except (Failure, core.Failure, start.StartError, *COMMAND_ERRORS) as exc:
+                errors.append(f"#{n}: {exc}")  # владения не известны — очередь за ним не держит
+                say(f"#{n}: место не занято — {exc}")
+                continue
+            # Пауза (#221) держит места, где пойдёт `claude`; продолжение на CI или мёрже — нет.
+            if self.ticket(n).get("resume") not in ("ci", "merge"):
+                if not self.usage_checked and not self.data["pauses"]:
+                    self.usage_checked = True  # перед первым новым запуском такта — доля лимита
+                    try:
+                        self.fresh_usage()
+                    except (Failure, *COMMAND_ERRORS) as exc:
+                        errors.append(f"доля лимита подписки: {exc}")
+                        say(f"новые места не заняты — {exc}")
+                        unchecked = True
+                if unchecked:
+                    continue
+                if self.data["pauses"]:
+                    if not told:
+                        reasons = "; ".join(p["reason"] for p in self.data["pauses"].values())
+                        say(f"очередь на паузе — {reasons}")
+                        told = True
+                    continue
+            try:
+                self.begin(n)
+            except (Failure, core.Failure, start.StartError, *COMMAND_ERRORS) as exc:
+                errors.append(f"#{n}: {exc}")  # тикет остаётся в очереди, следующие идут
+                say(f"#{n}: место не занято — {exc}")
+                continue
+            if n in self.data["queue"]:
+                self.data["queue"].remove(n)
+        return errors
+
+    def blockers(self, n: int, ahead: list[int]) -> list[tuple[int, str]]:
+        """Кто не даёт тикету занять место сейчас и почему; пусто — может. Его владения и флаги
+        (бриф — на момент старта) не пересекаются с владениями занятых мест, тикетов, ждущих
+        ответа владельца, и ждущих впереди в очереди (`ahead`); тикет без строк по образцу идёт
+        один. Бриф читается и без соседей: владения запоминаются на старте — по ним сверяют
+        следующих."""
+        mine = self.claims_of(n, fresh=True)
+        queue = self.data["queue"]
+        tracked = [*self.data["slots"], *ahead, *(int(k) for k in self.data["tickets"])]
+        others = [
+            o
+            for o in dict.fromkeys(tracked)
+            if o != n
+            and (o in ahead or self.holds(o))
+            # тикет с ответом позади в очереди держит не этого тикета, а тех, кто за ним
+            and not (o in queue and n in queue and queue.index(o) > queue.index(n))
+        ]
+        found = []
+        for other in others:
+            theirs = self.claims_of(other)
+            if mine is None:
+                why = "в брифе нет строк «Владения» и «Флаги» по образцу — тикет идёт один"
+            elif theirs is None:
+                why = f"#{other} идёт один: в его брифе нет строк «Владения» и «Флаги» по образцу"
+            elif clash := conflict(mine, theirs):
+                why = f"пересекается с #{other}: {clash}"
+            else:
+                continue
+            found.append((other, why))
+        return found
+
+    def holds(self, n: int) -> bool:
+        """Владения тикета заняты: он на месте или ждёт ответа владельца."""
+        return n in self.data["slots"] or self.waits_owner(n)
+
+    def waits_owner(self, n: int) -> bool:
+        """Тикет ждёт ответа владельца — или получил его и стоит в очереди."""
+        t = self.data["tickets"].get(str(n)) or {}
+        return t.get("phase") == "question" or self.waits_answer(n)
+
+    def claims_of(self, n: int, fresh: bool = False) -> dict | None:
+        """Владения и флаги тикета из брифа; `fresh` — бриф заново (тикет занимает место),
+        иначе — запомненные при прошлом чтении."""
+        t = self.ticket(n)
+        if fresh or "claims" not in t:
+            found = core.gh_json("issue", "view", str(n), "--json", "body") or {}
+            t["claims"] = claims(found.get("body"))
+        return t["claims"]
+
+    def begin(self, n: int) -> None:
+        """Первый в очереди занимает место: остановленный на CI или мёрже — снова CI и отметка;
+        остановленный до разбора итога кончившейся сессии (`settle`) — разбор, без запуска; с
+        сессией, чей worktree есть, — та же сессия; иначе — новая. Шаг без запуска занимает место
+        и уходит из очереди до своего действия: его сбой не оставит тикет и на месте, и в
+        очереди."""
+        t = self.ticket(n)
+        self.labels(n, remove=(QUEUED,))
+        back = t.get("resume")
+        if back in ("ci", "merge", "settle"):
+            self.data["queue"].remove(n)
+            self.occupy(n)
+            if back == "settle":
+                t["phase"] = "session"
+                self.session_over(n, t)
+            else:
+                t.pop("ci_since", None)
+                t["phase"] = "ci"
+                self.ci(n, t)
+        elif back == "answer":
+            self.after_answer(n, t)
+        elif self.resumable(n, t):  # прерванное задание оркестратора (догон, CI) — то же снова
+            self.launch(n, resume=t["session"], task=t.get("task"))
+        else:
+            self.launch(n)
+        if t["phase"] != "stopped":
+            t.pop("resume", None)
+
+    def after_answer(self, n: int, t: dict, why: str | None = None) -> None:
+        """Ответ владельца получен: та же сессия (`--resume`, маршрут сам находит ответ); её нет
+        или возобновление упало (`why`) — новая сессия на той же ветке и запись в тикет. Запуск
+        помнит вопрос (`answer`): кончился, а вопрос ждёт, — возобновление не состоялось."""
+        question = self.route(n)["question"]
+        if why is None and not self.resumable(n, t):
+            why = "сессии для возобновления нет (нет её id или worktree тикета)"
+        self.launch(n, resume=None if why else t["session"])
+        if t["phase"] != "session":
+            return  # предел тикета: отчёт об остановке уже в тикете
+        if question:
+            t["runs"][-1]["answer"] = question["stamp"]
+        if why:
+            branch = self.route(n).branch()
+            say(f"#{n}: новая сессия после ответа — {why}")
+            try:  # запуск уже идёт: сбой записи не должен оставить тикет и на месте, и в очереди
+                self.comment(
+                    n,
+                    f"Оркестратор: {why} — новая сессия на той же ветке `{branch}`; ответ "
+                    "владельца она возьмёт из тикета.\n",
+                )
+            except core.Failure as exc:
+                say(f"#{n}: запись о новой сессии в тикет не ушла — {exc}")
+
+    def resumable(self, n: int, t: dict) -> bool:
+        """Сессию можно возобновить: id есть и worktree тикета в клоне песочницы есть (старт мог
+        не дойти до `claude`)."""
+        return bool(t.get("session")) and self.worktree(n) is not None
+
+    def launch(self, n: int, resume: str | None = None, task: str | None = None) -> None:
+        """Сессия тикета через `session-run`: новая или возобновление той же (`--resume`;
+        задание оркестратора — `--prompt`, иначе `/start N`), с `--max-budget-usd` — наименьшим
+        из предела запуска и остатка предела тикета."""
+        t = self.ticket(n)
+        spent, _ = self.costs(t, self.route(n))
+        if exhausted(spent):
+            return self.stop(
+                n,
+                t,
+                f"предел тикета {TICKET_LIMIT} USD: потрачено {spent:.2f} USD — новый запуск "
+                "сессии не начат",
+            )
+        budget = f"{min(RUN_LIMIT, TICKET_LIMIT - spent):.2f}"
+        session = resume or str(uuid.uuid4())
+        logs = self.dir / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        # id сессии в имени: после `agent:retry` запуски считаются с нуля, лог прошлой попытки цел.
+        log = logs / f"ticket-{n}-{session[:8]}-{len(t['runs']) + 1}.jsonl"
+        tag = uuid.uuid4().hex[:16]  # метка запуска: по ней такт находит его процессы внутри
+        script = [str(HERE / "session-run"), str(n), "--run", tag, "--max-budget-usd", budget]
+        if resume:
+            script += ["--resume", session, *(["--prompt", task] if task else []), "--", *STREAM]
+        else:
+            script += ["--", "--session-id", session, *STREAM]
+        self.sandbox_entry()  # граница — до подготовки: шаблон в не ту песочницу не уйдёт
+        self.prepare()  # образы проекта и база-шаблон — до первого запуска такта
+        env = self.session_env()
+        cmd = ["sbx", "exec", "-w", str(self.clone)]
+        for key, value in env.items():
+            cmd += ["-e", f"{key}={value}"]
+        cmd += [self.box.name, "python3", *script]
+        with open(log, "w", encoding="utf-8") as out:
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=self.dir,
+                    env=without_tokens(),  # `sbx` на Mac — без токена оркестратора
+                    stdin=subprocess.DEVNULL,
+                    stdout=out,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,  # такт его не ждёт; стоп — группой внутри
+                )
+            except FileNotFoundError:
+                raise Failure("нет `sbx` (Docker Sandboxes) на PATH — docs/sandbox.md") from None
+        self.entry["status"] = "running"  # `sbx exec` поднимает остановленную
+        self.procs = None
+        t["runs"].append(
+            {
+                "run": tag,
+                "session": session,
+                "pid": proc.pid,
+                "pid_started": started_at(proc.pid),
+                "log": str(log),
+                "started": stamp(),
+                "budget": budget,
+                "resumed": bool(resume),
+            }
+        )
+        t.update(phase="session", session=session)
+        t.pop("ci_since", None)
+        if task:  # задание оркестратора — до «код готов»: стоп посреди его не потеряет
+            t["task"] = task
+        else:
+            t.pop("task", None)
+        self.occupy(n)
+        if n in self.data["queue"]:
+            self.data["queue"].remove(n)
+        # Запуск — в состояние сразу: такт, упавший дальше, не потеряет его (осиротевшую сессию
+        # без записи найдёт `reconcile`).
+        self.save()
+        say(f"#{n}: сессия {'возобновлена' if resume else 'запущена'} (pid {proc.pid})")
+
+    def advance(self, n: int) -> None:
+        t = self.ticket(n)
+        phase = t["phase"]
+        if phase == "session":
+            self.session_over(n, t)
+        elif phase == "ci":
+            self.ci(n, t)
+        elif phase == "merge":
+            self.merge(n, t)
+        else:
+            self.free(n)
+
+    # --- сессия ---
+
+    def finish_run(self, t: dict, last: dict) -> dict:
+        """Итог кончившегося запуска по его потоку — в состояние (один раз)."""
+        summary = stream_summary(Path(last["log"]))
+        if "ended" in last:
+            return summary
+        last.update(ended=stamp(), cost=summary["cost"], subtype=summary["subtype"])
+        if summary["rate_limit"] is not None:
+            t["rate_limit"] = summary["rate_limit"]
+            self.observe(summary["rate_limit"], since=last["started"])
+        return summary
+
+    def session_over(self, n: int, t: dict) -> None:
+        last = t["runs"][-1]
+        self.procs = None  # процессы — на сейчас: такт с ревью соседа идёт долго
+        if self.live(last):
+            if seconds_since(last["started"]) > RUN_TIME:
+                why = f"запуск сессии идёт дольше {RUN_TIME // 3600} ч — {ended(self.end_run(t))}"
+                return self.stop(n, t, f"предел времени: {why}")
+            # Доля лимита — и из хвоста потока живого запуска; упор разберётся, когда запуск
+            # кончится.
+            self.observe(
+                stream_summary(Path(last["log"]), LIVE_TAIL)["rate_limit"],
+                rejected=False,
+                since=last["started"],
+            )
+            self.session_env()  # токен сессии свежим: запуск дольше часа не падает на push
+            return
+        summary = self.finish_run(t, last)
+        st = self.route(n)
+        asked = last.get("answer")
+        unanswered = bool(asked) and (st["question"] or {}).get("stamp") == asked
+        if summary["limit"] and st.step not in ("ready", "stopped"):
+            if unanswered or not st["question"]:  # запуск не кончился вопросом
+                # Упор в лимит подписки — не сбой: пауза до сброса, та же сессия продолжит потом
+                # (после ответа владельца — снова с ответом).
+                self.hit_limit(summary["limit"])
+                self.requeue(n, t)
+                if unanswered:
+                    t["resume"] = "answer"
+                return say(f"#{n}: упор в лимит подписки — тикет первым ждёт сброса")
+        ready = st["ready"] or {}
+        if unanswered:
+            return self.answer_lost(n, t, last, summary)
+        if st.step == "ready":
+            t.pop("task", None)  # задание оркестратора выполнено
+        if st.step == "ready" and not ready.get("reviewed"):
+            self.review(n, t, st)
+        elif st.step == "ready":
+            t["phase"] = "ci"
+            self.ci(n, t)
+        elif st["question"]:
+            t.update(phase="question", pings=t["pings"] + 1)  # ответ — `answered`
+            self.free(n)
+            say(f"#{n}: вопрос владельцу — место свободно до ответа")
+        elif st.step == "stopped":
+            # Отчёт опубликовала сама сессия (`ready-for-human` — его); на шаге `stop` маршрут
+            # ещё ждал отчёт от агента — это сессия без результата, ниже.
+            self.labels(n, add=(STOPPED,))
+            t.update(phase="stopped", resume="session", pings=t["pings"] + 1)
+            self.free(n)
+            say(f"#{n}: сессия остановилась с отчётом")
+        elif summary["subtype"] == BUDGET_OUT:
+            self.stop(
+                n,
+                t,
+                f"{limit_name(last)}: запуск остановлен по `--max-budget-usd {last.get('budget')}` "
+                f"(шаг маршрута «{st.step}»): {summary['result']}",
+            )
+        else:
+            why = summary["result"] or "в потоке нет итога"
+            self.stop(n, t, f"сессия кончилась без результата (шаг маршрута «{st.step}»): {why}")
+
+    def answer_lost(self, n: int, t: dict, last: dict, summary: dict) -> None:
+        """Запуск после ответа кончился, а вопрос всё ещё ждёт: ответ сессия не взяла.
+        Возобновление (`--resume` не нашёл сессию, упал) — новая сессия на той же ветке, один раз;
+        новая тоже не взяла — отчёт об остановке."""
+        result = summary["result"] or "в потоке нет итога"
+        if summary["subtype"] == BUDGET_OUT:
+            return self.stop(
+                n,
+                t,
+                f"{limit_name(last)}: запуск после ответа владельца остановлен по "
+                f"`--max-budget-usd {last.get('budget')}`: {result}",
+            )
+        if not last.get("resumed"):
+            return self.stop(n, t, f"новая сессия кончилась, не взяв ответ владельца: {result}")
+        if self.hold(n, "новая сессия после ответа владельца"):
+            return
+        self.after_answer(n, t, why=f"сессия не возобновилась ({result})")
+
+    def stop(self, n: int, t: dict, reason: str, remove: tuple[str, ...] = ()) -> None:
+        """Отчёт об остановке «Причина / Сделано / Доступно» с упоминанием владельца (решение
+        16.10, п. 11: уведомление), `agent:stopped` и `ready-for-human`; ветка и PR сохраняются.
+        Шаг остановки — в `resume` (с него продолжит `agent:go`). Метки — до комментария: их сбой
+        не повторит комментарий на следующем такте."""
+        if t["phase"] not in ("stopped", "queued"):
+            t["resume"] = t["phase"]
+        body = self.report(n, t, reason)
+        self.labels(n, add=(STOPPED, HUMAN), remove=remove)
+        self.comment(n, body)
+        t.update(phase="stopped", reason=reason, pings=t["pings"] + 1)
+        self.free(n)
+        say(f"#{n}: остановка — {reason}")
+
+    def report(self, n: int, t: dict, reason: str) -> str:
+        st = self.route(n)
+        spent, _ = self.costs(t, st)
+        where = PHASES.get(t.get("resume") or t["phase"], t["phase"])
+        if t["runs"]:
+            kept = f"ветка `{st.branch()}`" + (f", PR {st['pr']}" if st["pr"] else "")
+            done = f"шаг «{where}», запусков сессии: {len(t['runs'])}; {kept} — сохранены"
+        else:
+            done = f"шаг «{where}», сессия не запускалась"
+        done += f"; расход {spent:.2f} USD в ценах API из {TICKET_LIMIT} USD на тикет."
+        if t.get("resume") in ("ci", "merge"):
+            go = "снова проверка CI и отметка `review`, черновик PR снимается"
+        elif t.get("resume") == "settle":
+            go = "разбор итога кончившейся сессии, без нового запуска"
+        elif t.get("resume") == "question":
+            go = (
+                "тикет снова ждёт ответа на вопрос (ответ — комментарием в тикете); вопроса в "
+                f"тикете нет — нужен `{RETRY}`"
+            )
+        elif self.resumable(n, t):
+            go = "та же сессия возобновится, черновик PR снимается"
+        else:
+            go = "новая сессия запустится"
+        if exhausted(spent) and t.get("resume") not in ("ci", "merge", "settle"):
+            go += f" — но предел тикета исчерпан: запуск сразу остановится, нужен `{RETRY}`"
+        owner = self.repo.split("/")[0]
+        return (
+            f"{core.REPORT_MARK} (оркестратор)\n\n"
+            f"**Причина:** {reason}\n\n"
+            f"**Сделано:** {done}\n\n"
+            "**Доступно:**\n"
+            f"- `{GO}` — продолжить с того же шага: {go};\n"
+            f"- `{RETRY}` — с чистого листа: PR закрыт с комментарием, ветка, worktree и "
+            "состояние удалены, тикет снова в очереди;\n"
+            "- ничего не ставить — тикет ждёт, место оркестратора свободно.\n\n"
+            f"@{owner}, нужен человек: метка `{HUMAN}`.\n"
+        )
+
+    # --- ревью ошибок ---
+
+    def claude_shim(self) -> Path:
+        """Каталог с обёрткой `claude --setting-sources user`: настройки проекта и ветки
+        (хуки, скиллы, `CLAUDE.md`) в ревью не участвуют."""
+        shim_dir = self.dir / "review-bin"
+        own = str(shim_dir)
+        path = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if p != own)
+        real = shutil.which("claude", path=path)
+        if real is None:
+            raise Failure("не найден `claude` на PATH")
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        shim = shim_dir / "claude"
+        shim.write_text(
+            f'#!/bin/sh\nexec {shlex.quote(real)} --setting-sources user "$@"\n', encoding="utf-8"
+        )
+        shim.chmod(0o755)
+        return shim_dir
+
+    def own_report(self, n: int) -> Path:
+        """Свой отчёт ревью тикета: по нему — отметка; сессии — копия рядом с состоянием."""
+        return self.dir / "reviews" / f"ticket-{n}.json"
+
+    def hand_over(self, n: int, st: Route) -> None:
+        """Копия своего отчёта (`.json` и `.md`) — туда, где его ждёт маршрут сессии: рядом с
+        состоянием тикета в клоне песочницы, без перехода по ссылкам (`write_inside`)."""
+        own = self.own_report(n)
+        for suffix in (".json", ".md"):
+            if own.with_suffix(suffix).exists():
+                data = own.with_suffix(suffix).read_bytes()
+                write_inside(self.clone, (st.rel / "review").with_suffix(suffix), data, 0o644)
+
+    def review(self, n: int, t: dict, st) -> None:
+        if self.hold(n, "ревью ошибок"):
+            return
+        spent, _ = self.costs(t, st)
+        if exhausted(spent):
+            return self.stop(
+                n,
+                t,
+                f"предел тикета {TICKET_LIMIT} USD: потрачено {spent:.2f} USD — ревью не начато",
+            )
+        if t.get("reviewed"):
+            # Ревью уже оплачено, а возобновлённая сессия кончилась до разбора (сбой, лимит):
+            # одно ревью на тикет — тот же отчёт снова, один раз; второй круг — остановка.
+            if t.get("handovers", 0) >= 1:
+                return self.stop(n, t, "сессия дважды кончилась до разбора находок ревью")
+            self.hand_over(n, st)
+            self.launch(n, resume=t["session"])
+            if t["phase"] == "session":  # засчитан только начатый запуск (сбой подготовки — нет)
+                t["handovers"] = t.get("handovers", 0) + 1
+            return
+        # Ревью — по ветке с GitHub: head «код готов» сессия ещё не отправляла, push — изнутри.
+        if problem := self.publish(n, st):
+            return self.stop(n, t, f"ветка «код готов» не на GitHub: {problem}")
+        head = st["ready"]["head"]
+        try:
+            checkout = self.checkout("review", n, head)
+        except Failure as exc:
+            return self.stop(n, t, f"чекаут для ревью не создан: {exc}")
+        report = self.own_report(n)
+        report.parent.mkdir(parents=True, exist_ok=True)
+        env = without_tokens()
+        env["PATH"] = f"{self.claude_shim()}{os.pathsep}{os.environ.get('PATH', '')}"
+        say(f"#{n}: ревью ошибок head {head[:7]}")
+        budget = f"{min(REVIEW_LIMIT, TICKET_LIMIT - spent):.2f}"  # ревью тоже в пределе тикета
+        review = [sys.executable, str(HERE / "review"), str(report), "--max-budget-usd", budget]
+        try:
+            res = run(*review, cwd=checkout, env=env, timeout=REVIEW_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return self.stop(n, t, f"ревью ошибок не кончилось за {REVIEW_TIMEOUT // 60} мин")
+        finally:
+            self.drop_checkout(checkout)
+        if res.returncode != 0:
+            return self.stop(n, t, f"ревью ошибок не состоялось: {tail(res.stderr or res.stdout)}")
+        try:
+            data = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return self.stop(n, t, f"отчёт ревью не прочитан: {exc}")
+        cost = data.get("total_cost_usd")
+        t["cost"]["review"] = cost if isinstance(cost, (int, float)) else 0
+        t["reviewed"] = True
+        self.hand_over(n, st)
+        self.launch(n, resume=t["session"])  # находки — той же сессии заданием маршрута
+
+    # --- PRD ---
+
+    def open_issues(self) -> list[dict]:
+        """Открытые тикеты с телами и связью автора с репозиторием — раз на такт, все страницы
+        REST (`gh issue list` её не отдаёт, а предел выборки счёл бы старый блокирующий
+        закрытым). PR в выдаче REST — отброшены."""
+        if self.opened is None:
+            found, page = [], 1
+            while True:
+                path = f"repos/{self.repo}/issues?state=open&per_page=100&page={page}"
+                batch = core.gh_json("api", path) or []
+                found += [i for i in batch if "pull_request" not in i]
+                if len(batch) < 100:
+                    break
+                page += 1
+            self.opened = found
+        return self.opened
+
+    def children(self, prd: int) -> list[dict]:
+        """Открытые тикеты PRD — чей раздел «Parent» ссылается на него, от участника репозитория
+        или App (#181, #185): тикет постороннего PRD не делает и в очередь не встаёт."""
+        found = [
+            i
+            for i in self.open_issues()
+            if parent_of(i.get("body"), self.repo) == prd and core.trusted(i)
+        ]
+        return sorted(found, key=lambda i: i["number"])
+
+    def prd_command(self, p: int, label: str) -> None:
+        """`agent:stop` на PRD — очередь PRD снята: новых тикетов не берёт, `agent:go` снята;
+        взятые идут дальше (стоп — на них). `agent:retry` на PRD не выполняется."""
+        if label == STOP:
+            self.labels(p, remove=(STOP, GO))
+            del self.data["prds"][str(p)]
+            text = (
+                f"Оркестратор: очередь PRD остановлена — новых тикетов не берёт, `{GO}` снята. "
+                f"Уже взятые тикеты идут дальше: остановить их — `{STOP}` на каждом."
+            )
+        else:
+            self.labels(p, remove=(label,))
+            text = f"Оркестратор: `{label}` на PRD не выполняется — ставь её на тикет PRD."
+        self.comment(p, text)
+        say(f"#{p}: {label} на PRD")
+
+    def prd_queue(self) -> list[str]:
+        """PRD с `agent:go`: его открытые тикеты с `ready-for-agent` — в очередь, каждый в свой
+        черёд: все блокирующие из «Blocked by» закрыты (или слиты в этом PRD). Без
+        `ready-for-agent` — пропуск и строка в сводке; заблокированный открытым тикетом или с
+        `in-progress` без своей сессии (ручная) — ждёт. Ни один тикет PRD не ведётся, а ждущие
+        есть — PRD стоит: одна запись с упоминанием, что держит. Невзятых тикетов с
+        `ready-for-agent` нет и ни один не ведётся — сводка. `agent:go` снята владельцем или PRD
+        закрыт — очередь PRD снята. Сбой — по PRD (повтор на следующем такте), остальной такт
+        идёт; итог — сбои."""
+        errors = []
+        for key, prd in list(self.data["prds"].items()):
+            try:
+                self.prd_step(int(key), prd)
+            except (Failure, core.Failure, *COMMAND_ERRORS) as exc:
+                errors.append(f"PRD #{key}: {exc}")
+                say(f"PRD #{key}: не разобран — {exc}")
+        return errors
+
+    def prd_step(self, p: int, prd: dict) -> None:
+        issues = {i["number"]: i for i in self.open_issues()}
+        if not prd.get("summary") and (p not in issues or GO not in label_names(issues[p])):
+            del self.data["prds"][str(p)]
+            return say(f"#{p}: PRD закрыт или `{GO}` снята — очередь PRD снята")
+        children = self.children(p)
+        for issue in children:  # взят своей меткой `agent:go` — тоже тикет PRD
+            n = issue["number"]
+            if n not in prd["taken"] and str(n) in self.data["tickets"]:
+                prd["taken"].append(n)
+                self.ticket(n)["prd"] = p
+        pending = [i for i in children if i["number"] not in prd["taken"]]
+        gone = {int(k) for k in prd["done"]}  # слит в этом PRD, даже если GitHub ещё не закрыл
+        waiting, unready = {}, {}
+        for issue in pending:
+            n, names = issue["number"], label_names(issue)
+            if READY_FOR_AGENT not in names:
+                continue
+            held = [b for b in blockers(issue.get("body"), self.repo) if b in issues.keys() - gone]
+            if held or start.IN_PROGRESS in names:
+                waiting[n] = (
+                    f"заблокирован {', '.join(f'#{b}' for b in held)}"
+                    if held
+                    else f"ведёт ручная сессия (`{start.IN_PROGRESS}`)"
+                )
+                continue
+            # #248: тикет PRD — команда владельца, только если тикет завёл он и
+            # `ready-for-agent` поставил он: App сессии мог завести тикет или дать метку сам.
+            if not self.is_owner(issue.get("user") or {}) or not self.is_owner(
+                self.labeler(n, READY_FOR_AGENT)
+            ):
+                unready[n] = True
+                continue
+            self.labels(n, add=(QUEUED,))
+            self.data["queue"].append(n)
+            self.data["tickets"][str(n)] = fresh(prd=p)
+            prd["taken"].append(n)
+            say(f"#{n}: тикет PRD #{p} — в очереди")
+        if [n for n in prd["taken"] if str(n) in self.data["tickets"]]:
+            prd.pop("stalled", None)
+        elif waiting:
+            self.prd_stalled(p, prd, waiting)
+        else:
+            # Остались только без `ready-for-agent` владельца: нет метки или она не его.
+            skipped = {i["number"]: i["number"] in unready for i in pending}
+            self.prd_summary(p, prd, skipped)
+
+    def prd_stalled(self, p: int, prd: dict, waiting: dict[int, str]) -> None:
+        """Ни один тикет PRD не ведётся, а ждущие есть (блокирующий без `ready-for-agent`, вне
+        PRD, круг «Blocked by», ручная сессия): владельцу — одна запись с упоминанием, что держит;
+        та же картина — без повтора. `agent:go` держится: блокирующий закроют — тикет пойдёт."""
+        rows = [f"- #{n} — {why}" for n, why in sorted(waiting.items())]
+        if prd.get("stalled") == rows:
+            return
+        owner = self.repo.split("/")[0]
+        body = "\n".join(
+            [
+                f"Оркестратор: PRD стоит — ни один его тикет не идёт, @{owner}. Ждут:",
+                "",
+                *rows,
+                "",
+                f"Закрыть блокирующий или дать ему `{READY_FOR_AGENT}` — тикеты пойдут сами; "
+                f"снять `{GO}` — очередь PRD снята.",
+            ]
+        )
+        self.comment(p, body + "\n")
+        prd["stalled"] = rows
+        say(f"#{p}: PRD стоит — {len(rows)} тикет(ов) ждут")
+
+    def closed_stopped(self) -> list[str]:
+        """Тикет на остановке, закрытый на GitHub, оркестратор больше не ведёт: PR слит (владелец
+        довёл руками) — уборка и меры, как по слиянию; иначе — «закрыт без слияния». Сбой `gh` —
+        по тикету, остальной такт идёт; итог — сбои."""
+        errors = []
+        for key, t in list(self.data["tickets"].items()):
+            if t["phase"] != "stopped":
+                continue
+            n = int(key)
+            try:
+                found = core.gh_json("issue", "view", key, "--json", "state") or {}
+                if found.get("state") != "CLOSED":
+                    continue
+                st = self.route(n)
+                pr = self.pr(st) if st["pr"] else {}
+                if pr.get("state") == "MERGED":
+                    self.merged(n, t, st, pr)
+                else:
+                    self.forget(n, t, None, self.costs(t, st)[0])
+                    say(f"#{n}: закрыт на остановке — больше не ведём")
+            except (Failure, core.Failure, start.StartError, *COMMAND_ERRORS) as exc:
+                errors.append(f"#{n} закрыт на остановке: {exc}")
+                say(f"#{n}: закрытие на остановке не разобрано — {exc}")
+        return errors
+
+    def forget(self, n: int, t: dict, pr: str | None, cost: float) -> None:
+        """Тикет уходит из состояния: меры — в его PRD (для сводки, с прошлыми попытками до
+        `agent:retry`), место и очередь освобождаются."""
+        prd = self.data["prds"].get(str(t.get("prd")))
+        before = t.get("before") or {}
+        if prd is not None:
+            prd["done"][str(n)] = {
+                "pr": pr,
+                "pings": t["pings"] + before.get("pings", 0),
+                "cost": round(cost + before.get("cost", 0), 4),
+                "runs": len(t["runs"]) + before.get("runs", 0),
+            }
+        del self.data["tickets"][str(n)]
+        if n in self.data["queue"]:
+            self.data["queue"].remove(n)
+        self.free(n)
+
+    def escaped(self, done: dict) -> int:
+        """Сколько тикетов `escaped-defect` ссылаются на слитый тикет PRD («Источник: #N, слит
+        ДД.ММ», `docs/agents/triage-labels.md`) или на его PR."""
+        numbers = {int(k) for k, d in done.items() if d["pr"]}
+        numbers |= {int(m.group(1)) for d in done.values() if (m := PULL.search(d["pr"] or ""))}
+        if not numbers:
+            return 0
+        query = ["--label", ESCAPED, "--state", "all", "--json", "number,body", "--limit", "1000"]
+        found = core.gh_json("issue", "list", *query) or []
+        return sum(1 for i in found if numbers & set(refs(i.get("body") or "", self.repo)))
+
+    def prd_summary(self, p: int, prd: dict, skipped: dict[int, bool]) -> None:
+        """Одна сводка PRD с упоминанием владельца: тикеты, меры, счёт `escaped-defect`; не
+        взятые — без `ready-for-agent` или с меткой (тикетом) не от владельца (`skipped`). Метка
+        `agent:go` снимается до комментария (`summary` в состоянии): сбой комментария повторит
+        следующий такт, PRD остаётся в состоянии до сводки."""
+        done = sorted(((int(k), d) for k, d in prd["done"].items()), key=lambda kv: kv[0])
+        rows = [
+            f"- #{n} — "
+            + (f"слит, PR {d['pr']}" if d["pr"] else "закрыт без слияния")
+            + f"; дёргали владельца {d['pings']} раз, расход {d['cost']:.2f} USD, "
+            f"запусков сессии {d['runs']}"
+            for n, d in done
+        ]
+        owner = self.repo.split("/")[0]
+        lines = [f"Оркестратор: PRD завершён — сводка, @{owner}.", "", "**Тикеты:**"]
+        lines += rows or ["- ни одного тикета не взято"]
+        if skipped:
+            lines += ["", "**Не взяты:**"]
+            lines += [
+                f"- #{n} — ждёт `{READY_FOR_AGENT}` владельца: тикет или метка не от него"
+                if foreign
+                else f"- #{n} — нет метки `{READY_FOR_AGENT}`: нужен человек"
+                for n, foreign in sorted(skipped.items())
+            ]
+        lines += [
+            "",
+            "**Меры:**",
+            f"- дёргали владельца: {sum(d['pings'] for _, d in done)} раз",
+            f"- время от `{GO}` до сводки: {duration(prd['queued'])}",
+            f"- расход: {sum(d['cost'] for _, d in done):.2f} USD в ценах API",
+            f"- запусков сессии: {sum(d['runs'] for _, d in done)}",
+            f"- ускользнувших дефектов (`{ESCAPED}`): {self.escaped(prd['done'])}",
+        ]
+        prd["summary"] = True
+        self.labels(p, remove=(GO,))
+        self.comment(p, "\n".join(lines) + "\n")
+        del self.data["prds"][str(p)]
+        say(f"#{p}: PRD завершён — сводка")
+
+    # --- CI, отметка, мёрж ---
+
+    def pr(self, st: Route) -> dict:
+        """PR из состояния маршрута — только PR ветки этого тикета: ссылку пишет сессия, а по ней
+        оркестратор своим токеном переводит PR в черновик, закрывает и признаёт слитым. Чужой —
+        как нет PR."""
+        pr = core.gh_json("pr", "view", st["pr"], "--json", PR_FIELDS) or {}
+        if pr.get("headRefName") != st.branch():
+            say(f"#{st.number}: PR {st['pr']} — не ветки {st.branch()}, не трогаю")
+            return {}
+        return pr
+
+    def ci(self, n: int, t: dict) -> None:
+        st = self.route(n)
+        if not st["pr"]:
+            return self.stop(n, t, "«код готов» после разбора, а PR в состоянии тикета нет")
+        pr = self.pr(st)
+        if (closed := self.closed(n, t, st, pr)) is not None:
+            return closed
+        if self.catch_up(n, t, st, pr):
+            return
+        self.own_draft(t, st)
+        if red := start.failed_checks(pr):
+            if pr["headRefOid"] != (st["ready"] or {}).get("head"):
+                # GitHub ещё отдаёт прошлый head: красный — не этого «код готов», ждём.
+                since = t.setdefault("ci_since", stamp())
+                if seconds_since(since) > CI_WAIT:
+                    why = f"head PR {pr['headRefOid'][:7]} — не «код готов» сессии"
+                    return self.stop(n, t, f"{why} {duration(since)}")
+                return
+            return self.give_back(n, t, st, f"красный CI на {pr['headRefOid'][:7]}", red)
+        if not ci_green(pr):
+            since = t.setdefault("ci_since", stamp())
+            if not checks(pr) and seconds_since(since) > CI_WAIT:
+                return self.stop(n, t, f"на PR нет проверок CI {duration(since)}")
+            return  # CI идёт
+        head = pr["headRefOid"]
+        if problem := self.unmarkable(n, t, st, head):
+            return self.stop(n, t, f"отметку review не ставлю: {problem}")
+        args = ["--mark", "--review-report", str(self.own_report(n))]
+        if st["weakening"]:
+            args += ["--weakening", st["weakening"]]
+        # Свой чекаут на ветке тикета в своём клоне: git в клоне сессий Mac не выполняет.
+        branch = st.branch()
+        checkout = self.checkout("mark", n, head, branch=branch)
+        try:
+            res = run(sys.executable, str(HERE / "ship-finish"), *args, cwd=checkout)
+        finally:
+            self.drop_checkout(checkout)
+            self.git("branch", "-q", "-D", branch)
+        if res.returncode != 0:
+            return self.stop(
+                n, t, f"отметка review не поставлена: {tail(res.stderr or res.stdout)}"
+            )
+        t.update(phase="merge", marked=head, pr=st["pr"])
+        say(f"#{n}: отметка review и авто-мёрж на {head[:7]}")
+
+    def unmarkable(self, n: int, t: dict, st, head: str) -> str | None:
+        """Почему отметку на head PR ставить нельзя; None — можно. Одно ревью на тикет: отчёт
+        этого круга, его head — head PR или предок; тесты маршрута — ровно на head PR."""
+        if not t.get("reviewed"):
+            return "ревью ошибок оркестратора в этом круге не было"
+        ready = st["ready"] or {}
+        if not ready.get("reviewed") or ready.get("head") != head:
+            return f"head PR {head[:7]} — не «код готов» сессии после разбора"
+        if (st["checks"] or {}).get("head") != head:
+            return f"тесты и линтеры маршрута не пройдены на head PR {head[:7]}"
+        self.own_repo(refetch=True)  # head PR — свежий: такт мог долго идти (ревью соседа)
+        if (tip := self.remote_tip(st.branch())) != head:
+            return f"ветка {st.branch()} на сервере — {tip[:7] or 'нет'}, а не head PR {head[:7]}"
+        try:
+            verdict = json.loads(self.own_report(n).read_text(encoding="utf-8"))
+            reviewed = verdict["canon_review"]["head"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return "нет годного отчёта ревью ошибок"
+        if not isinstance(reviewed, str) or not self.ancestor(reviewed, head):
+            return f"head отчёта ревью {str(reviewed)[:7]} — не head PR и не его предок"
+        return None
+
+    def closed(self, n: int, t: dict, st, pr: dict):
+        """PR слит, закрыт или черновик (не свой — на время догона основы) — итог такта; иначе
+        None."""
+        if not pr:
+            self.stop(n, t, f"PR {st['pr']} в состоянии маршрута — не PR ветки {st.branch()}")
+            return True
+        if pr.get("state") == "MERGED":
+            self.merged(n, t, st, pr)
+            return True
+        if pr.get("state") == "CLOSED":
+            self.stop(n, t, f"PR {st['pr']} закрыт без мёржа")
+            return True
+        if pr.get("isDraft") and not t.get("undraft"):
+            self.stop(n, t, f"PR {st['pr']} — черновик")
+            return True
+        return None
+
+    def merge(self, n: int, t: dict) -> None:
+        st = self.route(n)
+        pr = self.pr(st)
+        if (closed := self.closed(n, t, st, pr)) is not None:
+            return closed
+        if self.catch_up(n, t, st, pr):
+            return
+        self.own_draft(t, st)
+        if red := start.failed_checks(pr):
+            return self.give_back(n, t, st, "красный CI после отметки", red)
+        if start.is_conflicting(pr):
+            return self.stop(n, t, f"PR {st['pr']} в конфликте с main")
+        if not pr.get("autoMergeRequest"):
+            return self.stop(n, t, f"авто-мёрж PR {st['pr']} выключен — PR придержан")
+        # ждём авто-мёржа
+
+    def own_draft(self, t: dict, st) -> None:
+        """Черновик, поставленный на время догона основы (`undraft`), — снять: догон кончился."""
+        if t.get("undraft"):
+            self.draft(st, False)
+            t.pop("undraft")
+
+    def catch_up(self, n: int, t: dict, st, pr: dict) -> bool:
+        """Основа ушла вперёд (отметка `behind`: слит другой тикет оркестратора или GitHub
+        говорит `BEHIND`), а head PR не содержит `origin/main` — догон той же сессией: PR — в
+        черновик (старый head с отметкой не сольётся посреди догона), задание «догони основу»;
+        конфликт сводит сессия по правилам маршрута, ревью не повторяется. Отметка снимается,
+        когда основа в ветке: прерванный догон (стоп, сбой запуска) повторится. Та же основа не
+        догнана после запуска догона — отчёт об остановке, а не круг платных запусков. True — шаг
+        такта сделан (догон начат или остановка)."""
+        if pr.get("mergeStateStatus") == "BEHIND":
+            t["behind"] = True  # слияние в main мимо оркестратора
+        if not t.get("behind"):
+            return False
+        self.own_repo(refetch=True)  # основа и head PR — свежие, с GitHub, в своём клоне
+        base = self.git("rev-parse", "origin/main").stdout.strip()
+        if self.ancestor("origin/main", pr["headRefOid"]):
+            t.pop("behind")  # основа в ветке (догон сделан или маршрут догнал её сам)
+            t.pop("caught", None)
+            return False
+        if t.get("caught") == base:
+            t.pop("behind")
+            self.stop(n, t, f"сессия догоняла основу {base[:7]}, а head PR её не содержит")
+            return True
+        if not self.resumable(n, t):
+            t.pop("behind")
+            self.stop(n, t, "основа ушла вперёд, а догнать её некому: нет сессии")
+            return True
+        if self.hold(n, "догон основы"):
+            return True
+        self.draft(st, True)
+        t["undraft"] = True
+        self.launch(n, resume=t["session"], task=CATCH_UP.format(n=n, **self.task_words(n)))
+        if t["phase"] == "session":
+            t["caught"] = base
+            say(f"#{n}: основа ушла вперёд — догон той же сессией")
+        return True
+
+    def give_back(self, n: int, t: dict, st, why: str, red: list[str]) -> None:
+        """Красный CI — **возврат**: та же сессия с заданием по CI, в пределах тикета, без второго
+        ревью; возвратов не больше `RETURNS`, следующий красный — отчёт об остановке. Возврат
+        засчитан, только если запуск начат."""
+        what = f"{why}: {', '.join(red)}"
+        if t.get("returns", 0) >= RETURNS:
+            return self.stop(n, t, f"{what} — возвратов сессии уже {RETURNS}")
+        if not self.resumable(n, t):
+            return self.stop(n, t, f"{what} — вернуть некому: нет сессии")
+        if self.hold(n, "возврат по красному CI"):
+            return
+        task = CI_TASK.format(n=n, why=what, pr=st["pr"], **self.task_words(n))
+        self.launch(n, resume=t["session"], task=task)
+        if t["phase"] == "session":
+            t["returns"] = t.get("returns", 0) + 1
+            say(f"#{n}: {what} — возврат той же сессии ({t['returns']}/{RETURNS})")
+
+    def task_words(self, n: int) -> dict:
+        """Общие слова заданий оркестратора: вызов маршрута, до чего, вопрос владельцу, правила
+        конфликта при догоне — те же, что у шага маршрута «догон базы»."""
+        return {
+            "ship": f"{self.ticket_cmd} ship {n}",
+            "long": core.LONG_CALL,
+            "until": f"«{core.READY}» или «{core.STOPPED}»",
+            "ask": f"{self.ticket_cmd} ask {n}",
+            "conflict": ship.CONFLICT_TASK.format(
+                files="из `git diff --name-only --diff-filter=U`",
+                vendored=f"{ship.VENDORED}\n{ship.VENDORED_INSTALL}",
+            ),
+        }
+
+    def merged(self, n: int, t: dict, st, pr: dict) -> None:
+        gone, problems = self.retire(n, pr.get("headRefOid"))
+        total, parts = self.costs(t, st)
+        lines = [
+            f"Оркестратор: тикет слит — PR {st['pr']}.",
+            "",
+            f"- дёргали владельца: {t['pings']} раз",
+            f"- время от очереди до слияния: {duration(t['queued'])}",
+            f"- расход: {total:.2f} USD в ценах API ({', '.join(parts)})",
+            f"- запусков сессии: {len(t['runs'])}",
+        ]
+        if problems:
+            lines.append(f"- уборка не доделана: {'; '.join(problems)}")
+        self.comment(n, "\n".join(lines) + "\n")
+        for suffix in (".json", ".md"):  # отчёт этого круга новой работе по тикету не годится
+            self.own_report(n).with_suffix(suffix).unlink(missing_ok=True)
+        self.forget(n, t, st["pr"], total)
+        for other in self.data["tickets"].values():  # ещё не слиты: основа ушла вперёд
+            other["behind"] = True
+        say(f"#{n}: слит, {'убрано' if gone and not problems else 'уборка не доделана'}")
+
+    def retire(self, n: int, head) -> tuple[bool, list[str]]:
+        """Уборка после мёржа — изнутри песочницы (`session-run N --retire <head>`): worktree,
+        ветка, ресурсы проекта, метка `in-progress` — механикой `session-start`. Итог — (ветки
+        больше нет, что не доделано)."""
+        if not isinstance(head, str) or not SHA.fullmatch(head):
+            return False, [f"head слитого PR — не коммит: {head!r}"]
+        try:
+            res = self.cleanup_inside(n, "--retire", head)
+        except (Failure, *COMMAND_ERRORS) as exc:
+            return False, [f"сбой уборки в песочнице: {exc}"]
+        try:
+            data = json.loads(res.stdout.strip().splitlines()[-1])
+            return bool(data["gone"]), [str(p) for p in data["problems"]]
+        except (ValueError, IndexError, KeyError, TypeError):
+            return False, [f"сбой уборки в песочнице: {tail(res.stderr or res.stdout)}"]
+
+
+def fresh(prd: int | None = None) -> dict:
+    """Новый тикет в очереди: ни запусков, ни расхода; тикет PRD помнит его номер."""
+    t = {"phase": "queued", "queued": stamp(), "pings": 0, "runs": [], "cost": {}}
+    return {**t, "prd": prd} if prd else t
+
+
+def cell(text) -> str:
+    """Ячейка таблицы markdown: без переводов строк и с `\\|` — многострочная причина остановки
+    (хвост stderr) не рвёт строку и не сдвигает столбцы."""
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
+def label_names(issue: dict) -> set[str]:
+    """Имена меток тикета из `gh issue list --json labels`."""
+    return {lb["name"] for lb in issue.get("labels") or []}
+
+
+def section(body: str | None, title: str) -> str:
+    """Текст раздела `## <title>` тела тикета — до следующего заголовка `##`."""
+    pattern = rf"^##\s+{re.escape(title)}\s*$(.*?)(?=^##\s|\Z)"
+    found = re.search(pattern, body or "", re.M | re.S | re.I)
+    return found.group(1) if found else ""
+
+
+def refs(text: str, repo: str) -> list[int]:
+    """Номера тикетов и PR этого репозитория в тексте: `#N` (и `PR#N`; `org/lib#N` и `&#N;` —
+    нет) и ссылки `github.com/<repo>/issues/N`, `…/pull/N` (ссылка на чужой репозиторий — нет)."""
+    url = rf"github\.com/{re.escape(repo)}/(?:issues|pull)/"
+    pattern = rf"(?:(?:(?<![\w/&])|(?<=PR))#|{url})(\d+)\b"
+    return [int(x) for x in re.findall(pattern, text, re.I)]
+
+
+def parent_of(body: str | None, repo: str) -> int | None:
+    """PRD тикета — первая ссылка раздела «Parent»."""
+    found = refs(section(body, "Parent"), repo)
+    return found[0] if found else None
+
+
+def blockers(body: str | None, repo: str) -> list[int]:
+    """Блокирующие тикеты — ссылки раздела «Blocked by»."""
+    return refs(section(body, "Blocked by"), repo)
+
+
+def claims(body: str | None) -> dict | None:
+    """Владения и флаги брифа по образцу `.claude/canon/ticket-ownership.md`: по одной строке
+    `**Владения:**` (пути в обратных кавычках через запятую) и `**Флаги:**` (`нет` или слова из
+    `FLAGS`). Строки нет, их несколько или она не по образцу (слова вместо путей, маска, `.`) —
+    None: тикет идёт один."""
+    owns, flags = OWNS_LINE.findall(body or ""), FLAGS_LINE.findall(body or "")
+    if len(owns) != 1 or len(flags) != 1:
+        return None
+    paths = []
+    for item in owns[0].strip().rstrip(".").split(","):
+        found = re.fullmatch(r"`([^`\s]+)`", item.strip())
+        if not found:
+            return None
+        path = re.sub(r"^(\./)+|^/+", "", found.group(1))
+        # Маска (`src/*.py`) и весь репозиторий (`.`) буквально с путями не сравнить.
+        parts = path.rstrip("/").split("/")
+        if not path or re.search(r"[*?\[\]]", path) or "." in parts or ".." in parts:
+            return None
+        paths.append(path)
+    words = [w.strip().lower() for w in flags[0].strip().rstrip(".").split(",")]
+    if words == ["нет"]:
+        words = []
+    if not all(w in FLAGS for w in words):
+        return None
+    return {"paths": paths, "flags": sorted(set(words))}
+
+
+def conflict(a: dict, b: dict) -> str | None:
+    """Чем пересекаются владения и флаги двух тикетов; None — могут идти параллельно. Путь без
+    `/` в конце может оказаться каталогом — сравнивается и как каталог."""
+    if shared := sorted(set(a["flags"]) & set(b["flags"])):
+        return f"общий флаг «{', '.join(shared)}»"
+    for x in a["paths"]:
+        for y in b["paths"]:
+            px, py = x.rstrip("/"), y.rstrip("/")
+            if px == py or py.startswith(px + "/") or px.startswith(py + "/"):
+                return f"`{x}` и `{y}`"
+    return None
+
+
+def schedule(text: str) -> list[tuple[int, int, int]]:
+    """Окна расписания `ЧЧ:ММ-ЧЧ:ММ=места` через запятую → (начало, конец в минутах суток,
+    места); окно через полночь — конец раньше начала, `24:00` — конец суток. Пусто — круглые
+    сутки. Не по образцу — сбой такта (код 1)."""
+    windows = []
+    for item in filter(None, (part.strip() for part in text.split(","))):
+        found = WINDOW.fullmatch(item)
+        bad = f"`git config {SCHEDULE_KEY}` — окна `ЧЧ:ММ-ЧЧ:ММ=места` через запятую, а не {item!r}"
+        if not found:
+            raise Failure(bad)
+        h1, m1, h2, m2, places = map(int, found.groups())
+        if h1 > 23 or h2 > 24 or m1 > 59 or m2 > 59 or (h2 == 24 and m2):
+            raise Failure(bad)
+        windows.append((h1 * 60 + m1, h2 * 60 + m2, places))
+    return windows
+
+
+def ceiling(text: str) -> float:
+    """Суточный потолок — доля недельного лимита: `0.2` или `20%`; пусто — `CEILING`."""
+    if not text:
+        return CEILING
+    try:
+        value = float(text[:-1]) / 100 if text.endswith("%") else float(text)
+    except ValueError:
+        value = -1
+    if not 0 < value <= 1:
+        raise Failure(f"`git config {CEILING_KEY}` — доля от 0 до 1 или процент, а не {text!r}")
+    return value
+
+
+def flag_value(args: list[str], flag: str) -> str | None:
+    """Значение флага в аргументах (первое вхождение: текст `--prompt` идёт позже)."""
+    return args[args.index(flag) + 1] if flag in args[:-1] else None
+
+
+def meminfo_available(text: str) -> float | None:
+    """Доступная память в байтах по `/proc/meminfo` песочницы (`MemAvailable`); нет — None."""
+    found = re.search(r"^MemAvailable:\s+(\d+) kB", text or "", re.M)
+    return int(found.group(1)) * 1024 if found else None
+
+
+def free_gb(kind: str, measure) -> float | None:
+    """Свободно ГБ (`DISK`, `MEMORY`): `CANON_FREE_<kind>_GB` для тестов, иначе замер."""
+    if (given := os.environ.get(f"CANON_FREE_{kind}_GB")) is not None:
+        return float(given)
+    try:
+        value = measure()
+    except OSError:
+        return None
+    return None if value is None else value / 2**30
+
+
+def write_json(path: Path, data: dict) -> None:
+    """JSON атомарно: такт не прочтёт полузаписанный файл команды владельца."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".cmd-", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        json.dump(data, out, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def without_tokens() -> dict:
+    """Окружение такта без токенов GitHub: сессии и ревью токен оркестратора не нужен."""
+    return {k: v for k, v in os.environ.items() if k not in TOKENS}
+
+
+def checks(pr: dict) -> list[dict]:
+    """Проверки CI на PR — без сторожа и самой отметки."""
+    return [
+        c
+        for c in pr.get("statusCheckRollup") or []
+        if c.get("name") != start.GUARD and c.get("context") != start.REVIEW
+    ]
+
+
+def ci_green(pr: dict) -> bool:
+    """Все проверки CI закончились зелёными; проверок нет — не зелёный (GitHub ещё не завёл
+    их)."""
+    found = checks(pr)
+    return bool(found) and all(
+        (c.get("status") or "COMPLETED").upper() == "COMPLETED"
+        and (c.get("conclusion") or c.get("state") or "").upper() in GREEN
+        for c in found
+    )
+
+
+def inside_project(main: Path) -> bool:
+    """Скрипт лежит в проекте, который ведёт, — в главном чекауте или его worktree."""
+    for tree in start.worktrees():
+        if HERE.is_relative_to(Path(tree["path"])):
+            return True
+    return HERE.is_relative_to(main)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="orchestrator", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("tick", help="один такт: GitHub, состояние, время → действия")
+    sub.add_parser("pause", help="пауза: новые тикеты не брать, начатые — до конца запуска")
+    sub.add_parser("now", help="работай сейчас: снять паузу, переопределить расписание")
+    sub.add_parser("status", help="статус: тикеты, места, очередь, паузы с причинами")
+    service = sub.add_parser("service", help="служба launchd: поставить или снять")
+    service.add_argument("action", choices=("install", "remove"))
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        orch = Orchestrator()
+        if inside_project(orch.main):
+            print(
+                f"orchestrator: запуск из проекта ({HERE}) — нужен из своей копии канона: "
+                "иначе сессия подменила бы скрипты ревью и отметки",
+                file=sys.stderr,
+            )
+            return 2
+        commands = {
+            "tick": orch.tick,
+            "pause": orch.owner_pause,
+            "now": orch.owner_now,
+            "status": orch.status,
+            "service": {"install": orch.service_install, "remove": orch.service_remove}.get(
+                getattr(args, "action", None)
+            ),
+        }
+        commands[args.command]()
+    except (Failure, core.Failure, start.StartError) as exc:
+        print(f"orchestrator: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

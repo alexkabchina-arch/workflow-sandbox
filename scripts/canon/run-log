@@ -67,6 +67,22 @@ def parse(argv: list[str]) -> argparse.Namespace:
 
 def execute(command: list[str], out: int) -> int:
     """Исполняет команду с выводом в `out`; код выхода — как его вернула бы оболочка."""
+    # Обработчики — до запуска: сигнал, пришедший, пока команда стартует, не убивает обёртку,
+    # а ждёт и уходит группе команды сразу после запуска (#244).
+    group: list[int] = []
+    pending: list[int] = []
+
+    def forward(signum, _frame):
+        if not group:
+            pending.append(signum)
+            return
+        try:
+            os.killpg(group[0], signum)
+        except ProcessLookupError:
+            pass
+
+    for signum in FORWARDED:
+        signal.signal(signum, forward)
     try:
         proc = subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True
@@ -74,15 +90,9 @@ def execute(command: list[str], out: int) -> int:
     except OSError as exc:
         os.write(out, f"run-log: не удалось запустить {command[0]}: {exc}\n".encode())
         return 127 if exc.errno == errno.ENOENT else 126
-
-    def forward(signum, _frame):
-        try:
-            os.killpg(proc.pid, signum)
-        except ProcessLookupError:
-            pass
-
-    for signum in FORWARDED:
-        signal.signal(signum, forward)
+    group.append(proc.pid)
+    while pending:
+        forward(pending.pop(0), None)
     code = proc.wait()
     return 128 - code if code < 0 else code
 

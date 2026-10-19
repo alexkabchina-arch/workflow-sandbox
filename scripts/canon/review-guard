@@ -9,15 +9,23 @@
 обязательная проверка `review-guard` от GitHub Actions: workflow `review-guard` запускает его по
 `pull_request_target`, то есть из ветки по умолчанию, — PR не подменит ни workflow, ни скрипт.
 
-Зелёный, только если отметка `review` на коммите — своя:
+Зелёный, только если отметка `review` на коммите — из белого списка (#213):
 
-- статус от учётной записи (`creator.type == "User"`) — его ставит `ship-finish`; workflow PR
-  ставит статусы от `github-actions[bot]`;
+- статус от учётной записи владельца (`creator.type == "User"`, логин — `REVIEW_OWNER`) — его
+  ставит `ship-finish` ручной сессии; статус от другой учётной записи — красный (R-10 спеки #208);
+- статус от App канона (`creator.type == "Bot"`, логин — `REVIEW_APP` с `[bot]`; регистр не
+  важен) — его ставит оркестратор токеном App; `REVIEW_APP` пуст — App в списке нет;
 - статус от `github-actions[bot]`, у которого `target_url` ведёт на прогон
   `.github/workflows/dependabot-review.yml` по `pull_request_target` на этом же коммите, начатый
   Dependabot (`actor` — `dependabot[bot]`), и шаг отметки в нём не пропущен. Прогон этого
   workflow с пропущенным джобом есть у каждого PR: без проверки `actor` и шага подделка
   сослалась бы на него.
+
+Белый список — переменные окружения `REVIEW_OWNER` и `REVIEW_APP`, их задаёт workflow сторожа из
+переменных репозитория: в скрипт не зашит, проекту — свой. Без `REVIEW_OWNER` — код 2: сторож не
+судит. `REVIEW_APP` не может быть `github-actions` или `dependabot` (код 2 — это держит `guard`, а
+не только `main`): статус от них ставит любой workflow, и App с таким именем вернул бы R1 аудита
+#160. Статус `review` от App тоже порождает событие `status` и перезапуск сторожа.
 
 Красный сразу — check run с именем `review` (у отметок канона их нет: это джоб workflow) или
 статус `review` от другого источника, в том числе под честной отметкой. Успешной отметки нет —
@@ -46,6 +54,7 @@ DEPENDABOT_JOB = "dependabot-review"
 DEPENDABOT_STEP = "Отметка ревью и авто-мёрж"
 DEPENDABOT = "dependabot[bot]"
 ACTIONS_BOT = "github-actions[bot]"
+WORKFLOW_BOTS = {ACTIONS_BOT, DEPENDABOT}  # статус от них ставит любой workflow — не App канона
 POLL = 10  # секунд между опросами
 TRIES, PAUSE, TIMEOUT = 3, 5, 30  # попыток запроса к GitHub, секунд между ними и на ответ
 REFUSED = re.compile(r"HTTP 4(?!29)\d\d")  # отказ GitHub: повтор его не изменит
@@ -98,11 +107,26 @@ def dependabot_marked(run: dict, jobs: list, sha: str) -> bool:
     return False
 
 
-def foreign_source(status: dict, repo: str, sha: str, run_of, server: str) -> str | None:
-    """Причина, почему статус `review` не от `ship-finish` и не от `dependabot-review`."""
+def app_login(app: str) -> str:
+    """Логин статусов App в нижнем регистре: `<slug>[bot]`; slug можно задать и с `[bot]`, пусто —
+    App нет. Логин workflow-бота — `RuntimeError`: такой «App» засчитал бы любой workflow."""
+    slug = app.strip().lower()
+    slug = slug[: -len("[bot]")] if slug.endswith("[bot]") else slug
+    login = f"{slug}[bot]" if slug else ""
+    if login in WORKFLOW_BOTS:
+        raise RuntimeError(f"REVIEW_APP={app}: статус от него ставит любой workflow, не App")
+    return login
+
+
+def foreign_source(status: dict, repo: str, sha: str, run_of, server: str, owner: str, app: str):
+    """Причина, почему статус `review` не из белого списка; None — из него. `app` — логин из
+    `app_login`."""
     creator = status.get("creator") or {}
     login = creator.get("login") or "?"
-    if creator.get("type") == "User":
+    kind = creator.get("type")
+    if kind == "User" and login.lower() == owner.lower():
+        return None
+    if kind == "Bot" and app and login.lower() == app:
         return None
     if login == ACTIONS_BOT:
         url = status.get("target_url") or ""
@@ -111,24 +135,31 @@ def foreign_source(status: dict, repo: str, sha: str, run_of, server: str) -> st
         if match and dependabot_marked(*run_of(match.group(1)), sha):
             return None
         return f"статус review от {login} не из dependabot-review этого коммита"
-    return f"статус review от {login}"
+    return f"статус review от {login}: его нет в белом списке"
 
 
-def verdict(repo: str, sha: str, statuses: list, check_runs: list, run_of, server: str) -> tuple:
+def verdict(
+    repo: str, sha: str, statuses: list, check_runs: list, run_of, server: str, owner: str, app: str
+) -> tuple:
     """(True | False | None, пояснение); None — успешной отметки пока нет."""
     if check_runs:
         return False, "check run с именем review: у отметки канона их нет, его поставил workflow"
     marks = [s for s in statuses if s.get("context") == CONTEXT]  # от новых к старым
     for mark in marks:
-        reason = foreign_source(mark, repo, sha, run_of, server)
+        reason = foreign_source(mark, repo, sha, run_of, server, owner, app)
         if reason:
-            return False, f"{reason}: отметку ставят только ship-finish и dependabot-review"
+            allowed = ", ".join(filter(None, [owner, app, "dependabot-review"]))
+            return False, f"{reason}: отметку засчитывают только от {allowed}"
     if marks and marks[0].get("state") == "success":
         return True, f"отметка review от {marks[0]['creator']['login']}"
     return None, "нет успешной отметки review"
 
 
-def guard(repo: str, sha: str, wait: int, gh=gh_api, sleep=time.sleep) -> int:
+def guard(repo: str, sha: str, wait: int, owner: str, app: str, gh=gh_api, sleep=time.sleep) -> int:
+    """Код сторожа; `owner` — логин владельца, `app` — имя App канона (пусто — App нет)."""
+    if not owner.strip():
+        raise RuntimeError("не задан REVIEW_OWNER — логин владельца в белом списке сторожа")
+    owner, app = owner.strip(), app_login(app)
     server = os.environ.get("GITHUB_SERVER_URL") or "https://github.com"
     runs = {}
 
@@ -143,7 +174,8 @@ def guard(repo: str, sha: str, wait: int, gh=gh_api, sleep=time.sleep) -> int:
     while True:
         statuses = gh(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True)
         checks = gh(f"repos/{repo}/commits/{sha}/check-runs?check_name={CONTEXT}&per_page=100")
-        ok, why = verdict(repo, sha, statuses, checks.get("check_runs") or [], run_of, server)
+        check_runs = checks.get("check_runs") or []
+        ok, why = verdict(repo, sha, statuses, check_runs, run_of, server, owner, app)
         if ok is None and waited < wait:
             sleep(POLL)
             waited += POLL
@@ -158,8 +190,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("sha", help="head-коммит PR")
     parser.add_argument("--wait", type=int, default=0, help="сколько секунд ждать отметку")
     args = parser.parse_args(argv)
+    owner = os.environ.get("REVIEW_OWNER", "")
+    app = os.environ.get("REVIEW_APP", "")
     try:
-        return guard(args.repo, args.sha, args.wait)
+        return guard(args.repo, args.sha, args.wait, owner, app, gh=gh_api)
     except RuntimeError as exc:
         print(f"review-guard: {exc}", file=sys.stderr)
         return 2

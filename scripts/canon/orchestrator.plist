@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Образец службы оркестратора канона (#222) для launchd пользователя.
+  Руками не ставить: `<копия канона>/project/scripts/canon/orchestrator service install` из
+  главного чекаута проекта подставит Label, ProgramArguments, WorkingDirectory, логи и PATH и
+  положит plist в ~/Library/LaunchAgents. Как устроено — docs/orchestrator.md канона.
+  Файл вендорится из канона alexkabchina-arch/workflow: руками не править.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>canon.orchestrator</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>python3</string>
+		<string>orchestrator</string>
+		<string>tick</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/</string>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>StandardOutPath</key>
+	<string>/dev/null</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/null</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/bin:/bin</string>
+		<key>PYTHONIOENCODING</key>
+		<string>utf-8</string>
+	</dict>
+</dict>
+</plist>

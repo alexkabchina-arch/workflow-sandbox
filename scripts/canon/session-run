@@ -2,7 +2,9 @@
 """session-run — стартовая команда сессии тикета: `session-start`, затем `claude` в worktree.
 
     scripts/canon/session-run <номер тикета> [--headless [--max-budget-usd USD]] \\
-        [-- <аргументы claude>]
+        [--resume <id сессии> [--prompt <текст>]] [--run <метка>] [-- <аргументы claude>]
+    scripts/canon/session-run <номер тикета> --retire <head>    # уборка после мёржа
+    scripts/canon/session-run <номер тикета> --discard          # повтор с чистого листа
 
 Тонкая оболочка: вся стартовая логика — в `session-start` (его можно вызвать и сам, первым шагом
 уже открытой сессии). Здесь только способ запуска: `claude` прямо в каталоге worktree (иначе
@@ -23,6 +25,33 @@
   числе аварийным. `claude` дескриптор не наследует: иначе его унесли бы фоновые процессы
   сессии (dev-сервер) и держали worktree занятым после её конца.
 
+- Под оркестратором (`CANON_ORCHESTRATOR=1` в окружении, #214) — всегда headless, флаг передаётся
+  `claude` и Stop-хуку, промпт — режим `/start N` вместо «`/implement`, затем `/ship`»: сессия
+  кончается на «код готов» или на вопросе.
+- `--resume <id>` — продолжить сессию `claude -p --resume <id>` в worktree тикета (ветка
+  `ticket-N` или `ticket-N-…`) под тем же замком и с тем же Stop-хуком; `session-start` не
+  вызывается (уборка, PR автора, метка — уже были). Промпт — `--prompt`, по умолчанию `/start N`:
+  режим `/start` сам находит шаг маршрута (ответ на вопрос, разбор находок, продолжение). Worktree
+  тикета нет или в нём уже идёт сессия — код 2. Только headless: оркестратор возобновляет
+  `claude -p`. Время запуска — `CANON_RUN_STARTED`: Stop-хук не засчитает этому запуску отчёт
+  об остановке прошлого.
+
+Под оркестратором `session-run` идёт **внутри песочницы проекта** (`sbx exec`, #241), в клоне
+оркестратора, — и всё, что трогает git клона, тоже идёт здесь, внутри: оркестратор на Mac git в
+клоне сессий не выполняет (хук или `core.fsmonitor`, заложенные сессией, сработали бы с его
+токеном).
+
+- `--run <метка>` — метка запуска оркестратора: по ней такт находит процессы запуска внутри
+  песочницы (`ps`), стоп и предел времени завершают их группу. С ней процесс становится лидером
+  своей группы (`setsid`): агент, тесты и dev-сервер — в ней, сама `sbx exec` — нет.
+- `--retire <head>` — уборка после мёржа PR с этим head механикой `session-start`
+  (`retire_merged`: worktree, ветка, ресурсы проекта, метка `in-progress`); итог — последней
+  строкой JSON `{"gone": …, "problems": […]}`, код 0 (сбой уборки — в `problems`).
+- `--discard` — повтор с чистого листа (`agent:retry`): `git fetch --prune`, worktree тикета с
+  ресурсами проекта (`cleanup`) и записью реестра, локальная ветка и состояние маршрута
+  `canon-ticket/N`. В worktree идёт сессия, ресурсы не убраны или git отказал — код 1 и причина;
+  повтор безопасен.
+
 Код выхода — код `session-start`, если он не 0 (2 — и неверные аргументы, и в worktree уже идёт
 сессия); иначе — код `claude`.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
@@ -32,10 +61,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -54,6 +87,86 @@ def load(name: str, filename: str):
 
 claude_run = load("canon_claude_run", "claude_run.py")  # предел — как у `review` и `verify`
 session_start = load("canon_session_start", "session-start")
+core = session_start.core
+
+
+def resume_plan(ticket: str, claim) -> tuple[int, dict | None]:
+    """План возобновления: worktree ветки тикета под замком, без `session-start`."""
+    try:
+        number = ticket_number(ticket)
+        with session_start.registry_lock():
+            worktree = core.worktree_of(number)
+            if worktree is None:
+                raise session_start.UsageError(
+                    f"worktree тикета #{number} нет — возобновлять негде: новая сессия"
+                )
+            claim(worktree)
+    except session_start.UsageError as exc:
+        session_start.note(str(exc))
+        return 2, None
+    except (session_start.StartError, core.Failure) as exc:
+        session_start.note(str(exc))
+        return 1, None
+    return 0, {"worktree": str(worktree), "session": f"ticket-{number}"}
+
+
+def ticket_number(ticket: str) -> int:
+    if not ticket.lstrip("#").isdigit():
+        raise session_start.UsageError(f"номер тикета — число, а не {ticket!r}")
+    return int(ticket.lstrip("#"))
+
+
+def route_branch(number: int) -> str:
+    """Ветка тикета из состояния маршрута; не ветка этого тикета — `ticket-N`."""
+    branch = core.State(number)["branch"]
+    return branch if core.ticket_of(branch) == number else f"ticket-{number}"
+
+
+def retire(number: int, head: str) -> int:
+    """Уборка после мёржа — механикой `session-start`; итог — JSON последней строкой."""
+    try:
+        gone, problems = session_start.retire_merged(route_branch(number), head, None)
+    except (session_start.StartError, core.Failure) as exc:
+        gone, problems = False, [f"сбой: {exc}"]
+    print(json.dumps({"gone": gone, "problems": problems}, ensure_ascii=False))
+    return 0
+
+
+def discard(number: int) -> int:
+    """Повтор с чистого листа: worktree с ресурсами и записью реестра, ветка, состояние
+    маршрута. Каждый шаг повторим: сбой посреди — код 1, следующий вызов доделает."""
+    st = core.State(number)
+    branch = route_branch(number)
+    main = Path(session_start.worktrees()[0]["path"])
+    fetched = core.run("git", "fetch", "-q", "--prune", "origin")
+    if fetched.returncode != 0:
+        session_start.note(f"git fetch --prune: {fetched.stderr.strip()}")
+        return 1
+    with session_start.registry_lock():
+        if (worktree := core.worktree_of(number)) is not None:
+            lock = session_start.take_lock(worktree)
+            if lock is None:
+                session_start.note(f"в {worktree} ещё идёт сессия — повтор не начат")
+                return 1
+            lock.close()
+            res = core.run("git", "worktree", "remove", "--force", str(worktree))
+            if res.returncode != 0:
+                session_start.note(f"worktree {worktree} не убран: {res.stderr.strip()}")
+                return 1
+        pending = session_start.cleanup(main)  # ресурсы worktree и запись реестра
+    if left := [p for p in pending if re.fullmatch(rf"ticket-{number}(-.+)?", Path(p).name)]:
+        session_start.note(
+            f"ресурсы worktree {', '.join(left)} не убраны ({session_start.CLEANUP})"
+        )
+        return 1
+    if session_start.tip(f"refs/heads/{branch}") is not None:
+        res = core.run("git", "branch", "-q", "-D", branch)
+        if res.returncode != 0:
+            session_start.note(f"ветка {branch} не удалена: {res.stderr.strip()}")
+            return 1
+    shutil.rmtree(st.dir, ignore_errors=True)
+    print(f"session-run: тикет #{number} — worktree, ветка и состояние маршрута убраны")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -71,7 +184,36 @@ def main(argv: list[str] | None = None) -> int:
         type=claude_run.budget_usd,
         help=f"предел (по умолчанию {DEFAULT_BUDGET})",
     )
+    parser.add_argument("--resume", metavar="ID", help="продолжить сессию claude по id")
+    parser.add_argument("--prompt", help="промпт возобновления (по умолчанию /start N)")
+    parser.add_argument("--run", metavar="МЕТКА", help="метка запуска оркестратора")
+    cleanup = parser.add_mutually_exclusive_group()
+    cleanup.add_argument("--retire", metavar="HEAD", help="уборка после мёржа PR с этим head")
+    cleanup.add_argument(
+        "--discard", action="store_true", help="worktree, ветка и состояние — с чистого листа"
+    )
     args = parser.parse_args(argv)
+    if args.retire or args.discard:
+        try:
+            number = ticket_number(args.ticket)
+            return retire(number, args.retire) if args.retire else discard(number)
+        except session_start.UsageError as exc:
+            session_start.note(str(exc))
+            return 2
+        except (session_start.StartError, core.Failure) as exc:
+            session_start.note(str(exc))
+            return 1
+    if args.run:
+        try:  # своя группа: стоп завершит агента, тесты и dev-сервер, но не `sbx exec`
+            os.setsid()
+        except OSError:
+            pass  # уже лидер своей группы
+    orchestrated = core.orchestrated()
+    if orchestrated or args.resume:
+        args.headless = True  # оркестратор ведёт только claude -p
+    if args.prompt and not args.resume:
+        print("session-run: --prompt — только с --resume", file=sys.stderr)
+        return 2
     if args.max_budget_usd and not args.headless:
         print(
             "session-run: --max-budget-usd работает только с --headless (claude -p)",
@@ -87,19 +229,29 @@ def main(argv: list[str] | None = None) -> int:
             raise session_start.UsageError(f"в {worktree} уже идёт сессия — второй не запускаю")
         held.append(lock)
 
-    code, plan = session_start.prepare(args.ticket, claim)
+    if args.resume:
+        code, plan = resume_plan(args.ticket, claim)
+    else:
+        code, plan = session_start.prepare(args.ticket, claim)
     if code != 0:
         return code
     (lock,) = held
+    start = f"/start {args.ticket.lstrip('#')}"
+    prompt = (args.prompt or start) if args.resume or orchestrated else plan["prompt"]
 
     cmd = ["claude"]
     if args.headless:
         cmd += ["-p", "--max-budget-usd", args.max_budget_usd or DEFAULT_BUDGET]
         if "--permission-mode" not in extra:
             cmd += ["--permission-mode", HEADLESS_MODE]
+    if args.resume:
+        cmd += ["--resume", args.resume]
     # `--` перед промптом: вариадические флаги (`--allowedTools`, `--add-dir`) иначе съедят его.
-    cmd += [*extra, "--", plan["prompt"]]
+    cmd += [*extra, "--", prompt]
     env = {**os.environ, "CANON_SESSION": plan["session"]}
+    # Начало этого запуска для Stop-хука: `--resume` продолжает транскрипт прошлого, и отчёт об
+    # остановке прошлого запуска иначе засчитался бы этому.
+    env["CANON_RUN_STARTED"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     env.pop("CANON_ENFORCE_STOP", None)
     if args.headless:
         # Stop-хук (`stop-check`) держит только headless-сессию: в интерактивной владелец рядом.

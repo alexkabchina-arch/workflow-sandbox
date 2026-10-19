@@ -2,18 +2,23 @@
 #
 # Сторож отметки ревью (#163): обязательная проверка `review-guard` от GitHub Actions. Проверка
 # `review` в наборе правил засчитывается от любого источника, и PR с workflow, где есть джоб
-# `review`, сам ставил себе отметку. Сторож зелёный, только если отметку поставил `ship-finish`
-# (статус от учётной записи) или `dependabot-review` (статус со ссылкой на свой прогон);
-# check run `review` или статус `review` из другого источника — красный. Логика — в
-# `scripts/canon/review-guard`.
+# `review`, сам ставил себе отметку. Сторож зелёный, только если отметка из белого списка (#213):
+# от учётной записи владельца (`ship-finish` ручной сессии), от App канона (оркестратор) или от
+# `dependabot-review` (статус со ссылкой на свой прогон); check run `review` или статус `review`
+# из другого источника — красный. Логика — в `scripts/canon/review-guard`.
+#
+# Белый список — переменные репозитория (Settings → Secrets and variables → Actions →
+# Variables): `REVIEW_OWNER` — логин владельца (не задан — владелец репозитория), `REVIEW_APP` —
+# имя (slug) App канона (не задан — App в списке нет). PR их не подменит; меняет их участник с
+# доступом к настройкам Actions — шаг владельца (`docs/protect-main.md` канона).
 #
 # `pull_request_target`: workflow и скрипт — из базовой ветки, код PR не выгружается и не
 # исполняется, подменить сторожа PR не может. Свой зелёный джоб `review-guard` в PR красного
 # сторожа не перекрывает: упавший check run с тем же именем держит мёрж (R2 аудита #160).
 #
 # Отметка часто приходит после старта сторожа: он ждёт её 2 минуты, а успешный статус `review`
-# от `ship-finish` (событие `status`) перезапускает упавший прогон сторожа — workflow
-# `review-guard-rerun.yml`. Статус от токена workflow событий не порождает, поэтому
+# от `ship-finish` или от App канона (событие `status`) перезапускает упавший прогон сторожа —
+# workflow `review-guard-rerun.yml`. Статус от токена workflow событий не порождает, поэтому
 # `dependabot-review` перезапускает сторожа сам тем же шагом. Перезапуск — отдельным файлом: здесь
 # на каждое событие `status` появлялся бы пропущенный check run `review-guard`.
 #
@@ -43,4 +48,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEW_OWNER: ${{ vars.REVIEW_OWNER || github.repository_owner }}
+          REVIEW_APP: ${{ vars.REVIEW_APP }}
         run: python3 scripts/canon/review-guard "$GITHUB_REPOSITORY" "$SHA" --wait 120
