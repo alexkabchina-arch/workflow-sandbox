@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""app-token — часовые токены лица агента (GitHub App) для сессии тикета и оркестратора (#212).
+
+    scripts/canon/app-token issue   --kind session|orchestrator [--repo OWNER/NAME] [--app-id ID]
+    scripts/canon/app-token refresh --kind … --repo … --app-id … --file ФАЙЛ [--margin СЕК]
+    scripts/canon/app-token keep    --kind … --repo … --app-id … --file ФАЙЛ [--every СЕК] […]
+    scripts/canon/app-token shims   --file ФАЙЛ --dir КАТАЛОГ [--gh ПУТЬ]
+
+Ключ App — PEM в связке ключей macOS (служба `canon-agent-app`, учётная запись — App ID);
+читается `security find-generic-password -w` в память процесса и только в ней превращается в
+подпись JWT (RS256 на стандартной библиотеке: ключ не уходит ни в файл, ни в подпроцесс, ни в
+окружение). JWT меняется на токен установки App на один репозиторий с урезанными правами:
+
+- `session` — токен сессии: contents, pull requests, issues — запись; checks, statuses, actions —
+  чтение (статус PR и логи CI); без записи статусов, без administration и workflows;
+- `orchestrator` — токен оркестратора: то же плюс запись статусов (отметка `review`). Авто-мёрж
+  включают оба: отдельного права у GitHub нет, хватает contents и pull requests (проба #212);
+  слияние без отметки `review` от владельца или App он всё равно не даст.
+
+Выданные права и репозиторий сверяются с ответом GitHub: токен шире набора (лишнее право, уровень
+выше запрошенного) или не на один репозиторий не отдаётся (код 1).
+
+`issue` печатает JSON `{token, expires_at, permissions, kind, repo}`. `refresh` пишет токен в ФАЙЛ
+(строки: токен, `expires_at`, вид, репозиторий; права 0600, замена атомарная), если в файле не
+токен этого вида на этот репозиторий или ему осталось меньше `--margin` секунд (900); иначе файл
+не трогает. `keep` — `refresh` раз в `--every` секунд (300) до сигнала, сбой круга — строка в
+stderr и повтор: так оркестратор держит токен сессии свежим, а запуск дольше часа не падает на
+push. `issue`, `refresh` и `keep` идут на Mac владельца, где есть связка ключей; у `refresh` и
+`keep` репозиторий и App ID — только явные (`origin` и git config клона сессия правит сама).
+
+`shims` — для среды сессии, где связки ключей нет: пишет в КАТАЛОГ обёртку `gh` (берёт токен из
+ФАЙЛА на каждый вызов через `GH_TOKEN`, настройки — пустой `GH_CONFIG_DIR`: вход `gh` владельца
+не виден) и помощник git `git-credential-canon-app` (отдаёт токен из ФАЙЛА для
+`https://github.com`); пустой токен — обе отказывают, а не откатываются к чужому входу. Печатает
+строки `export` окружения: `PATH` с КАТАЛОГОМ первым и `GIT_CONFIG_*` после уже заданных в
+окружении, где список помощников для github.com сначала сброшен (помощник `gh-token` Docker
+Sandboxes и прочие не участвуют). Обе обёртки читают файл при каждом вызове — токен, обновлённый
+`keep`, подхватывается без перезапуска. КАТАЛОГ с чужим `gh` и `--gh`, указывающий на обёртку, —
+отказ.
+
+Настройки `issue`: App ID — `--app-id` или `git config canon.agentAppId`; репозиторий — `--repo`
+или `origin` текущего клона. Адрес API — `CANON_GITHUB_API`, только для тестов: принимается лишь
+`https://api.github.com` и `http://127.0.0.1` или `localhost` — JWT с ключом App другому хосту не
+уходит. Ошибка — код 1 и сообщение `app-token:` в stderr, ошибка аргументов — код 2.
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import datetime as dt
+import hashlib
+import http.client
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+SERVICE = "canon-agent-app"  # служба записи связки ключей с PEM ключа App
+APP_ID_CONFIG = "canon.agentAppId"
+API = "https://api.github.com"
+LOCAL_API = re.compile(r"http://(?:127\.0\.0\.1|localhost)(?::\d+)?$")  # сервер тестов
+LEVELS = ("none", "read", "write", "admin")
+SHIM_MARK = "canon app-token shim"
+JWT_LIFE = 540  # GitHub: exp не дальше 10 минут
+CLOCK_SKEW = 60  # GitHub советует iat на минуту в прошлое
+MARGIN = 900
+EVERY = 300
+HELPER = "git-credential-canon-app"
+SESSION = {
+    "contents": "write",
+    "pull_requests": "write",
+    "issues": "write",
+    "metadata": "read",
+    "checks": "read",
+    "statuses": "read",
+    "actions": "read",
+}
+KINDS = {"session": SESSION, "orchestrator": {**SESSION, "statuses": "write"}}
+# DigestInfo SHA-256 для EMSA-PKCS1-v1_5 (RFC 8017, 9.2, примечание 1).
+SHA256_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
+REMOTE = re.compile(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+
+
+class Failure(Exception):
+    """Ошибка, о которой скрипт сообщает строкой и кодом 1."""
+
+
+# --- RSA и JWT ---------------------------------------------------------------------------------
+
+
+def _der(data: bytes, pos: int) -> tuple[int, int, int]:
+    """Элемент DER с позиции `pos`: (тег, начало значения, конец значения)."""
+    tag, size = data[pos], data[pos + 1]
+    pos += 2
+    if size & 0x80:
+        count = size & 0x7F
+        size = int.from_bytes(data[pos : pos + count], "big")
+        pos += count
+    if pos + size > len(data):
+        raise ValueError("DER обрезан")
+    return tag, pos, pos + size
+
+
+def _children(data: bytes, start: int, end: int) -> list[tuple[int, int, int]]:
+    items, pos = [], start
+    while pos < end:
+        item = _der(data, pos)
+        items.append(item)
+        pos = item[2]
+    return items
+
+
+def private_key(pem: str) -> tuple[int, int]:
+    """(n, d) из PEM ключа RSA: PKCS#1 (`RSA PRIVATE KEY`, как отдаёт GitHub) или PKCS#8."""
+    match = re.search(r"-----BEGIN ((?:RSA )?PRIVATE KEY)-----(.+?)-----END \1-----", pem, re.S)
+    if not match:
+        raise Failure("ключ App — не PEM ключа RSA")
+    try:
+        der = base64.b64decode("".join(match.group(2).split()), validate=True)
+        _, start, end = _der(der, 0)
+        items = _children(der, start, end)
+        if match.group(1) == "PRIVATE KEY":  # PKCS#8: version, algorithm, OCTET STRING с PKCS#1
+            _, start, end = items[2]
+            _, start, end = _der(der, start)
+            items = _children(der, start, end)
+        n, d = (int.from_bytes(der[s:e], "big") for _, s, e in (items[1], items[3]))
+    except (ValueError, IndexError, binascii.Error):
+        raise Failure("ключ App не разобран как ключ RSA") from None
+    return n, d
+
+
+def sign(message: bytes, key: tuple[int, int]) -> bytes:
+    """Подпись RSASSA-PKCS1-v1_5 с SHA-256 (RS256)."""
+    n, d = key
+    size = (n.bit_length() + 7) // 8
+    digest = SHA256_PREFIX + hashlib.sha256(message).digest()
+    block = b"\x00\x01" + b"\xff" * (size - len(digest) - 3) + b"\x00" + digest
+    return pow(int.from_bytes(block, "big"), d, n).to_bytes(size, "big")
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def jwt(app_id: str, key: tuple[int, int], now: float) -> str:
+    """JWT App: iat на минуту в прошлое, exp — через 9 минут, iss — App ID."""
+    header = {"alg": "RS256", "typ": "JWT"}
+    claims = {"iat": int(now) - CLOCK_SKEW, "exp": int(now) + JWT_LIFE, "iss": app_id}
+    body = ".".join(_b64(json.dumps(x, separators=(",", ":")).encode()) for x in (header, claims))
+    return f"{body}.{_b64(sign(body.encode(), key))}"
+
+
+# --- окружение: связка ключей, git, API ----------------------------------------------------------
+
+
+def keychain_pem(app_id: str) -> str:
+    """PEM ключа App из связки ключей. `security -w` печатает многострочный пароль в hex."""
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", SERVICE, "-a", app_id, "-w"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        raise Failure("нет `security`: связка ключей есть только на Mac владельца") from None
+    if out.returncode:
+        raise Failure(
+            f"ключа App {app_id} нет в связке ключей (служба {SERVICE}): docs/github-app.md"
+        )
+    value = out.stdout.strip()
+    if "BEGIN" not in value and re.fullmatch(r"(?:[0-9a-fA-F]{2})+", value):
+        value = bytes.fromhex(value).decode(errors="replace")
+    return value
+
+
+def git_value(*args: str) -> str:
+    out = subprocess.run(["git", *args], capture_output=True, text=True)
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def default_repo() -> str:
+    match = REMOTE.search(git_value("remote", "get-url", "origin"))
+    if not match:
+        raise Failure("репозиторий не задан: --repo OWNER/NAME (origin — не github.com)")
+    return f"{match.group(1)}/{match.group(2)}"
+
+
+def api_base() -> str:
+    """Адрес API: GitHub или локальный сервер тестов — JWT с ключом App другому хосту не уходит."""
+    base = os.environ.get("CANON_GITHUB_API", API).rstrip("/")
+    if base != API and not LOCAL_API.match(base):
+        raise Failure(f"CANON_GITHUB_API={base}: допустимы только {API} и локальный адрес тестов")
+    return base
+
+
+def api(method: str, path: str, bearer: str, body: dict | None = None) -> dict:
+    base = api_base()
+    request = urllib.request.Request(
+        f"{base}{path}",
+        method=method,
+        data=None if body is None else json.dumps(body).encode(),
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {bearer}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "canon-app-token",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")[:300]
+        raise Failure(f"{method} {path}: HTTP {error.code} {detail}") from None
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as error:
+        raise Failure(f"{method} {path}: {error}") from None
+
+
+def wider(granted: dict, wanted: dict) -> dict:
+    """Права ответа шире набора: лишний ключ или уровень выше запрошенного."""
+    rank = {level: n for n, level in enumerate(LEVELS)}
+    return {
+        k: v for k, v in granted.items() if rank.get(v, len(LEVELS)) > rank[wanted.get(k, "none")]
+    }
+
+
+def issue(kind: str, repo: str, app_id: str, now: float, pem=keychain_pem, call=api) -> dict:
+    """Токен установки App на `repo` с правами набора `kind`."""
+    token = jwt(app_id, private_key(pem(app_id)), now)
+    installation = call("GET", f"/repos/{repo}/installation", token)
+    name = repo.split("/", 1)[1]
+    body = {"repositories": [name], "permissions": KINDS[kind]}
+    try:
+        reply = call("POST", f"/app/installations/{installation['id']}/access_tokens", token, body)
+        granted = reply.get("permissions") or {}
+        repos = [r.get("full_name") or r.get("name") for r in reply.get("repositories") or []]
+        data = {"token": reply["token"], "expires_at": reply["expires_at"]}
+    except (KeyError, TypeError, AttributeError):
+        raise Failure("ответ GitHub без токена — не тот формат") from None
+    extra = wider(granted, KINDS[kind])
+    if extra:  # токен шире набора сессии открыл бы ей слияние — не отдавать
+        raise Failure(f"GitHub выдал права шире набора {kind}: {extra}")
+    if reply.get("repository_selection") != "selected" or repos not in ([name], [repo]):
+        raise Failure(f"GitHub выдал токен не на один {repo}: {repos or 'все репозитории'}")
+    return {**data, "permissions": granted, "kind": kind, "repo": repo}
+
+
+# --- файл токена ----------------------------------------------------------------------------------
+
+
+def epoch(stamp: str) -> float:
+    """Секунды эпохи из ISO 8601 GitHub (`Z`, `+00:00`, доли секунды); без зоны — UTC."""
+    moment = dt.datetime.fromisoformat(stamp.strip().replace("Z", "+00:00"))
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.timezone.utc)
+    return moment.timestamp()
+
+
+def expires(path: Path, kind: str, repo: str) -> float | None:
+    """Время истечения токена в файле, если он выпущен для `kind` и `repo`; файла нет, он
+    испорчен или токен другого вида или репозитория — None."""
+    try:
+        token, stamp, own_kind, own_repo = path.read_text().splitlines()[:4]
+        if not token.strip() or (own_kind, own_repo) != (kind, repo):
+            return None
+        return epoch(stamp)
+    except (OSError, ValueError):
+        return None
+
+
+def write_token(path: Path, data: dict) -> None:
+    """Файл токена: токен, `expires_at`, вид, репозиторий; права 0600, замена атомарная."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w") as handle:  # mkstemp создаёт файл с правами 0600
+            handle.write("".join(f"{data[k]}\n" for k in ("token", "expires_at", "kind", "repo")))
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def refresh(path: Path, kind: str, repo: str, margin: int, now: float, fresh) -> bool:
+    """Новый токен в `path`, если там не токен `kind` на `repo` или ему осталось меньше `margin`
+    секунд; True — обновлён. Токен оркестратора в файле сессии так заменяется сразу."""
+    left = expires(path, kind, repo)
+    if left is not None and left - now >= margin:
+        return False
+    data = fresh(now)
+    epoch(data["expires_at"])  # испорченный срок — ошибка здесь, а не новый токен каждый круг
+    write_token(path, data)
+    return True
+
+
+# --- среда сессии ---------------------------------------------------------------------------------
+
+
+def is_shim(path: Path) -> bool:
+    """Файл — обёртка `app-token` (по метке во второй строке)."""
+    try:
+        with path.open("rb") as handle:
+            return SHIM_MARK.encode() in handle.read(512)
+    except OSError:
+        return False
+
+
+def shims(token_file: Path, folder: Path, gh: str, env=None) -> dict[str, str]:
+    """Обёртки `gh` и помощника git в `folder`; возвращает окружение для среды сессии.
+    Пустой токен — отказ обёртки, а не откат `gh` к сохранённому входу владельца."""
+    env = os.environ if env is None else env
+    real = Path(gh).resolve()
+    if real.parent == folder.resolve() or is_shim(real):
+        raise Failure(f"--gh {gh}: это обёртка или каталог обёрток, нужен настоящий gh")
+    if (folder / "gh").exists() and not is_shim(folder / "gh"):
+        raise Failure(f"в {folder} уже есть gh не от app-token: нужен свой каталог обёрток")
+    folder.mkdir(parents=True, exist_ok=True)
+    config = folder / "gh-config"  # пустой каталог настроек: вход gh владельца не виден
+    config.mkdir(exist_ok=True)
+    source = shlex.quote(str(token_file))
+    read = (
+        f"token=$(head -n 1 {source} 2>/dev/null)\n"
+        '[ -n "$token" ] || { echo "app-token: нет токена App в файле" >&2; exit 1; }\n'
+    )
+    scripts = {
+        "gh": (
+            f"#!/bin/sh\n# {SHIM_MARK}: gh от лица App, токен из файла на каждый вызов (#212).\n"
+            f"{read}"
+            "GH_TOKEN=$token\nexport GH_TOKEN\n"
+            f"GH_CONFIG_DIR={shlex.quote(str(config))}\nexport GH_CONFIG_DIR\n"
+            "unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN\n"
+            f'exec {shlex.quote(str(real))} "$@"\n'
+        ),
+        HELPER: (
+            f"#!/bin/sh\n# {SHIM_MARK}: помощник git, токен App из файла (#212).\n"
+            '[ "$1" = get ] || exit 0\n'
+            "cat >/dev/null\n"
+            f"{read}"
+            "printf 'username=x-access-token\\npassword=%s\\n' \"$token\"\n"
+        ),
+    }
+    for name, text in scripts.items():
+        target = folder / name
+        target.write_text(text)
+        target.chmod(0o755)
+    try:
+        start = int(env.get("GIT_CONFIG_COUNT") or 0)
+    except ValueError:
+        raise Failure(f"GIT_CONFIG_COUNT={env['GIT_CONFIG_COUNT']}: не число") from None
+    key = "credential.https://github.com.helper"
+    # пустое значение сбрасывает список помощников, затем свой; чужие записи окружения целы
+    entries = [(key, ""), (key, str(folder / HELPER))]
+    out = {"PATH": f"{folder}{os.pathsep}{env.get('PATH', '')}"}
+    for n, (name, value) in enumerate(entries, start):
+        out[f"GIT_CONFIG_KEY_{n}"], out[f"GIT_CONFIG_VALUE_{n}"] = name, value
+    out["GIT_CONFIG_COUNT"] = str(start + len(entries))
+    return out
+
+
+def real_gh(folder: Path) -> str:
+    """`gh` из PATH: не из `folder` и не обёртка `app-token` из прошлого вызова."""
+    own = folder.resolve()
+    for part in os.environ.get("PATH", "").split(os.pathsep):
+        if part and Path(part).resolve() != own:
+            found = shutil.which("gh", path=part)
+            if found and not is_shim(Path(found)):
+                return found
+    raise Failure("нет `gh` в PATH: --gh ПУТЬ")
+
+
+# --- CLI -----------------------------------------------------------------------------------------
+
+
+def parse(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="app-token", description="Токены GitHub App канона.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def github(p: argparse.ArgumentParser, explicit: bool) -> None:
+        # refresh и keep — только явные: origin и git config клона сессия правит сама
+        p.add_argument("--kind", choices=sorted(KINDS), required=True)
+        p.add_argument(
+            "--repo", required=explicit, help="OWNER/NAME" + ("" if explicit else "; или origin")
+        )
+        p.add_argument(
+            "--app-id",
+            required=explicit,
+            help="App ID" + ("" if explicit else f"; или git config {APP_ID_CONFIG}"),
+        )
+
+    github(sub.add_parser("issue", help="выпустить токен и напечатать JSON"), False)
+    for name in ("refresh", "keep"):
+        p = sub.add_parser(name, help="держать токен в файле свежим")
+        github(p, True)
+        p.add_argument("--file", type=Path, required=True)
+        p.add_argument("--margin", type=int, default=MARGIN, help="секунд до истечения (900)")
+        if name == "keep":
+            p.add_argument("--every", type=int, default=EVERY, help="секунд между проверками")
+    p = sub.add_parser("shims", help="обёртки gh и git для среды сессии")
+    p.add_argument("--file", type=Path, required=True)
+    p.add_argument("--dir", type=Path, required=True)
+    p.add_argument("--gh", help="настоящий gh; по умолчанию из PATH")
+    args = parser.parse_args(argv)
+    if getattr(args, "margin", 1) < 0 or getattr(args, "every", 1) <= 0:
+        parser.error("--margin — не меньше 0, --every — больше 0")
+    return args
+
+
+def main(argv: list[str]) -> int:
+    args = parse(argv)
+    try:
+        if args.command == "shims":
+            env = shims(args.file.absolute(), args.dir.absolute(), args.gh or real_gh(args.dir))
+            for name, value in env.items():
+                print(f"export {name}={shlex.quote(value)}")
+            return 0
+        repo = args.repo or default_repo()
+        app_id = args.app_id or git_value("config", "--get", APP_ID_CONFIG)
+        if not app_id:
+            raise Failure(f"App ID не задан: --app-id или git config {APP_ID_CONFIG}")
+
+        def fresh(now: float) -> dict:
+            return issue(args.kind, repo, app_id, now)
+
+        if args.command == "issue":
+            print(json.dumps(fresh(time.time()), ensure_ascii=False))
+            return 0
+
+        def once() -> bool:
+            return refresh(args.file, args.kind, repo, args.margin, time.time(), fresh)
+
+        if args.command == "refresh":
+            print(f"app-token: {'обновлён' if once() else 'свежий'} {args.file}")
+            return 0
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        while True:
+            try:
+                if once():
+                    print(f"app-token: обновлён {args.file}", flush=True)
+            except Exception as error:  # сбой сети или диска — повторить на следующем круге
+                print(f"app-token: {error}", file=sys.stderr, flush=True)
+            time.sleep(args.every)
+    except Failure as error:
+        print(f"app-token: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

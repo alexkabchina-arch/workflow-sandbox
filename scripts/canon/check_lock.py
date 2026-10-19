@@ -24,6 +24,10 @@ LOCK_NAME = ".canon.lock"
 SETTINGS = ".claude/settings.json"
 SETTINGS_BASE = ".claude/settings.base.json"
 SETTINGS_PROJECT = ".claude/settings.project.json"
+# Блок владений тикета: `canon-sync` вписывает его в трекер проекта с профилем (#215).
+OWNERSHIP = ".claude/canon/ticket-ownership.md"
+PROFILE = "docs/agents/profile.md"
+TRACKER = "docs/agents/issue-tracker.md"
 
 
 class MergeError(Exception):
@@ -95,6 +99,17 @@ def check(root: Path) -> list[str]:
                 problems.append(
                     f"{SETTINGS}: не совпадает со склейкой {SETTINGS_BASE} + {SETTINGS_PROJECT}"
                 )
+
+    block = root / OWNERSHIP
+    if OWNERSHIP in lock["files"] and block.is_file() and (root / PROFILE).is_file():
+        tracker = root / TRACKER
+        text = tracker.read_bytes().decode(errors="replace") if tracker.is_file() else ""
+        text = text.lstrip("﻿").replace("\r\n", "\n")
+        if text.count(block.read_text(encoding="utf-8")) != 1:
+            problems.append(
+                f"{TRACKER}: блок владений не совпадает с {OWNERSHIP} (правлен, удалён или "
+                "файл переписан) — запустите canon-sync той же версии"
+            )
     return problems
 
 

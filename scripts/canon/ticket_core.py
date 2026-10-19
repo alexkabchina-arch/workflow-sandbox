@@ -33,7 +33,9 @@ STATE_DIR = "canon-ticket"
 ANSWERS = ".ticket"
 TICKET_BRANCH = re.compile(r"^ticket-(\d+)(?:-.+)?$")
 TURN, DONE, STOPPED = "ход агента", "готово", "остановка"
-AGENT, OWNER, CI = "агент", "владелец", "CI"
+# Конец сессии под оркестратором (#214): ветка готова к его ревью или к отметке.
+READY = "код готов"
+AGENT, OWNER, CI, ORCHESTRATOR = "агент", "владелец", "CI", "оркестратор"
 # Bash агента по умолчанию обрывает команду через 2 минуты; долгие шаги — с таймаутом 45 минут.
 LONG_CALL = "обычный Bash, не в фоне, timeout 2700000"
 NOT_SIMPLE = re.compile(r"[$`'\"\n;&|<>]|\bcd\b")
@@ -47,9 +49,12 @@ STEP_NAMES = {
     "body": "тело PR",
     "finish": "финиш",
     "done": "готово",
+    "ready": "код готов",
     "stop": "остановка",
     "stopped": "остановка",
 }
+# Пометка вопроса `ticket ask` в комментарии; по ней вопрос находит и Stop-хук.
+ASK_MARK = "<!-- canon-ticket-ask {stamp} -->"
 CHECKS_BLOCK = re.compile(r"^```checks[ \t]*\n(.*?)^```", re.M | re.S)
 # Профиль до блока `checks` (проекты на каноне до #154): строки таблицы «Команды».
 TABLE_CHECKS = {"Тесты": "tests", "Линтер": "lint", "Формат (проверка)": "format"}
@@ -76,9 +81,17 @@ def elapsed(since: str | None) -> str:
     return f"{minutes // 60} ч {minutes % 60:02d} мин" if minutes >= 60 else f"{minutes} мин"
 
 
-def run(*cmd: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
+def run(
+    *cmd: str, cwd: Path | None = None, timeout: float | None = None
+) -> subprocess.CompletedProcess:
     return subprocess.run(
-        cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        cmd,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
     )
 
 
@@ -93,22 +106,178 @@ def git_ok(*args: str) -> bool:
     return run("git", *args).returncode == 0
 
 
-def gh(*args: str) -> str:
+def gh(*args: str, cwd: Path | None = None, timeout: float | None = None) -> str:
     try:
-        result = run("gh", *args)
+        result = run("gh", *args, cwd=cwd, timeout=timeout)
     except FileNotFoundError:
         raise Failure("не найден `gh` на PATH") from None
+    except subprocess.TimeoutExpired:
+        raise Failure(f"gh {' '.join(args[:2])}: дольше {timeout} с") from None
     if result.returncode != 0:
         raise Failure(f"gh {' '.join(args[:2])}: {(result.stderr or result.stdout).strip()}")
     return result.stdout.strip()
 
 
-def gh_json(*args: str):
-    out = gh(*args)
+def gh_json(*args: str, cwd: Path | None = None, timeout: float | None = None):
+    out = gh(*args, cwd=cwd, timeout=timeout)
     try:
         return json.loads(out) if out else None
     except ValueError:
         raise Failure(f"gh {' '.join(args[:2])}: не JSON: {out[:200]}") from None
+
+
+# Доверенный автор тикета и комментария — участник репозитория (#181, #185): владелец, член
+# организации, коллаборатор. Текст постороннего в публичном репозитории — не решение владельца, а
+# маршрут отдаёт его агенту в задании, в том числе `claude -p` в режиме auto. Общий список: его
+# берут и `session-start`, и `stop-check` (#214).
+TRUSTED = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+# Лицо агента — GitHub App владельца (#214): его тикеты и комментарии свои (не посторонние),
+# хотя участником репозитория GitHub его не считает; но голос владельца — только участники: App —
+# это сама сессия и оркестратор, его комментарий не ответ владельца. Логин App (slug, без
+# `[bot]`) — в git config проекта `canon.agentApp`; нет — App чужой.
+APP_CONFIG = "canon.agentApp"
+COMMENT_ID = re.compile(r"#issuecomment-(\d+)$")
+_app_comments: dict[tuple[str, str], bool] = {}
+_apps: dict[str, str | None] = {}
+# Комментарии маршрута в тикете помечены (`ticket ask`), отчёт об остановке узнаётся по началу.
+OWN_MARK = "<!-- canon-ticket"
+REPORT_MARK = "Отчёт об остановке"
+# Ответ владельца из чата, переданный сессией в тикет (`ticket ask`): помечен, чтобы не
+# прочитаться вторым ответом. Решение о `/verify` из чата не передаётся (#249).
+REPLY_MARK = "<!-- canon-ticket-reply -->"
+# Режим маршрута «под оркестратором» (#214): флаг окружения от оркестратора. Сессия кончается на
+# «код готов» или на вопросе; ревью ошибок, отметку, авто-мёрж, ожидание и уборку делает он.
+ORCHESTRATED = "CANON_ORCHESTRATOR"
+
+
+def orchestrated() -> bool:
+    return os.environ.get(ORCHESTRATED) == "1"
+
+
+# Вопрос владельцу под оркестратором — тремя разделами (спека #208): владелец отвечает с
+# телефона, не зная хода сессии.
+ORCHESTRATED_ASK = (
+    " Под оркестратором — тремя разделами: «Причина» (что неясно и почему без ответа не "
+    "сделать), «Сделано» (что уже готово), «Доступно» (варианты, что будет при каждом, "
+    "рекомендация)."
+)
+
+
+def until() -> str:
+    """До какого статуса выполнять задания маршрута: под оркестратором сессия кончается на
+    «код готов» — ревью, отметку и ожидание мёржа ведёт он."""
+    return f"«{READY}» или «{STOPPED}»" if orchestrated() else f"«{DONE}» или «{STOPPED}»"
+
+
+def agent_app(cwd: Path | None = None) -> str | None:
+    """Логин App из `git config canon.agentApp` (без `app/` и `[bot]`); не задан — None.
+    Читается раз на процесс и каталог."""
+    key = str(cwd)
+    if key not in _apps:
+        try:
+            out = run("git", "config", "--get", APP_CONFIG, cwd=cwd).stdout.strip()
+        except OSError:
+            out = ""
+        _apps[key] = out.removeprefix("app/").removesuffix("[bot]") or None
+    return _apps[key]
+
+
+def member(item: dict) -> bool:
+    """Автор — участник репозитория (`authorAssociation` GitHub): его голос — голос владельца."""
+    return item.get("authorAssociation", item.get("author_association")) in TRUSTED
+
+
+def is_answer(body: str) -> bool:
+    """Комментарий — не служебный маршрута и не отчёт об остановке: может быть ответом."""
+    return bool(body) and OWN_MARK not in body and not body.startswith(REPORT_MARK)
+
+
+def trusted(
+    item: dict, cwd: Path | None = None, *, strict: bool = False, timeout: float | None = None
+) -> bool:
+    """Автор тикета или комментария — свой: участник репозитория или App (лицо агента).
+
+    `item` — ответ REST (`author_association`, `user`) или `gh … --json comments`
+    (`authorAssociation`, `author`). В REST бот App — `<slug>[bot]` типа `Bot`. В `gh --json`
+    логин бота без `[bot]` и неотличим от пользователя с таким же логином: совпадение по логину
+    сверяется REST по id комментария из его ссылки. Сбой `gh` — не свой; `strict` — `Failure`
+    (Stop-хук: проверка не состоялась, а не «чужой»)."""
+    if member(item):
+        return True
+    app = agent_app(cwd)
+    if not app:
+        return False
+    user = item.get("user")
+    if isinstance(user, dict):
+        return user.get("login") == f"{app}[bot]" and user.get("type") == "Bot"
+    login = ((item.get("author") or {}).get("login") or "").removeprefix("app/")
+    match = COMMENT_ID.search(item.get("url") or "")
+    if login.removesuffix("[bot]") != app or not match:
+        return False
+    key = (str(cwd), match.group(1))
+    if key not in _app_comments:
+        try:
+            path = f"repos/{{owner}}/{{repo}}/issues/comments/{match.group(1)}"
+            data = gh_json("api", path, cwd=cwd, timeout=timeout) or {}
+        except Failure:
+            if strict:
+                raise
+            data = {}
+        user = data.get("user") if isinstance(data, dict) else None
+        _app_comments[key] = isinstance(user, dict) and trusted({"user": user}, cwd)
+    return _app_comments[key]
+
+
+def keep(st, path: Path, name: str) -> None:
+    """Файл ответа агента — в каталог состояния `st`: в worktree он не повторится на новом круге."""
+    if path.exists():
+        st.dir.mkdir(parents=True, exist_ok=True)
+        path.replace(st.dir / name)
+
+
+def relay_reply(number: int, reply: str) -> str:
+    """Ответ владельца из чата (`.ticket/reply.md`) — комментарием в тикет; ссылка на него (`gh`
+    её печатает) или «тикет #N»."""
+    body = f"{REPLY_MARK}\n**Ответ владельца из чата** (передан сессией)\n\n{reply}"
+    posted = gh("issue", "comment", str(number), "--body", body)
+    return posted.splitlines()[0] if posted else f"тикет #{number}"
+
+
+def issue_head(number: int) -> dict:
+    """Заголовок и тело тикета; у тикета не участника — пустые, `trusted` — False.
+
+    Тело правят только автор и участники репозитория: тикет участника посторонний не перепишет,
+    а свой посторонний перепишет в любой момент, и после того, как владелец взял его в работу.
+    `gh issue view` связи автора с репозиторием не отдаёт — поэтому REST."""
+    data = gh_json("api", f"repos/{{owner}}/{{repo}}/issues/{number}") or {}
+    ok = trusted(data)
+    return {
+        "title": (data.get("title") or "") if ok else "",
+        "body": (data.get("body") or "") if ok else "",
+        "trusted": ok,
+    }
+
+
+def quote(text: str) -> str:
+    """Цитата Markdown: строка текста в задании не начнётся с `▶` команды."""
+    return "\n".join(f"> {line}" if line else ">" for line in text.splitlines())
+
+
+def pending(question: dict) -> str:
+    """Начало задания, пока вопрос `ticket ask` ждёт ответа (`ticket start`, `ticket ship`; #196):
+    вопрос владельцу в чат полным текстом из состояния, как в `ticket ask`, — владелец отвечает
+    там, не открывая GitHub. У вопроса, заданного до #194, текста в состоянии нет —
+    к комментарию."""
+    url = question["url"]
+    if text := question.get("text"):
+        return (
+            f"Вопрос владельцу ждёт ответа: {url}. Владельцу в чат — этот вопрос полным текстом "
+            f"и ссылка на него, обычным сообщением, без `AskUserQuestion`:\n\n{quote(text)}\n\n"
+        )
+    return (
+        f"Вопрос владельцу ждёт ответа: {url}. Владельцу в чат — вопрос полным текстом, с "
+        f"вариантами и рекомендацией, из комментария {url} и ссылка на него. "
+    )
 
 
 def common_dir() -> Path:
@@ -155,13 +324,43 @@ class State:
         try:
             self.data = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            stamp = now()
-            self.data = {"ticket": number, "step": None, "since": stamp, "updated": stamp}
+            self.data = self.blank()
         except (OSError, ValueError) as exc:
             raise Failure(f"файл состояния {self.path}: {exc}") from None
         for key in ("heads", "attempts", "cost"):
             self.data.setdefault(key, {})
         self.data.setdefault("waiting", AGENT)
+
+    def blank(self) -> dict:
+        stamp = now()
+        return {
+            "ticket": self.number,
+            "step": None,
+            "since": stamp,
+            "updated": stamp,
+            **{key: {} for key in ("heads", "attempts", "cost")},
+            "waiting": AGENT,
+        }
+
+    def retire(self, root: Path) -> None:
+        """PR маршрута слит, а работа по тикету идёт дальше (тикет переоткрыт, новые коммиты) —
+        маршрут с нуля, новым PR (#190, п. 5). Состояние, отчёт ревью и ответы агента в `.ticket/`
+        worktree `root` — в архив рядом (`<имя>-<время>`): круги, догон, тикеты техдолга, расход,
+        «Что сделано» и пометка «слит» прошлого маршрута к новой работе не относятся. Остаются
+        ветка и PR прошлых маршрутов (`past_prs`): у новой ветки то же имя, и поиск PR по ветке
+        нашёл бы слитый."""
+        stamp = now()
+        self.dir.mkdir(parents=True, exist_ok=True)
+        answers = root / ANSWERS
+        old = sorted(answers.glob("*.md")) if answers.is_dir() else []
+        for path in [self.path, self.dir / "review.json", *old]:
+            if path.exists():
+                path.replace(self.dir / f"{path.stem}-{stamp}{path.suffix}")
+        past = list(self.data.get("past_prs") or [])
+        if self.data.get("pr"):
+            past.append(self.data["pr"])
+        kept = {"branch": self.data.get("branch"), "past_prs": past}
+        self.data = self.blank() | {key: value for key, value in kept.items() if value}
 
     def __getitem__(self, key):
         return self.data.get(key)
@@ -225,6 +424,22 @@ def read_answer(root: Path, name: str) -> str:
 def canon(name: str, *args: str) -> subprocess.CompletedProcess:
     """Скрипт канона рядом с `ticket` (той же версии)."""
     return run(sys.executable, str(HERE / name), *args)
+
+
+def scripts_dir() -> str:
+    """Каталог скриптов канона от корня их репозитория: `scripts/canon` в проекте,
+    `project/scripts/canon` в самом каноне — он ведёт свои тикеты тем же `ticket` из своего кода
+    (#159). Корень — ближний каталог с `.git` (у worktree это файл)."""
+    for root in HERE.parents:
+        if (root / ".git").exists():
+            return HERE.relative_to(root).as_posix()
+    return "scripts/canon"
+
+
+def command(*args: object) -> str:
+    """Команда задания `ticket …` — от корня worktree, путём скрипта в его репозитории: в каноне
+    команда проектов `scripts/canon/ticket` не нашлась бы."""
+    return " ".join([f"{scripts_dir()}/ticket", *map(str, args)])
 
 
 def profile_checks(profile: Path) -> list[tuple[str, list[str]]]:

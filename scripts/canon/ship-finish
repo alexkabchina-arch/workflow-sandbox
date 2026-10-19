@@ -3,6 +3,9 @@
 
     scripts/canon/ship-finish --title <заголовок> --body-file <тело.md>
         --review-report <отчёт.json> [--ready-for-human <строка>] [--weakening <решение>]
+    scripts/canon/ship-finish --pr-only --title … --body-file … --review-report … [флаги выше]
+    scripts/canon/ship-finish --mark --review-report <отчёт.json> [--ready-for-human …]
+        [--weakening …]
     scripts/canon/ship-finish --unconfirmed <отчёт>
 
 Из корня проекта, на ветке с закоммиченной работой. По порядку:
@@ -41,6 +44,12 @@
 ослабление, которого тикет не просит, — блокирующая находка (решение канона
 `docs/decisions/2026-10-08-no-restricted-paths.md`). Находка и решение — разделом
 «Ослабление защиты» в конце тела PR.
+Под оркестратором (#214) шаги делятся по правам. `--pr-only` — шаги 0–2 токеном сессии (push,
+PR, признак `--ready-for-human`): без авто-мёржа и отметки, этих прав у сессии нет. `--mark` —
+шаги 3–4 для оркестратора токеном App: без push, ветка на сервере должна быть ровно локальным
+HEAD, открытый PR ветки уже есть (черновик — снова готов к ревью); отчёт ревью и решение
+`--weakening` сверяются так же. Запуск — из worktree тикета (любого чекаута на ветке). Без флагов
+— все шаги, как в ручной сессии.
 `--unconfirmed <причина>` — отчёт об остановке: комментарий с первой строкой «Отчёт об остановке»
 (его ищет Stop-хук) и метка `ready-for-human`, без push и без отметки; пустая причина — отказ
 (код 2), отчёт не публикуется; незакоммиченные правки и
@@ -404,6 +413,16 @@ def report_stop(branch: str, reason: str) -> str:
     return where
 
 
+def check_pushed(branch: str, sha: str) -> None:
+    """`--mark` без push: на сервере — ровно локальный HEAD, отметка ляжет на проверенный код."""
+    remote = run("git", "ls-remote", "origin", f"refs/heads/{branch}").split("\t")[0]
+    if remote != sha:
+        raise UsageError(
+            f"ветка {branch} на сервере {remote[:7] or 'нет'}, локально {sha[:7]}: отметка — "
+            "только на запушенный head (push и PR — `--pr-only` сессии)"
+        )
+
+
 def mark_review(sha: str, description: str) -> bool:
     """Ставит отметку ревью на коммит; False — она там уже стоит."""
     statuses = json.loads(run("gh", "api", f"repos/{{owner}}/{{repo}}/commits/{sha}/statuses"))
@@ -438,30 +457,53 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--unconfirmed", metavar="ПРИЧИНА", help="отчёт об остановке: без push, в тикет или на PR"
     )
+    split = parser.add_mutually_exclusive_group()
+    split.add_argument(
+        "--pr-only", action="store_true", help="push и PR без авто-мёржа и отметки (сессия)"
+    )
+    split.add_argument(
+        "--mark", action="store_true", help="авто-мёрж и отметка без push (оркестратор)"
+    )
     args = parser.parse_args(argv)
+    if args.unconfirmed is not None and (args.pr_only or args.mark):
+        parser.error("--unconfirmed не сочетается с --pr-only и --mark")
     try:
-        branch = check_branch(dirty_ok=args.unconfirmed is not None)
+        branch = check_branch(dirty_ok=args.unconfirmed is not None or args.mark)
         if args.unconfirmed is not None:  # и после мёржа: правки в дереве — тоже остановка
             where = report_stop(branch, args.unconfirmed)
             print(f"ship-finish: отчёт об остановке — {where}, ждёт владельца ({LABEL}), без push")
             return 0
         sha = run("git", "rev-parse", "HEAD")
         merged = check_merged(branch, sha)
-        if not args.title or not args.body_file:
+        if not args.mark and (not args.title or not args.body_file):
             raise UsageError("нужны --title и --body-file (без них — только --unconfirmed)")
         review = check_review(args.review_report, sha, merged)
         unreviewed = unreviewed_commits(review, sha)
         weakening = weakening_section(review, args.weakening, unreviewed, load_canon_review())
-        body_file = pr_body(args.body_file, review, unreviewed, weakening)
-        try:
-            push(branch, sha)
-            pr = upsert_pr(branch, sha, args.title, body_file)
-        finally:
-            if body_file != args.body_file:
-                Path(body_file).unlink(missing_ok=True)
+        if args.mark:
+            check_pushed(branch, sha)
+            pr = find_pr(branch)
+            if pr is None:
+                raise UsageError(f"у ветки {branch} нет открытого PR: сначала `--pr-only`")
+            if pr["isDraft"]:  # черновик отчёта об остановке не сольётся и с авто-мёржем
+                run("gh", "pr", "ready", str(pr["number"]))
+        else:
+            body_file = pr_body(args.body_file, review, unreviewed, weakening)
+            try:
+                push(branch, sha)
+                pr = upsert_pr(branch, sha, args.title, body_file)
+            finally:
+                if body_file != args.body_file:
+                    Path(body_file).unlink(missing_ok=True)
         number = str(pr["number"])
         if human := human_lines(args.ready_for_human, review):
             flag_for_human(number, f"{LABEL}: {human}")
+        if args.pr_only:
+            print(
+                f"ship-finish: {pr['url']} — push и PR на {sha[:7]}; авто-мёрж и отметку ревью "
+                "ставит оркестратор (--mark)"
+            )
+            return 0
         if not pr.get("autoMergeRequest"):
             run("gh", "pr", "merge", number, "--auto", "--squash")
         description = DESCRIPTION_SKIPPED if review.get("skipped") is True else DESCRIPTION
