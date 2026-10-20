@@ -13,6 +13,7 @@ from sandbox.money import (
     format_rub,
     order_total_kop,
 )
+from sandbox.money.rounding import round_rub_kop
 
 
 class OneLineErrorParser(argparse.ArgumentParser):
@@ -64,6 +65,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="второй строкой «средняя цена: X» — итог со скидкой на число штук, в формате итога",
     )
+    parser.add_argument(
+        "--round",
+        action="store_true",
+        help="итог до целого рубля, половина — вверх; минимум заказа и средняя — до округления",
+    )
     parser.add_argument("--version", action=VersionAction, help="показать версию и выйти")
     args = parser.parse_args(argv)
     try:
@@ -71,7 +77,10 @@ def main(argv: list[str] | None = None) -> int:
         total = order_total_kop(items, args.discount, loyal=args.loyal)
         check_min_order(total)
         qty = total_qty(items)
+        # Средняя — цена единицы от неокруглённого итога: --round меняет только строку итога
         avg = avg_unit_price_kop(total, qty) if args.avg else None
+        if args.round:
+            total = round_rub_kop(total)
     except ValueError as exc:
         parser.error(str(exc))
 
