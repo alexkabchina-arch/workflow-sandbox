@@ -74,6 +74,26 @@ def test_code_flag_prints_currency_code_instead_of_sign(capsys, argv, out):
 @pytest.mark.parametrize(
     ("argv", "out"),
     [
+        # 314,91 → 315: итог после скидки округляется до рубля, половина — вверх
+        (["3x100", "1x49.90", "--discount", "10", "--round"], "315.00\u00a0₽\n"),
+        (["3x100", "1x49.90", "--discount", "10", "--round", "--kop"], "31500\n"),
+        (["3x100", "1x49.90", "--round"], "350.00\u00a0₽\n"),
+        (["1x300.49", "--round"], "300.00\u00a0₽\n"),
+        (["1x300.50", "--round"], "301.00\u00a0₽\n"),
+        (["1x1234.56", "--round", "--code"], "1\u00a0235.00 RUB\n"),
+        (["3x100", "1x49.90", "--round", "--count"], "350.00\u00a0₽\nпозиций: 4\n"),
+        # Средняя — от напечатанного, уже округлённого итога: 350,00 / 4 = 87,50
+        (["3x100", "1x49.90", "--round", "--avg"], "350.00\u00a0₽\nсредняя цена: 87.50\u00a0₽\n"),
+    ],
+)
+def test_round_flag_rounds_total_to_rubles(capsys, argv, out):
+    assert main(argv) == 0
+    assert capsys.readouterr().out == out
+
+
+@pytest.mark.parametrize(
+    ("argv", "out"),
+    [
         # 5 % от 349,90 = 17,495 → скидка 17,49 (округление скидки вниз до копейки), итог 332,41
         (["3x100", "1x49.90", "--loyal"], "332.41\u00a0₽\n"),
         (["3x100", "1x49.90", "--loyal", "--discount", "3"], "332.41\u00a0₽\n"),
@@ -158,6 +178,8 @@ def test_help_names_min_order(capsys, monkeypatch):
         (["3x100", "--discount", "1"], "минимальная сумма заказа — 300.00\u00a0₽"),
         (["3x100", "--loyal", "--kop"], "минимальная сумма заказа — 300.00\u00a0₽"),
         (["3x100", "--discount", "100", "--avg"], "минимальная сумма заказа — 300.00\u00a0₽"),
+        # С --round минимум сверяется до округления: 299,50 → 300 не спасает
+        (["1x299.50", "--round"], "минимальная сумма заказа — 300.00\u00a0₽"),
         (["1x0.005"], "цена точнее копейки: '0.005'"),
         (["3x100", "--code", "--kop"], "argument --kop: not allowed with argument --code"),
         (["3x100", "--kop", "--code"], "argument --code: not allowed with argument --kop"),
