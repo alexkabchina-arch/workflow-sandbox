@@ -63,13 +63,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--avg",
         action="store_true",
-        help="второй строкой «средняя цена: X» — итог со скидкой (с --round — округлённый) "
-        "на число штук, в формате итога",
+        help="второй строкой «средняя цена: X» — итог со скидкой на число штук, в формате итога",
     )
     parser.add_argument(
         "--round",
         action="store_true",
-        help="итог до целого рубля, половина — вверх; минимум заказа сверяется до округления",
+        help="итог до целого рубля, половина — вверх; минимум заказа и средняя — до округления",
     )
     parser.add_argument("--version", action=VersionAction, help="показать версию и выйти")
     args = parser.parse_args(argv)
@@ -77,10 +76,11 @@ def main(argv: list[str] | None = None) -> int:
         items = [parse_item(spec) for spec in args.items]
         total = order_total_kop(items, args.discount, loyal=args.loyal)
         check_min_order(total)
+        qty = total_qty(items)
+        # Средняя — цена единицы от неокруглённого итога: --round меняет только строку итога
+        avg = avg_unit_price_kop(total, qty) if args.avg else None
         if args.round:
             total = round_rub_kop(total)
-        qty = total_qty(items)
-        avg = avg_unit_price_kop(total, qty) if args.avg else None
     except ValueError as exc:
         parser.error(str(exc))
 
