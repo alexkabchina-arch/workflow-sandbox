@@ -198,7 +198,8 @@ class Session:
         if WAITING not in labels(item):
             return False
         mark = self.core.ASK_MARK.format(stamp=question.get("stamp"))
-        said = [c for c in item.get("comments") or [] if not c.get("isMinimized")]
+        # Вопрос — и среди скрытых, скрытый ответ — не ответ: как `answers` в `ticket_ask` (#204).
+        said = item.get("comments") or []
         at = max(
             (i for i, c in enumerate(said) if mark in (c.get("body") or "") and self.trusted(c)),
             default=None,
@@ -209,6 +210,7 @@ class Session:
         return not any(
             self.core.is_answer((c.get("body") or "").strip()) and self.core.member(c)
             for c in said[at + 1 :]
+            if not c.get("isMinimized")
         )
 
     def orchestrated_problem(self, head: str, dirty: bool, prs: list[dict]) -> str | None:

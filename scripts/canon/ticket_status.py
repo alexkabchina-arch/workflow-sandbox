@@ -4,7 +4,8 @@
 
 Из любого чекаута проекта. Данные — файлы состояния тикетов (`<общий каталог git>/canon-ticket/`)
 и GitHub на момент запроса (`gh pr view`): состояние PR и итог CI — живые, не из файла; красный
-сторож `review-guard` — не красный CI: «перезапуск сторожа» или «нет отметки». Слитый тикет
+сторож `review-guard` — не красный CI: «перезапуск сторожа», «сторож: нужен агент» (перезапуск
+не поможет: исчерпаны или прогон не от сторожа канона) или «нет отметки». Слитый тикет
 показывается один раз (`MERGED`), дальше скрыт без запросов к GitHub — в конце их число.
 Таблица — в чат владельцу как есть; копии на GitHub нет (спека #111, этап B).
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
@@ -13,11 +14,16 @@
 
 from __future__ import annotations
 
+import types
+from pathlib import Path
+
 RED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 PENDING = {"PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"}
 GUARD = "review-guard"  # сторож отметки ревью: красный — не красный CI (#176)
 REVIEW = "review"  # отметка ревью — статус на head
-NEEDS_AGENT = ("красный", "нет отметки")
+RERUN = "перезапуск сторожа"
+STUCK = "сторож: нужен агент"  # перезапуск сторожа не поможет (#204, п. 5)
+NEEDS_AGENT = ("красный", "нет отметки", STUCK)
 HEADER = ("Тикет", "Шаг", "Ждём", "PR", "Состояние PR", "CI", "Расход", "На шаге")
 
 
@@ -43,8 +49,38 @@ def ci(rollup: list[dict]) -> str:
         return "идёт"
     if states & RED:  # красный остался только у сторожа
         marked = any(c.get("context") == REVIEW and state(c) == "SUCCESS" for c in rollup)
-        return "перезапуск сторожа" if marked else "нет отметки"
+        return RERUN if marked else "нет отметки"
     return "зелёный"
+
+
+_start: types.ModuleType | None = None
+
+
+def load_session_start() -> types.ModuleType:
+    """`session-start` рядом со скриптом — его проверка прогона сторожа; загружается раз."""
+    global _start
+    if _start is None:
+        path = Path(__file__).resolve().parent / "session-start"
+        module = types.ModuleType("canon_session_start_for_status")
+        module.__file__ = str(path)
+        exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+        _start = module
+    return _start
+
+
+def guard_stuck(rollup: list[dict]) -> bool:
+    """Перезапуск красного сторожа не поможет (исчерпаны или прогон не от сторожа канона — джоб
+    ветки) — та же проверка, что у `session-start` и `ticket wait` (`guard_run`): нужен агент, а
+    не ожидание CI. Сбой `gh` — не «застрял»: статус только
+    показывает, решение — у `ticket wait`."""
+    start = load_session_start()
+    guard = next((c for c in rollup if c.get("name") == GUARD and start.is_red(c)), None)
+    if guard is None:
+        return False
+    try:
+        return start.guard_run(guard)[0] == "stuck"
+    except start.StartError:
+        return False
 
 
 def pull_request(core, state: dict) -> tuple[str, str, str]:
@@ -65,7 +101,11 @@ def pull_request(core, state: dict) -> tuple[str, str, str]:
     except core.Failure as exc:
         return url or "—", f"gh: {str(exc)[:60]}", "?"
     pr_state = data.get("state", "?") + (" (черновик)" if data.get("isDraft") else "")
-    return url, pr_state, ci(data.get("statusCheckRollup") or [])
+    rollup = data.get("statusCheckRollup") or []
+    checks = ci(rollup)
+    if checks == RERUN and data.get("state") == "OPEN" and guard_stuck(rollup):
+        checks = STUCK
+    return url, pr_state, checks
 
 
 def waiting(state: dict, pr_state: str, checks: str) -> str:

@@ -55,7 +55,9 @@ def answers(
     """Ответы владельца на вопрос среди комментариев тикета (`gh … --json comments`) и число
     комментариев посторонних после него. Вопроса нет среди своих — `NoQuestion`.
 
-    Скрытый в GitHub (Hide — Outdated) комментарий отозван — как в критериях `/verify`. Пометку
+    Скрытый в GitHub (Hide — Outdated) комментарий после вопроса отозван — как в критериях
+    `/verify`: не ответ и не посторонний. Сам вопрос ищется и среди скрытых: владелец прячет
+    отработанный вопрос (Resolved), а ответ на него от этого не пропадает (#204, п. 3). Пометку
     вопроса посторонний может повторить — вопрос ищется среди своих (участники, App). #185: ответ —
     только от участника репозитория; посторонний «Решение владельца: …» сессия получила бы как ответ
     владельца. App — сама сессия и оркестратор (#214): свой, но не голос владельца.
@@ -64,7 +66,7 @@ def answers(
     пометкой вопроса и, если нужно число посторонних (`strangers`), комментарии после него.
     `strict` — сбой сверки `core.Failure`, а не «чужой» (оркестратор: повторить на следующем
     такте, а не счесть вопрос пропавшим)."""
-    said = [c for c in comments if not c.get("isMinimized")]
+    said = comments
     bodies = [(c.get("body") or "").strip() for c in said]
     mark = core.ASK_MARK.format(stamp=question["stamp"])
     at = next(
@@ -77,7 +79,7 @@ def answers(
     )
     if at is None:
         raise NoQuestion(question["url"])
-    after = range(at + 1, len(said))
+    after = [i for i in range(at + 1, len(said)) if not said[i].get("isMinimized")]
     found = [bodies[i] for i in after if core.member(said[i]) and core.is_answer(bodies[i])]
     if not strangers:
         return found, 0
@@ -203,14 +205,20 @@ class Ask:
                 f"\nКомментарии не участников репозитория ({strangers}) после вопроса ответом "
                 "не считаются."
             )
-        if reply := core.read_answer(self.root, "reply.md"):
+        if core.orchestrated() and core.read_answer(self.root, "reply.md"):
+            # #275: чата под оркестратором нет — файл пишет сама сессия, ответом он не считается.
+            core.keep(st, self.dir / "reply.md", f"reply-ignored-{core.now()}.md")
+            held += (
+                "\n`.ticket/reply.md` под оркестратором не принимается: чата нет, ответ "
+                "владельца — только комментарием в тикете. Файл убран из worktree."
+            )
+        elif reply := core.read_answer(self.root, "reply.md"):
             core.relay_reply(n, reply)
             replies.append(reply)
             core.keep(st, self.dir / "reply.md", f"reply-{question['stamp']}.md")
         if not replies:
-            return self.waiting(
-                "Ответа нет: в тикете после вопроса ответа нет, `.ticket/reply.md` пуст." + held
-            )
+            chat = "" if core.orchestrated() else ", `.ticket/reply.md` пуст"  # чата нет (#275)
+            return self.waiting(f"Ответа нет: в тикете после вопроса ответа нет{chat}." + held)
         answer = "\n\n".join(replies)
         note = ""
         try:

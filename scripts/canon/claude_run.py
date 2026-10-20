@@ -2,7 +2,8 @@
 
 `session-run` берёт отсюда только проверку предела `budget_usd`.
 
-Дочерний процесс — без меток сессии тикета (иначе Stop-хук `stop-check` держал бы его), на
+Дочерний процесс — без меток сессии тикета (иначе Stop-хук `stop-check` держал бы его) и с
+переменными вызывающего поверх окружения (`env`: у `review` — `CLAUDE_CODE_REPORT_FINDINGS=1`), на
 закреплённой модели, с аргументами списком (без оболочки) и пустым stdin. Итог — всегда по
 схеме (`--json-schema`): ответ — в поле `structured_output`, `.md` пишет вызывающий (из него или,
 как `review`, из событий потока).
@@ -88,9 +89,11 @@ def parser(prog: str, description: str) -> argparse.ArgumentParser:
     return result
 
 
-def child_env() -> dict:
-    """Окружение без меток сессии тикета: Stop-хук не должен держать дочерний процесс."""
-    return {k: v for k, v in os.environ.items() if k not in SESSION_VARS}
+def child_env(extra: dict | None = None) -> dict:
+    """Окружение (с `extra` поверх) без меток сессии тикета: Stop-хук не должен держать дочерний
+    процесс."""
+    merged = {**os.environ, **(extra or {})}
+    return {k: v for k, v in merged.items() if k not in SESSION_VARS}
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -135,7 +138,12 @@ def budget_verdict(cost, budget: str, what: str) -> dict:
 
 
 def run_claude(
-    args: list[str], report: Path, budget: str, schema: dict, events: list | None = None
+    args: list[str],
+    report: Path,
+    budget: str,
+    schema: dict,
+    events: list | None = None,
+    env: dict | None = None,
 ) -> dict:
     """Запускает `claude -p --model MODEL --max-budget-usd <budget> --output-format json
     --json-schema <schema> --disallowedTools=Agent,Workflow,Monitor <args>`.
@@ -147,6 +155,9 @@ def run_claude(
     С `events` (список) — `--output-format stream-json --verbose`: события потока дописываются в
     `events`, итог — последнее событие `result` с ответом по схеме (тот же объект, что у
     `json`; см. `last_result`).
+
+    `env` — переменные дочернему процессу поверх `child_env()`, независимо от окружения родителя;
+    метки сессии тикета (`SESSION_VARS`) не проходят и из него.
     """
     output = ["json"] if events is None else ["stream-json", "--verbose"]
     command = [
@@ -172,7 +183,7 @@ def run_claude(
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=child_env(),
+            env=child_env(env),
         )
     except FileNotFoundError:
         raise ChildError("не найден `claude` на PATH") from None
@@ -307,10 +318,12 @@ def check_result(data: dict, report: Path, budget: str, code: int) -> dict:
             f"шло не на {MODEL}: modelUsage — {', '.join(models)}; сырой результат — {report}"
         )
     if data.get("local_command") and not data.get("num_turns"):
-        # Так `/review` ведёт себя с `--output-format json`: итог уходит мимо `claude -p`.
+        # Так `/review` ведёт себя с `--output-format json` или без `CLAUDE_CODE_REPORT_FINDINGS=1`
+        # в окружении (#260): итог уходит мимо `claude -p`.
         raise ChildError(
             f"команда отработала локально (local_command {data['local_command']}, 0 ходов): "
-            f"итог ушёл мимо claude -p, ответа по схеме нет; сырой результат — {report}"
+            "итог ушёл мимо claude -p, ответа по схеме нет (у /review так было при выводе json "
+            f"и без CLAUDE_CODE_REPORT_FINDINGS=1, #260); сырой результат — {report}"
         )
     if not isinstance(data.get("structured_output"), dict):
         raise ChildError(

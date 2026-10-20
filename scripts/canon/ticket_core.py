@@ -59,6 +59,12 @@ CHECKS_BLOCK = re.compile(r"^```checks[ \t]*\n(.*?)^```", re.M | re.S)
 # Профиль до блока `checks` (проекты на каноне до #154): строки таблицы «Команды».
 TABLE_CHECKS = {"Тесты": "tests", "Линтер": "lint", "Формат (проверка)": "format"}
 TABLE_ROW = re.compile(r"^\|\s*([^|]+?)\s*\|\s*`([^`]+)`\s*\|", re.M)
+# Поля находки `gitleaks -v`, которые можно показать: блок находки кончается `Fingerprint`.
+LEAK_FIELD = re.compile(r"^(RuleID|File|Line|Commit|Fingerprint):\s*(.*)$")
+SECRET_FIELD = re.compile(r'^"?(Finding|Secret|Match)"?\s*:', re.I)
+OTHER_FIELD = re.compile(r'^"?[A-Z][A-Za-z]+"?\s*:\s')  # следующее поле находки — конец значения
+LEAKS_SHOWN = 10
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 class Failure(Exception):
@@ -453,6 +459,11 @@ def profile_checks(profile: Path) -> list[tuple[str, list[str]]]:
         text = profile.read_text(encoding="utf-8")
     except OSError as exc:
         raise Failure(f"профиль {profile}: {exc.strerror}") from None
+    return parse_checks(text, profile)
+
+
+def parse_checks(text: str, profile) -> list[tuple[str, list[str]]]:
+    """Проверки из текста профиля (`profile_checks`); `profile` — где он, для ошибок."""
     block = CHECKS_BLOCK.search(text)
     if not block:
         rows = [
@@ -471,6 +482,59 @@ def profile_checks(profile: Path) -> list[tuple[str, list[str]]]:
             raise Failure(f"профиль {profile}: строка блока checks не «имя: команда»: {line}")
         checks.append((name.strip(), shlex.split(command)))
     return checks
+
+
+def secret_findings(text: str) -> list[str]:
+    """Находки `gitleaks -v` из вывода проверки `secrets` (#258): «файл:строка (правило, коммит)»
+    — только эти поля, без `Finding`/`Secret`/`Match`: значение секрета не уходит ни в вывод,
+    ни в отчёт на GitHub, даже если профиль забыл `--redact`."""
+    found, item = [], {}
+    for raw in text.splitlines():
+        m = LEAK_FIELD.match(ANSI.sub("", raw).strip())
+        if not m:
+            continue
+        key, value = m.group(1), m.group(2).strip()
+        if key == "Fingerprint":
+            if item.get("File"):
+                rule = item.get("RuleID", "?")
+                commit = item.get("Commit", "")[:7]
+                where = f"{item['File']}:{item.get('Line', '?')}"
+                found.append(f"{where} ({rule}" + (f", коммит {commit})" if commit else ")"))
+            item = {}
+        else:
+            item[key] = value
+    return found
+
+
+def leaks_line(found: list[str]) -> str:
+    """Находки для отчёта: первые `LEAKS_SHOWN` и «и ещё N» — комментарий GitHub не бесконечен."""
+    shown = "; ".join(found[:LEAKS_SHOWN])
+    more = len(found) - LEAKS_SHOWN
+    return f"секрет в коммитах ветки: {shown}" + (f" и ещё {more}" if more > 0 else "")
+
+
+def without_secret_fields(text: str) -> str:
+    """Вывод gitleaks без значения: поле `Finding`/`Secret`/`Match` (и в JSON) вместе со
+    строками-продолжениями многострочного значения (тело PEM) — до следующего поля. Для строки
+    ошибки в отчёте, когда находки не разобраны (другой формат вывода)."""
+    kept, hiding = [], False
+    for raw in text.splitlines():
+        line = ANSI.sub("", raw).strip()
+        if SECRET_FIELD.match(line):
+            hiding = True
+        elif hiding and (LEAK_FIELD.match(line) or OTHER_FIELD.match(line) or not line):
+            hiding = False
+        if not hiding:
+            kept.append(raw)
+    return "\n".join(kept)
+
+
+def secrets_command(text: str | None, profile) -> list[str] | None:
+    """Команда проверки `secrets` из текста профиля (#258); профиля или блока `checks` нет — None.
+    Строка блока не разобрана — `Failure`: защитная проверка из-за опечатки не открывается молча."""
+    if text is None or not CHECKS_BLOCK.search(text):
+        return None
+    return dict(parse_checks(text, profile)).get("secrets")
 
 
 def say(text: str) -> None:

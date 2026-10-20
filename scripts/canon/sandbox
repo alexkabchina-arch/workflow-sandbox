@@ -419,7 +419,9 @@ class Sandbox:
             have = ", ".join(entry.get("workspaces") or [])
             raise Failure(
                 f"песочница {self.name} смонтирована иначе ({have}), а нужно "
-                f"{', '.join(self.mounts)} — `sandbox rm`, затем `sandbox up`"
+                f"{', '.join(self.mounts)} — `sandbox rm`, затем `sandbox up`; `rm` удалит "
+                "транскрипты сессий тикетов в работе — сначала полный простой оркестратора "
+                "(`orchestrator status`: «Простой полный», docs/sandbox.md)"
             )
         else:
             say(f"песочница {self.name} уже есть")

@@ -14,7 +14,12 @@
    (отчёт ревью не нужен; `--unconfirmed` пишет отчёт и тогда). Так же, если GitHub слил PR по
    ходу: ветки после push на сервере нет или открытого PR уже нет. Затем, до любой записи, —
    сверка отчёта ревью.
-1. `git push -u origin HEAD` (без force) и сверка: ветка на сервере — ровно локальный HEAD.
+1. Проверка `secrets` блока `checks` профиля (`docs/agents/profile.md`, через `run-log`) — до
+   push, на каждом вызове с push (#258): работа без тикета шага маршрута не проходит. Красная —
+   отказ (код 2) с файлом и строкой находки gitleaks, без значения секрета, ничего не
+   отправлено; в профиле её нет — предупреждение, ветка уходит как раньше.
+   Затем `git push -u origin <HEAD>:refs/heads/<ветка>` — ровно проверенный коммит (без force) и
+   сверка: ветка на сервере — ровно локальный HEAD.
 2. PR ветки: нет открытого — `gh pr create`, есть — `gh pr edit` (тело и заголовок обновляются).
    Были коммиты после ревью — в конец тела дописывается их список.
 3. `gh pr merge --auto --squash`, если авто-мёрж ещё не включён. Мёржа скрипт не ждёт.
@@ -77,6 +82,9 @@ import tempfile
 import types
 from pathlib import Path
 
+HERE = Path(__file__).resolve().parent
+PROFILE = Path("docs/agents/profile.md")
+RUN_LOG_END = re.compile(r"^run-log: завершено с кодом \S+ · лог: (.+)$", re.M)
 CONTEXT = "review"
 TARGET = "origin/main"
 LABEL = "ready-for-human"
@@ -121,14 +129,66 @@ def check_branch(dirty_ok: bool = False) -> str:
     return branch
 
 
-def load_canon_review():
-    """`review` рядом со скриптом — его `is_docs` и `MODEL`: пропуск перепроверяется тем же
-    правилом, что его выдал. Без правки `sys.path` и без `__pycache__` в `scripts/canon/`."""
-    path = Path(__file__).resolve().parent / "review"
-    module = types.ModuleType("canon_review")
+def load_canon(name: str):
+    """Модуль канона рядом со скриптом. Без правки `sys.path` и без `__pycache__` в
+    `scripts/canon/`."""
+    path = HERE / name
+    module = types.ModuleType(f"canon_{path.stem}")
     module.__file__ = str(path)
     exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
     return module
+
+
+def load_canon_review():
+    """`review` рядом со скриптом — его `is_docs` и `MODEL`: пропуск перепроверяется тем же
+    правилом, что его выдал."""
+    return load_canon("review")
+
+
+def check_secrets() -> None:
+    """Проверка `secrets` блока `checks` профиля до push (#258) — та же, что шаг маршрута «тесты
+    и линтеры», через `run-log`: работа без тикета её шага не проходит. Красная — отказ (код 2)
+    с файлом и строкой находки, без значения секрета; в профиле её нет — предупреждение."""
+    core = load_canon("ticket_core.py")
+    root = Path(run("git", "rev-parse", "--show-toplevel"))
+    try:
+        text = (root / PROFILE).read_text(encoding="utf-8")
+    except OSError:
+        text = None
+    try:
+        argv = core.secrets_command(text, PROFILE)
+    except core.Failure as exc:
+        raise UsageError(f"{exc} — проверку `secrets` не разобрать, push и PR не сделаны") from None
+    if argv is None:
+        print(
+            f"ship-finish: предупреждение: в {PROFILE} нет проверки `secrets` — ветка уходит без "
+            "gitleaks, ключ поймает только CI после отправки",
+            file=sys.stderr,
+        )
+        return
+    if Path(argv[0]).name != "run-log":
+        argv = [sys.executable, str(HERE / "run-log"), "-l", "secrets", "--", *argv]
+    res = subprocess.run(argv, cwd=root, capture_output=True, text=True, check=False)
+    if res.returncode == 0:
+        return
+    output = res.stdout + res.stderr
+    # Путь лога — из итоговой строки `run-log` (последней), а не из хвоста вывода команды.
+    log = next(reversed(RUN_LOG_END.findall(res.stdout)), None)
+    if log:  # находки — из полного лога, не из хвоста
+        try:
+            output = Path(log).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    where = f"; полный вывод — {log}" if log else ""
+    if found := core.secret_findings(output):
+        raise UsageError(
+            f"{core.leaks_line(found)} — push и PR не сделаны. Не чинить коммитом и не глушить: "
+            "ключ отзывает владелец (docs/secrets.md)" + where
+        )
+    raise UsageError(
+        f"проверка `secrets` профиля не прошла (код {res.returncode}), находок в выводе нет — "
+        "push и PR не сделаны" + where
+    )
 
 
 def load_review(path: str) -> dict:
@@ -329,8 +389,8 @@ def check_merged(branch: str, sha: str) -> list[dict]:
 
 
 def push(branch: str, sha: str) -> None:
-    try:
-        run("git", "push", "-u", "origin", "HEAD")
+    try:  # ровно проверенный коммит `sha`, а не HEAD на момент push (#258)
+        run("git", "push", "-u", "origin", f"{sha}:refs/heads/{branch}")
     except ShipError as exc:
         raise ShipError(f"push отклонён: {exc}") from None
     remote = run("git", "ls-remote", "origin", f"refs/heads/{branch}").split("\t")[0]
@@ -488,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
             if pr["isDraft"]:  # черновик отчёта об остановке не сольётся и с авто-мёржем
                 run("gh", "pr", "ready", str(pr["number"]))
         else:
+            check_secrets()
             body_file = pr_body(args.body_file, review, unreviewed, weakening)
             try:
                 push(branch, sha)

@@ -2,7 +2,7 @@
 """session-run — стартовая команда сессии тикета: `session-start`, затем `claude` в worktree.
 
     scripts/canon/session-run <номер тикета> [--headless [--max-budget-usd USD]] \\
-        [--resume <id сессии> [--prompt <текст>]] [--run <метка>] [-- <аргументы claude>]
+        [--resume <id сессии>] [--prompt <текст>] [--run <метка>] [-- <аргументы claude>]
     scripts/canon/session-run <номер тикета> --retire <head>    # уборка после мёржа
     scripts/canon/session-run <номер тикета> --discard          # повтор с чистого листа
 
@@ -35,6 +35,8 @@
   тикета нет или в нём уже идёт сессия — код 2. Только headless: оркестратор возобновляет
   `claude -p`. Время запуска — `CANON_RUN_STARTED`: Stop-хук не засчитает этому запуску отчёт
   об остановке прошлого.
+- `--prompt` без `--resume` — только под оркестратором: новая сессия вместо потерянной (её
+  транскрипт удалён с песочницей, #262) получает то же задание оркестратора (догон, CI).
 
 Под оркестратором `session-run` идёт **внутри песочницы проекта** (`sbx exec`, #241), в клоне
 оркестратора, — и всё, что трогает git клона, тоже идёт здесь, внутри: оркестратор на Mac git в
@@ -185,7 +187,9 @@ def main(argv: list[str] | None = None) -> int:
         help=f"предел (по умолчанию {DEFAULT_BUDGET})",
     )
     parser.add_argument("--resume", metavar="ID", help="продолжить сессию claude по id")
-    parser.add_argument("--prompt", help="промпт возобновления (по умолчанию /start N)")
+    parser.add_argument(
+        "--prompt", help="промпт возобновления или сессии оркестратора (по умолчанию /start N)"
+    )
     parser.add_argument("--run", metavar="МЕТКА", help="метка запуска оркестратора")
     cleanup = parser.add_mutually_exclusive_group()
     cleanup.add_argument("--retire", metavar="HEAD", help="уборка после мёржа PR с этим head")
@@ -211,8 +215,8 @@ def main(argv: list[str] | None = None) -> int:
     orchestrated = core.orchestrated()
     if orchestrated or args.resume:
         args.headless = True  # оркестратор ведёт только claude -p
-    if args.prompt and not args.resume:
-        print("session-run: --prompt — только с --resume", file=sys.stderr)
+    if args.prompt and not (args.resume or orchestrated):
+        print("session-run: --prompt — только с --resume или под оркестратором", file=sys.stderr)
         return 2
     if args.max_budget_usd and not args.headless:
         print(

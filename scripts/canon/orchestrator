@@ -19,9 +19,9 @@
 
 - Сверка процессов (#221, #241): живые `session-run` внутри песочницы проекта против записанных
   запусков (метка `--run`); незаписанный (такт упал после запуска) — **осиротевший**: группа его
-  процессов внутри завершается, запуск — в состояние с расходом худшим случаем, тикет продолжает
-  ту же сессию возобновлением. Второй сессии на тикет нет: запуск пишется в состояние сразу после
-  старта.
+  процессов внутри завершается, запуск — в состояние с оценкой расхода худшим случаем, тикет
+  продолжает ту же сессию возобновлением. Второй сессии на тикет нет: запуск пишется в состояние
+  сразу после старта.
 - Паузы (#221) — пересчёт: «пауза» владельца (`pause`, до `now`), вне окна расписания
   (`canon.agentSchedule`: `ЧЧ:ММ-ЧЧ:ММ=места` через запятую, местное время), суточный потолок
   (`canon.agentCeiling`, 20% недельного лимита: прирост доли недели за сутки), упор в лимит
@@ -99,7 +99,8 @@
      черновик, выключенный авто-мёрж или закрытый PR — отчёт об остановке; слит — уборка
      механикой `session-start` (`retire_merged`: worktree, ветка, ресурсы, метка `in-progress`),
      свой отчёт ревью удаляется, и комментарий в тикет без упоминания владельца с мерами:
-     сколько раз дёргали владельца, время от очереди до слияния, расход, PR;
+     вопросов владельцу, отчётов об остановке (из них по команде владельца), время от очереди
+     до слияния, расход (факт и оценка прерванных запусков — отдельно), PR;
    - **догон основы** — `main` ушёл вперёд (слит тикет оркестратора или GitHub говорит
      `BEHIND`), а head PR на шаге CI или мёржа не содержит `origin/main`: PR — в черновик
      (старый head с отметкой не сольётся посреди догона), та же сессия с заданием «догони
@@ -107,8 +108,8 @@
      повторяется, черновик снимается перед отметкой. Та же основа не догнана — отчёт об
      остановке.
    Отчёт об остановке оркестратора — «Причина / Сделано / Доступно» с упоминанием владельца
-   (уведомление), метки `agent:stopped` и `ready-for-human` — до комментария: сбой меток не
-   повторит комментарий.
+   (уведомление; стоп по `agent:stop` владельца — без упоминания: это его команда), метки
+   `agent:stopped` и `ready-for-human` — до комментария: сбой меток не повторит комментарий.
 3. Места свободны, очередь не пуста — тикеты очереди по порядку. Тикет занимает место, только
    если его владения и флаги (строки `**Владения:**` и `**Флаги:**` брифа по образцу
    `.claude/canon/ticket-ownership.md`, на момент старта) не пересекаются с владениями занятых
@@ -127,8 +128,11 @@
 **Пределы** (решение 16.10, п. 10): каждый запуск — с `--max-budget-usd` наименьшим из
 `RUN_LIMIT` (30 USD) и остатка `TICKET_LIMIT` (60 USD) за вычетом расхода тикета по состоянию
 (сессии, ревью, дочерние прогоны маршрута); остатка нет — отчёт об остановке без запуска и без
-ревью. Запуск, кончившийся по `--max-budget-usd` (`error_max_budget_usd`) без «код готов»,
-вопроса или своего отчёта, — отчёт об остановке с пределом. Отдельного предела ходов нет.
+ревью. Запуск без итога (стоп, предел времени, осиротевший) — в расход оценкой, его
+`--max-budget-usd`, всюду с пометкой и отдельно от факта; в предел тикета идёт, кроме прерванного
+`agent:stop` владельца (#264). Запуск, кончившийся по `--max-budget-usd`
+(`error_max_budget_usd`) без «код готов», вопроса или своего отчёта, — отчёт об остановке с
+пределом. Отдельного предела ходов нет.
 
 **Служба, «статус», caffeinate** (#222): `service install` — plist из образца
 `orchestrator.plist` рядом (этот Python и скрипт, главный чекаут, PATH установки, такт раз в
@@ -161,8 +165,8 @@ git на него ставятся внутри (`app-token shims`); `sbx` ид�
 
 **Своё состояние** — `<общий каталог git>/canon-orchestrator/state.json` (рядом с состояниями
 тикетов `canon-ticket/`): очередь, места, тикеты (шаг, id сессии, номера процессов, логи, расход,
-сколько раз дёргали владельца), паузы с причинами, доля недельного лимита. Часы — `CANON_NOW`
-(ISO 8601, для тестов), иначе текущее время.
+вопросы владельцу, отчёты об остановке, из них по его команде), паузы с причинами, доля
+недельного лимита. Часы — `CANON_NOW` (ISO 8601, для тестов), иначе текущее время.
 Код выхода 0 — такт прошёл; 1 — сбой (`gh`, git, App, состояние); 2 — ошибка запуска.
 Как устроено — `docs/orchestrator.md` канона.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
@@ -186,6 +190,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import types
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -222,7 +227,8 @@ PR_FIELDS = (
 GREEN = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 TAIL = 600
 # Ревью Opus xhigh идёт 5–8 минут (`review`); час — заведомо зависание, а не долгий прогон.
-REVIEW_TIMEOUT = 3600
+# `CANON_REVIEW_TIMEOUT` — секунды для тестов таймаута.
+REVIEW_TIMEOUT = int(os.environ.get("CANON_REVIEW_TIMEOUT") or 3600)
 AWAKE_FOR = REVIEW_TIMEOUT + 600  # срок `caffeinate`: такт с ревью ошибок его не переживёт
 # PR открыт, а проверок CI на нём так и нет — workflow не запустился; ждать дальше незачем.
 CI_WAIT = 1800
@@ -230,6 +236,7 @@ CI_WAIT = 1800
 RUN_LIMIT, TICKET_LIMIT, RUN_TIME = 30, 60, 2 * 3600
 REVIEW_LIMIT = 10  # предел скрипта `review` по умолчанию; меньше — когда остаток тикета меньше
 BUDGET_OUT = "error_max_budget_usd"  # `subtype` итога `claude -p`, упёршегося в `--max-budget-usd`
+LOST_SESSION = "No conversation found"  # `claude --resume` не нашёл сессию (её транскрипта нет)
 # Группа процессов после SIGTERM: столько секунд на выход, потом SIGKILL.
 KILL_WAIT = 10
 # Расход подписки (#221, разведка #211): суточный потолок — доля недельного лимита за сутки
@@ -254,6 +261,22 @@ INSIDE = Path(".git/canon-session")
 SESSION_CONFIG = ("canon.agentApp",)  # git config главного чекаута, нужный маршруту внутри
 STATE_LIMIT = 2**20  # файл клона больше — не читается (его пишет сессия)
 OWN_REPO = "repo"
+# Проверка `secrets` до публикации (#258): коммиты ветки приходят из песочницы бандлом git —
+# файлом, без git Mac в клоне; бандл больше — отказ, проверка дольше — сбой.
+PROFILE = "docs/agents/profile.md"
+SECRETS_REF = "refs/canon-secrets"
+BUNDLE_LIMIT = 512 * 2**20
+SECRETS_TIMEOUT = 600
+# Внутри песочницы: своих коммитов у head нет — код 3 (проверять нечего); иначе бандл коммитов
+# после `origin/main` по временной ссылке, ссылка убирается в любом случае.
+NOTHING_TO_PACK = 3
+PACK = (
+    'n=$(git rev-list --count origin/main.."$2") || exit 1; [ "$n" -gt 0 ] || exit 3; '
+    'git update-ref "$1" "$2" && git bundle create "$3" "$1" --not origin/main; rc=$?; '
+    'git update-ref -d "$1"; exit $rc'
+)
+# Интерпретаторы: их первый аргумент-файл в чекауте ветки — код ветки (`mac_command`).
+INTERPRETERS = {"sh", "bash", "zsh", "python", "python3", "perl", "ruby", "node"}
 IMAGES_KEY, BUILD_KEY = "canon.sandboxImages", "canon.sandboxBuild"
 SEED_FROM_KEY, SEED_INTO_KEY = "canon.sandboxSeedFrom", "canon.sandboxSeedInto"
 BUILD_TIMEOUT = 1800  # сборка образа или перенос базы-шаблона дольше получаса — сбой
@@ -424,6 +447,53 @@ def read_inside(root: Path, rel: Path) -> bytes:
         return source.read(STATE_LIMIT + 1)
 
 
+def mac_command(argv: list[str]) -> tuple[list[str], str | None]:
+    """Команда `secrets` профиля — для запуска на Mac в чекауте ветки (#258): файлы ветки не
+    исполняются, иначе код сессии шёл бы на Mac вне песочницы. Обёртка `run-log` снимается
+    (вывод нужен целиком, лог — свой), исполняемый файл по относительному пути и скрипт
+    интерпретатора не по абсолютному пути — отказ. Итог — команда и причина отказа."""
+    if Path(argv[0]).name == "run-log":
+        if "--" not in argv:
+            return argv, "команда `secrets` профиля: `run-log` без `--` — команду не выделить"
+        argv = argv[argv.index("--") + 1 :]
+    if not argv:
+        return argv, "команда `secrets` профиля пуста"
+    prog, rest = argv[0], argv[1:]
+    branch_files = [prog] if "/" in prog else []
+    if Path(prog).name in INTERPRETERS and rest and not rest[0].startswith("-"):
+        branch_files.append(rest[0])
+    for name in branch_files:
+        if not Path(name).is_absolute():
+            return argv, (
+                f"команда `secrets` профиля исполняет файл ветки `{name}` — на Mac не "
+                "запускается: нужна команда с PATH (`gitleaks …`, `sh -c '…'`)"
+            )
+    return argv, None
+
+
+def take_inside(root: Path, rel: Path, dest: Path, limit: int) -> None:
+    """Файл клона песочницы — в `dest` на Mac потоком (без копии в памяти) и удаляется из клона:
+    по тем же правилам, что `read_inside` (без ссылок и ожидания, обычный файл до `limit`)."""
+    fd = open_inside(root, rel.parent.parts)
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        file = os.open(rel.name, flags, dir_fd=fd)
+        try:
+            os.unlink(rel.name, dir_fd=fd)  # открытый файл читается и после удаления имени
+        except OSError:
+            pass
+    finally:
+        os.close(fd)
+    with os.fdopen(file, "rb") as source, open(dest, "wb") as out:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise OSError(f"{rel}: не обычный файл до {limit // 2**20} МБ")
+        left = limit
+        while left > 0 and (chunk := source.read(min(left, 2**20))):
+            out.write(chunk)
+            left -= len(chunk)
+
+
 def write_inside(root: Path, rel: Path, data: bytes, mode: int = 0o600) -> None:
     """Файл клона песочницы атомарно и без перехода по ссылкам: временный файл рядом (`O_EXCL`,
     `O_NOFOLLOW`) и замена имени — ссылка на месте файла заменяется, а не пишется насквозь."""
@@ -461,9 +531,36 @@ class Route(core.State):
                 self.data[key] = {}
         self.data.setdefault("step", None)
         self.data.setdefault("waiting", core.AGENT)
+        self.damaged = self.normalize()
+
+    def normalize(self) -> str | None:
+        """Поля, которые читает оркестратор, — того вида, что он ждёт: файл пишет сессия, и
+        `"question": "x"` уронил бы любой разбор тикета (#275). Поле не того вида заменяется
+        пустым (None) — так его безопасно читают и «статус», и повтор, и стоп; имя первого
+        такого поля — итог (`broken`), по нему шаг тикета — отчёт об остановке."""
+        damaged = []
+        for key in ("step", "pr", "weakening"):
+            if not isinstance(self.data.get(key), (str, type(None))):
+                damaged.append(key)
+                self.data[key] = None
+        for key, fields in (("question", ("stamp", "url")), ("ready", ("head",)), ("checks", ())):
+            value = self.data.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                damaged.append(key)
+                self.data[key] = None
+            elif bad := [f for f in fields if not isinstance(value.get(f), str)]:
+                damaged.append(f"{key}.{bad[0]}")
+                self.data[key] = None
+        return damaged[0] if damaged else None
 
     def save(self) -> None:
         raise core.Failure("состояние маршрута пишет сессия, не оркестратор")
+
+    def broken(self) -> str | None:
+        """Первое поле состояния не того вида (`normalize`); всё годно — None."""
+        return self.damaged
 
     def branch(self) -> str:
         """Ветка тикета: из состояния, только если это ветка этого тикета (`ticket-N`,
@@ -596,6 +693,47 @@ def exhausted(spent: float) -> bool:
     return TICKET_LIMIT - spent < 0.01
 
 
+ESTIMATE_NOTE = "оценка прерванных запусков без итога"
+
+
+def money(fact: float, estimate: float, short: bool = False, parts: str = "") -> str:
+    """Расход словами (#264): факт и оценка прерванных запусков — отдельными числами, оценка —
+    верхней границей с пометкой; `short` — для ячейки «статуса»; `parts` — состав факта, в
+    скобках сразу за ним."""
+    spent = f"{fact:.2f} USD" + (f" ({parts})" if parts else "")
+    if not estimate:
+        return spent
+    if short:
+        return f"факт {spent}, оценка ≤ {estimate:.2f} USD"
+    return f"факт {spent}, ≤ {estimate:.2f} USD — {ESTIMATE_NOTE}"
+
+
+# Счётчик «дёргали владельца» с разбивкой (#264): вопросы владельцу, отчёты об остановке, из них
+# по команде владельца (`agent:stop`).
+COUNTS = ("asked", "reports", "owner_stops")
+
+
+def counts(d: dict) -> tuple[int, ...]:
+    return tuple(int(d.get(k) or 0) for k in COUNTS)
+
+
+def counts_text(asked: int, reports: int, owner_stops: int) -> str:
+    return (
+        f"вопросов владельцу: {asked}; отчётов об остановке: {reports}, "
+        f"из них по команде владельца: {owner_stops}"
+    )
+
+
+def legacy_pings(d: dict) -> None:
+    """Состояние до #264: общий счётчик `pings` — в отчёты об остановке (разбивки он не помнит);
+    тикет, ждущий ответа, — один из них его вопрос."""
+    if "pings" in d:
+        pings = int(d.pop("pings") or 0)
+        asked = 1 if pings and d.get("phase") == "question" else 0
+        d["asked"] = int(d.get("asked") or 0) + asked
+        d["reports"] = int(d.get("reports") or 0) + pings - asked
+
+
 def ended(killed: bool | None) -> str:
     """Итог `end_run` словами отчёта."""
     return {
@@ -679,12 +817,22 @@ def stream_text(stream: str) -> dict:
         last.get("result") or ""
     ).startswith("You've hit your"):
         hit = {"window": None, "resets": None}
+    # Сессия не нашлась (`--resume` после пересоздания песочницы, проба #224, #262): запуск без
+    # успешного итога и без единого хода, строка `claude` — в его выводе не JSON или в ошибках
+    # итога. Та же фраза в успешном итоге или у агента — не потеря; сбой API до первого хода без
+    # неё — тоже.
+    found = [x for x in [*noise, *map(str, last.get("errors") or [])] if LOST_SESSION in x]
+    lost = bool(found) and last.get("subtype") != "success" and not last.get("num_turns")
+    lost = lost and not said
+    if lost and LOST_SESSION not in text:
+        text = f"{text}: {found[0]}"
     return {
         "cost": max(costs) if costs else 0,
         "subtype": last.get("subtype"),
         "result": tail(text),
         "rate_limit": limit,
         "limit": hit,
+        "lost": lost,
     }
 
 
@@ -752,6 +900,12 @@ class Orchestrator:
         data.setdefault("pauses", {})
         data.setdefault("own", [])  # свои снятия меток-команд: {n, label, at, seen}
         data.setdefault("restored", [])  # метки-команды, возвращённые за владельца: [n, label]
+        for t in data["tickets"].values():
+            legacy_pings(t)
+            legacy_pings(t.get("before") or {})
+        for prd in data["prds"].values():
+            for done in (prd.get("done") or {}).values():
+                legacy_pings(done)
         return data
 
     def save(self) -> None:
@@ -774,16 +928,30 @@ class Orchestrator:
         if n not in self.data["slots"]:
             self.data["slots"].append(n)
 
-    def costs(self, t: dict, st) -> tuple[float, list[str]]:
+    def costs(self, t: dict, st) -> dict:
         """Расход тикета по состоянию в ценах API: сессии, ревью оркестратора, дочерние прогоны
-        маршрута (`/verify`); итог и части для комментария."""
-        sessions = sum(r.get("cost") or 0 for r in t["runs"])
+        маршрута (`/verify`). `fact` — по итогам; `estimate` — верхняя граница запусков без итога
+        (`cost_estimated`: стоп, предел времени, осиротевшая сессия) и упавших ревью ошибок
+        (`review_estimate`, #275); `limit` — что идёт в предел
+        тикета: факт и оценки, кроме прерванных `agent:stop` владельца (`owner_stop`, #264);
+        `parts` — части факта для комментария."""
+        cut = [r for r in t["runs"] if r.get("cost_estimated")]
+        sessions = sum(r.get("cost") or 0 for r in t["runs"] if not r.get("cost_estimated"))
+        estimate = sum(r.get("cost") or 0 for r in cut) + (t["cost"].get("review_estimate") or 0)
         review = t["cost"].get("review") or 0
         route = {k: v for k, v in (st["cost"] or {}).items() if k != "review"}
         route = {k: v for k, v in route.items() if isinstance(v, (int, float)) and v}
         parts = [f"сессии {sessions:.2f}", f"ревью {review:.2f}"]
         parts += [f"{k} {v:.2f}" for k, v in route.items()]
-        return sessions + review + sum(route.values()), parts
+        fact = sessions + review + sum(route.values())
+        excluded = sum(r.get("cost") or 0 for r in cut if r.get("owner_stop"))
+        return {
+            "fact": fact,
+            "estimate": estimate,
+            "limit": fact + estimate - excluded,
+            "excluded": excluded,
+            "parts": parts,
+        }
 
     # --- лицо агента ---
 
@@ -1043,6 +1211,8 @@ class Orchestrator:
         worktree = self.worktree(n)
         if worktree is None:
             return "worktree тикета в клоне песочницы нет"
+        if problem := self.check_secrets(n, st, head, worktree):
+            return problem
         refspec = f"{head}:refs/heads/{branch}"
         res = self.inside(
             "git", "push", "-q", "origin", refspec, workdir=worktree, env=self.session_env()
@@ -1053,6 +1223,75 @@ class Orchestrator:
         if (tip := self.remote_tip(branch)) != head:
             return f"ветка {branch} на сервере — {tip[:7] or 'нет'}, а не head {head[:7]}"
         return None
+
+    def check_secrets(self, n: int, st: Route, head: str, worktree: Path) -> str | None:
+        """Проверка `secrets` профиля до push head (#258) — на Mac, его gitleaks. Git клона сессий
+        Mac не выполняет, поэтому коммиты ветки после `origin/main` собирает в бандл git внутри
+        песочницы; Mac забирает файл (`take_inside`) в свой клон и гоняет проверку в своём
+        чекауте head. Профиль — из `origin/main` своего клона, а не из ветки: ветка проверку из
+        профиля не уберёт. В профиле её нет — пропуск с записью в вывод такта; своих коммитов
+        у ветки нет — проверять нечего. Итог — причина остановки (без значения секрета) или
+        None."""
+        self.own_repo()
+        shown = self.git("show", f"origin/main:{PROFILE}")
+        try:
+            text = shown.stdout if shown.returncode == 0 else None
+            argv = core.secrets_command(text, f"origin/main:{PROFILE}")
+        except core.Failure as exc:
+            return f"{exc} — проверку `secrets` не разобрать, head не опубликован"
+        if argv is None:
+            say(f"#{n}: в профиле нет проверки `secrets` — head {head[:7]} уходит без gitleaks")
+            return None
+        argv, problem = mac_command(argv)
+        if problem:
+            return problem
+        rel = st.rel / "secrets.bundle"
+        res = self.inside(
+            "sh", "-c", PACK, "sh", SECRETS_REF, head, str(self.clone / rel), workdir=worktree
+        )
+        if res.returncode == NOTHING_TO_PACK:
+            return None
+        if res.returncode != 0:
+            return f"коммиты ветки для проверки `secrets` не собраны: {tail(res.stderr)}"
+        bundle, ref = self.dir / "bundles" / f"ticket-{n}.bundle", f"{SECRETS_REF}/ticket-{n}"
+        bundle.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            take_inside(self.clone, rel, bundle, BUNDLE_LIMIT)
+            fetch = ("fetch", "-q", "--no-tags", str(bundle), f"+{SECRETS_REF}:{ref}")
+            res = self.git(*fetch)
+            if res.returncode != 0:  # `origin/main` песочницы новее своего клона — догнать раз
+                self.own_repo(refetch=True)
+                res = self.git(*fetch)
+            if res.returncode != 0:
+                return f"бандл коммитов ветки не принят своим клоном: {tail(res.stderr)}"
+            got = self.git("rev-parse", "--verify", "-q", ref).stdout.strip()
+            if got != head:
+                return f"в бандле коммитов ветки {got[:7] or 'ничего'}, а не head {head[:7]}"
+            checkout = self.checkout("secrets", n, head)
+            try:
+                res = run(*argv, cwd=checkout, env=without_tokens(), timeout=SECRETS_TIMEOUT)
+            finally:
+                self.drop_checkout(checkout)
+        except OSError as exc:
+            return f"бандл коммитов ветки для проверки `secrets` не прочитан: {exc}"
+        except subprocess.TimeoutExpired:
+            return f"проверка `secrets` дольше {SECRETS_TIMEOUT // 60} мин — head не опубликован"
+        except Failure as exc:
+            return f"проверка `secrets` не начата: {exc}"
+        finally:
+            bundle.unlink(missing_ok=True)
+            self.git("update-ref", "-d", ref)
+        if res.returncode == 0:
+            return None
+        output = res.stdout + res.stderr
+        log = self.output_log(n, "secrets", output)
+        if found := core.secret_findings(output):
+            return (
+                f"{core.leaks_line(found)} — head не опубликован; не чинить коммитом и не "
+                f"глушить, ключ отзывает владелец; вывод — лог `{log}` на Mac"
+            )
+        said = ship.failure(core.without_secret_fields(output), log, "на Mac")
+        return f"проверка `secrets` не прошла (код {res.returncode}): {said}"
 
     def cleanup_inside(self, n: int, *args: str) -> subprocess.CompletedProcess:
         """Уборка тикета изнутри песочницы — `session-run N --retire <head>` или `--discard`
@@ -1237,6 +1476,8 @@ class Orchestrator:
             self.save()
             self.login()
             errors = [awake] if awake else []
+            for held in (*self.data["tickets"].values(), *self.data["prds"].values()):
+                held.pop("fault", None)  # «статус» показывает сбои последнего такта
             try:
                 errors += self.reconcile()
                 self.review_pauses()
@@ -1254,6 +1495,8 @@ class Orchestrator:
                     except (Failure, core.Failure, start.StartError, *COMMAND_ERRORS) as exc:
                         errors.append(f"#{n}: {exc}")
                         say(f"#{n}: шаг на месте не выполнен — {exc}")
+                    except Exception as exc:  # noqa: BLE001 — любой сбой одного тикета (#275)
+                        errors.append(self.fault(n, exc))
                 errors += self.fill()
             finally:
                 if awake := self.try_keep_awake():
@@ -1307,6 +1550,8 @@ class Orchestrator:
             except (Failure, core.Failure, *COMMAND_ERRORS) as exc:
                 errors.append(f"#{n} осиротевшая сессия: {exc}")
                 say(f"#{n}: осиротевшая сессия не разобрана — {exc}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self.fault(n, exc))
         return errors
 
     def adopt(self, n: int, t: dict, proc: dict) -> None:
@@ -1340,6 +1585,19 @@ class Orchestrator:
             t["session"] = proc["session"]
         if t["phase"] == "session":
             self.requeue(n, t)
+
+    def fault(self, n: int, exc: Exception) -> str:
+        """Непредвиденный сбой разбора тикета (#275): трассировка — в журнал службы, строка — в
+        «статус» до следующего такта; тикет остаётся на своём шаге, такт идёт дальше. Итог —
+        строка сбоя для кода выхода такта. Номер PRD (очередь, команды) — строкой PRD."""
+        text = " ".join(f"{type(exc).__name__}: {exc}".split())
+        kind, held = "тикет", self.data["tickets"].get(str(n))
+        if held is None and str(n) in self.data["prds"]:
+            kind, held = "PRD", self.data["prds"][str(n)]
+        if held is not None:
+            held["fault"] = text
+        say(f"{kind} {n}: сбой такта — {text}\n{traceback.format_exc().rstrip()}")
+        return f"{kind} {n}: сбой такта — {text}"
 
     def requeue(self, n: int, t: dict) -> None:
         """Тикет прерван не по своей вине (упор в лимит, осиротевшая сессия) — место свободно,
@@ -1552,6 +1810,26 @@ class Orchestrator:
         (self.dir / OWNER_NOW).unlink(missing_ok=True)
         write_json(self.dir / OWNER_PAUSE, {"since": stamp()})
         say("пауза: новые тикеты не берутся, начатые идут до конца своего запуска")
+        print(self.idle())
+
+    def idle(self) -> str:
+        """Простой для обновления копии канона и пересоздания песочницы (#262): тикеты, которым
+        ещё понадобится их сессия, — у них есть сессия в состоянии (на месте, в очереди, на
+        вопросе, остановке, CI или мёрже — до слияния); пересоздание песочницы удалит её
+        транскрипт. Без «паузы» владельца простой — на сейчас: следующий такт может взять тикет."""
+        risk = [
+            f"#{key} ({self.where(int(key), t)})"
+            for key, t in sorted(self.data["tickets"].items(), key=lambda kv: int(kv[0]))
+            if t.get("session")
+        ]
+        if not risk and self.owner_file(OWNER_PAUSE) is None:
+            return "Простой полный, но паузы нет: сначала `orch pause`, затем обновлять"
+        if not risk:
+            return "Простой полный: обновлять можно"
+        return (
+            f"Сессии пропадут при пересоздании песочницы: {'; '.join(risk)} — обновлять копию "
+            "канона рано (docs/orchestrator.md, «Обновление канона»)"
+        )
 
     def owner_now(self) -> None:
         """«Работай сейчас»: «пауза» снята, расписание переопределено до ближайшей границы окна
@@ -1650,22 +1928,44 @@ class Orchestrator:
         rows = []
         for key in sorted(self.data["tickets"], key=int):
             n, t = int(key), self.data["tickets"][key]
-            st = self.route(n)
-            ticket, step, wait, url, _, checks, _, since = table.row(core, st.data)
+            try:  # состояние маршрута пишет сессия: его сбой — строкой тикета, не всего «статуса»
+                st = self.route(n)
+                ticket, step, wait, url, _, checks, _, since = table.row(core, st.data)
+            except Exception as exc:  # noqa: BLE001
+                what = " ".join(f"{type(exc).__name__}: {exc}".split())
+                row = (f"#{n}", self.where(n, t), f"состояние маршрута не прочитано: {what}")
+                rows.append(tuple(cell(x) for x in row + ("—",) * 6))
+                continue
             if t["phase"] == "queued":
                 wait, since = "место", duration(t.get("requeued") or t.get("queued"))
             elif t["phase"] in ("question", "stopped"):
                 wait = "владелец"
-            spent, _ = self.costs(t, st)
+            spent = self.costs(t, st)
             if st.step is None:
                 step = "—"
-            row = (ticket, self.where(n, t), step, wait, url, checks, f"{spent:.2f} USD", since)
+            spend = money(spent["fact"], spent["estimate"], short=True)
+            asked = " / ".join(map(str, counts(t)))
+            row = (ticket, self.where(n, t), step, wait, url, checks, spend, asked, since)
             rows.append(tuple(cell(x) for x in row))
-        header = ("Тикет", "Оркестратор", "Шаг маршрута", "Ждём", "PR", "CI", "Расход", "На шаге")
+        header = (
+            "Тикет",
+            "Оркестратор",
+            "Шаг маршрута",
+            "Ждём",
+            "PR",
+            "CI",
+            "Расход",
+            "Вопросов / отчётов / по команде владельца",
+            "На шаге",
+        )
         if rows:
             table.table(core, header, rows)
         else:
             say("тикетов нет")
+        for kind, held in (("тикет", self.data["tickets"]), ("PRD", self.data["prds"])):
+            for key in sorted(held, key=int):
+                if fault := held[key].get("fault"):
+                    print(f"{kind} {key}: сбой такта — {fault}")
         busy = ", ".join(f"#{n}" for n in self.data["slots"])
         places = self.capacity()
         print(
@@ -1694,6 +1994,7 @@ class Orchestrator:
         print(f"Последний такт: {moment(last) if last else 'не было'}")
         print(f"Служба: {self.service_state()}")
         print(f"Песочница: {self.sandbox_state()}")
+        print(self.idle())
         awake = self.data.get("awake")
         held = isinstance(awake, dict) and alive(awake)
         print(f"Mac не уснёт: {'да (caffeinate)' if held else 'нет'}")
@@ -1800,7 +2101,13 @@ class Orchestrator:
         своих обёрток), лог в своём каталоге; затем `launchctl bootstrap` в домен пользователя.
         Под замком такта: прошлая версия снимается не посреди такта."""
         path = self.plain_path()
-        missing = [tool for tool in SERVICE_TOOLS if shutil.which(tool, path=path) is None]
+        tools = list(SERVICE_TOOLS)
+        try:  # проверка `secrets` до публикации (#258) идёт на Mac — нужен его gitleaks
+            if core.secrets_command((self.main / PROFILE).read_text(encoding="utf-8"), PROFILE):
+                tools.append("gitleaks")
+        except (OSError, core.Failure):
+            pass  # профиля нет или он не разобран — скажет такт
+        missing = [tool for tool in tools if shutil.which(tool, path=path) is None]
         if missing:
             names = ", ".join(f"`{tool}`" for tool in missing)
             raise Failure(
@@ -1871,21 +2178,26 @@ class Orchestrator:
                 except (Failure, core.Failure, start.StartError, *COMMAND_ERRORS) as exc:
                     errors.append(f"#{n} {label}: {exc}")
                     say(f"#{n}: {label} не выполнена — {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(self.fault(n, exc))
         return errors
 
-    def end_run(self, t: dict) -> bool | None:
+    def end_run(self, t: dict, by_owner: bool = False) -> bool | None:
         """Живой запуск — завершить всей группой процессов; итог запуска — в состояние. Итог:
         None — запуск не шёл, True — завершён, False — группа пережила SIGKILL. У завершённого
-        итога `result` в потоке нет — расход записывается худшим случаем, его
-        `--max-budget-usd`: иначе стоп и продолжение обходили бы предел тикета."""
+        итога `result` в потоке нет — расход записывается оценкой худшим случаем, его
+        `--max-budget-usd`: иначе предел времени и продолжение обходили бы предел тикета.
+        `by_owner` — прерван `agent:stop` владельца: оценка в предел тикета не идёт (#264)."""
         if not t["runs"]:
             return None
         last = t["runs"][-1]
         killed = self.end_group(last) if self.live(last) else None
         self.finish_run(t, last)
-        if killed is not None:
+        if killed is not None and not last.get("subtype"):  # итог есть — это факт, не оценка
             budget = float(last.get("budget") or RUN_LIMIT)
             last.update(cost=max(last.get("cost") or 0, budget), cost_estimated=True)
+            if by_owner:
+                last["owner_stop"] = True
         return killed
 
     def draft(self, st, on: bool) -> None:
@@ -1915,15 +2227,17 @@ class Orchestrator:
             self.finish_run(t, last)
             if st.step == "stopped":
                 self.labels(n, add=(STOPPED,), remove=(STOP,))
-                t.update(phase="stopped", resume="session", pings=t["pings"] + 1)
+                # Отчёт — сессии, не по команде владельца.
+                t.update(phase="stopped", resume="session", reports=t.get("reports", 0) + 1)
                 return self.free(n)
             t["phase"] = "settle"
             why = f"сессия уже кончилась (шаг маршрута «{st.step}»), её итог не разобран"
         elif t["phase"] == "question":
             why = "сессия кончилась с вопросом и ждала ответа владельца"
         else:
-            why = ended(self.end_run(t))
-        self.stop(n, t, f"владелец поставил `{STOP}` — {why}", remove=(STOP, QUEUED))
+            why = ended(self.end_run(t, by_owner=True))
+        reason = f"владелец поставил `{STOP}` — {why}"
+        self.stop(n, t, reason, remove=(STOP, QUEUED), by_owner=True)
 
     def retry(self, n: int, t: dict) -> None:
         """`agent:retry`: с чистого листа. Каждый шаг повторим — сбой посреди оставляет метку, и
@@ -1931,7 +2245,7 @@ class Orchestrator:
         if self.end_run(t) is False:
             raise Failure(f"#{n}: процессы сессии не завершились и за SIGKILL — повтор не начат")
         st = self.route(n)
-        spent, _ = self.costs(t, st)  # прошлая попытка — в мерах сводки PRD, не в пределе тикета
+        spent = self.costs(t, st)  # прошлая попытка — в мерах сводки PRD, не в пределе тикета
         branch = st.branch()
         if st["pr"] and self.pr(st).get("state") == "OPEN":
             core.gh("pr", "close", st["pr"], "--comment", RETRY_NOTE)
@@ -1954,9 +2268,10 @@ class Orchestrator:
         before = t.get("before") or {}
         renewed = fresh(prd=t.get("prd"))
         renewed["before"] = {
-            "pings": before.get("pings", 0) + t["pings"],
+            **{k: before.get(k, 0) + t.get(k, 0) for k in COUNTS},
             "runs": before.get("runs", 0) + len(t["runs"]),
-            "cost": round(before.get("cost", 0) + spent, 4),
+            "cost": round(before.get("cost", 0) + spent["fact"], 4),
+            "estimate": round(before.get("estimate", 0) + spent["estimate"], 4),
         }
         self.data["tickets"][str(n)] = renewed
         self.free(n)
@@ -2024,7 +2339,7 @@ class Orchestrator:
             say(f"события меток не прочитаны — {exc}")
             return [f"события меток: {exc}"]
         keep = list(self.data["own"])
-        errors = []
+        errors, failed = [], None
         for event in fresh_events:
             label = (event.get("label") or {}).get("name")
             n = (event.get("issue") or {}).get("number")
@@ -2056,11 +2371,18 @@ class Orchestrator:
             except (Failure, core.Failure, *COMMAND_ERRORS) as exc:
                 errors.append(f"#{n} снятие {label}: {exc}")
                 say(f"#{n}: снятие {label} не разобрано — {exc}")
+            except Exception as exc:  # noqa: BLE001
+                # Непредвиденный сбой (#275): курсор встаёт перед этим событием — следующий такт
+                # повторит возврат метки, а не потеряет его.
+                errors.append(self.fault(n, exc))
+                failed = event["id"]
+                break
         for o in keep:
             o["seen"] = o.get("seen", 0) + 1
         self.data["own"] = [o for o in keep if o["seen"] < OWN_KEEP]
-        if fresh_events:
-            self.data["events"] = max(e["id"] for e in fresh_events)
+        done = [e["id"] for e in fresh_events if failed is None or e["id"] < failed]
+        if done:
+            self.data["events"] = max(done)
         return errors
 
     def new_events(self) -> list[dict]:
@@ -2117,6 +2439,8 @@ class Orchestrator:
             except (Failure, core.Failure, *COMMAND_ERRORS) as exc:
                 errors.append(f"#{n} {GO}: {exc}")
                 say(f"#{n}: {GO} не разобрана — {exc}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self.fault(n, exc))
         return errors
 
     def take(self, n: int, names: list[str]) -> None:
@@ -2170,8 +2494,11 @@ class Orchestrator:
                 fields = "state,comments"
                 found = core.gh_json("issue", "view", str(n), "--json", fields) or {}
                 if found.get("state") == "CLOSED":
-                    self.forget(n, t, None, self.costs(t, st)[0])
+                    self.forget(n, t, None, self.costs(t, st))
                     say(f"#{n}: тикет закрыт, ожидая ответа, — больше не ведём")
+                    continue
+                if field := st.broken():
+                    self.stop(n, t, f"состояние маршрута повреждено: {field}")
                     continue
                 if question:  # вопроса в маршруте нет — ответ взят (ручная сессия): продолжение
                     comments = found.get("comments") or []
@@ -2188,6 +2515,9 @@ class Orchestrator:
             except (core.Failure, *COMMAND_ERRORS) as exc:
                 errors.append(f"#{n} ответ на вопрос: {exc}")
                 say(f"#{n}: ответ на вопрос не проверен — {exc}")
+                continue
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self.fault(n, exc))
                 continue
             t.update(phase="queued", resume="answer", requeued=stamp())
             queue = self.data["queue"]
@@ -2230,6 +2560,9 @@ class Orchestrator:
                 errors.append(f"#{n}: {exc}")  # владения не известны — очередь за ним не держит
                 say(f"#{n}: место не занято — {exc}")
                 continue
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self.fault(n, exc))
+                continue
             # Пауза (#221) держит места, где пойдёт `claude`; продолжение на CI или мёрже — нет.
             if self.ticket(n).get("resume") not in ("ci", "merge"):
                 if not self.usage_checked and not self.data["pauses"]:
@@ -2253,6 +2586,9 @@ class Orchestrator:
             except (Failure, core.Failure, start.StartError, *COMMAND_ERRORS) as exc:
                 errors.append(f"#{n}: {exc}")  # тикет остаётся в очереди, следующие идут
                 say(f"#{n}: место не занято — {exc}")
+                continue
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self.fault(n, exc))
                 continue
             if n in self.data["queue"]:
                 self.data["queue"].remove(n)
@@ -2365,11 +2701,11 @@ class Orchestrator:
         return bool(t.get("session")) and self.worktree(n) is not None
 
     def launch(self, n: int, resume: str | None = None, task: str | None = None) -> None:
-        """Сессия тикета через `session-run`: новая или возобновление той же (`--resume`;
-        задание оркестратора — `--prompt`, иначе `/start N`), с `--max-budget-usd` — наименьшим
-        из предела запуска и остатка предела тикета."""
+        """Сессия тикета через `session-run`: новая или возобновление той же (`--resume`);
+        задание оркестратора — `--prompt` (и новой сессии вместо потерянной), иначе `/start N`;
+        `--max-budget-usd` — наименьший из предела запуска и остатка предела тикета."""
         t = self.ticket(n)
-        spent, _ = self.costs(t, self.route(n))
+        spent = self.costs(t, self.route(n))["limit"]
         if exhausted(spent):
             return self.stop(
                 n,
@@ -2385,10 +2721,9 @@ class Orchestrator:
         log = logs / f"ticket-{n}-{session[:8]}-{len(t['runs']) + 1}.jsonl"
         tag = uuid.uuid4().hex[:16]  # метка запуска: по ней такт находит его процессы внутри
         script = [str(HERE / "session-run"), str(n), "--run", tag, "--max-budget-usd", budget]
-        if resume:
-            script += ["--resume", session, *(["--prompt", task] if task else []), "--", *STREAM]
-        else:
-            script += ["--", "--session-id", session, *STREAM]
+        script += ["--resume", session] if resume else []
+        script += ["--prompt", task] if task else []
+        script += ["--", *([] if resume else ["--session-id", session]), *STREAM]
         self.sandbox_entry()  # граница — до подготовки: шаблон в не ту песочницу не уйдёт
         self.prepare()  # образы проекта и база-шаблон — до первого запуска такта
         env = self.session_env()
@@ -2440,6 +2775,10 @@ class Orchestrator:
     def advance(self, n: int) -> None:
         t = self.ticket(n)
         phase = t["phase"]
+        # Состояние маршрута пишет сессия (#275); на шаге «сессия» — проверка в `session_over`,
+        # когда запуск кончился.
+        if phase in ("ci", "merge") and (field := self.route(n).broken()):
+            return self.stop(n, t, f"состояние маршрута повреждено: {field}")
         if phase == "session":
             self.session_over(n, t)
         elif phase == "ci":
@@ -2480,6 +2819,8 @@ class Orchestrator:
             return
         summary = self.finish_run(t, last)
         st = self.route(n)
+        if field := st.broken():  # запуск кончился — состояние больше не пишется (#275)
+            return self.stop(n, t, f"состояние маршрута повреждено: {field}")
         asked = last.get("answer")
         unanswered = bool(asked) and (st["question"] or {}).get("stamp") == asked
         if summary["limit"] and st.step not in ("ready", "stopped"):
@@ -2494,6 +2835,8 @@ class Orchestrator:
         ready = st["ready"] or {}
         if unanswered:
             return self.answer_lost(n, t, last, summary)
+        if last.get("resumed") and summary["lost"]:
+            return self.session_lost(n, t, summary)
         if st.step == "ready":
             t.pop("task", None)  # задание оркестратора выполнено
         if st.step == "ready" and not ready.get("reviewed"):
@@ -2502,14 +2845,14 @@ class Orchestrator:
             t["phase"] = "ci"
             self.ci(n, t)
         elif st["question"]:
-            t.update(phase="question", pings=t["pings"] + 1)  # ответ — `answered`
+            t.update(phase="question", asked=t.get("asked", 0) + 1)  # ответ — `answered`
             self.free(n)
             say(f"#{n}: вопрос владельцу — место свободно до ответа")
         elif st.step == "stopped":
             # Отчёт опубликовала сама сессия (`ready-for-human` — его); на шаге `stop` маршрут
             # ещё ждал отчёт от агента — это сессия без результата, ниже.
             self.labels(n, add=(STOPPED,))
-            t.update(phase="stopped", resume="session", pings=t["pings"] + 1)
+            t.update(phase="stopped", resume="session", reports=t.get("reports", 0) + 1)
             self.free(n)
             say(f"#{n}: сессия остановилась с отчётом")
         elif summary["subtype"] == BUDGET_OUT:
@@ -2541,30 +2884,74 @@ class Orchestrator:
             return
         self.after_answer(n, t, why=f"сессия не возобновилась ({result})")
 
-    def stop(self, n: int, t: dict, reason: str, remove: tuple[str, ...] = ()) -> None:
+    def session_lost(self, n: int, t: dict, summary: dict) -> None:
+        """Возобновление не нашло сессию (её транскрипт удалён с песочницей, #262) на любом шаге:
+        один раз на тикет — новая сессия на той же ветке и в том же worktree с тем же заданием
+        оркестратора (догон, CI; на разборе находок — тот же отчёт ревью рядом с состоянием, без
+        второго ревью) и запись в тикет без упоминания. Второго `--resume` потерянной сессии нет;
+        потеряна и новая — отчёт об остановке, а id потерянной забыт: `agent:go` начнёт новую
+        сессию, а не возобновит несуществующую."""
+        st = self.route(n)
+        why = f"сессия `{t['session'][:8]}` не нашлась при возобновлении ({summary['result']})"
+        if any(r.get("replaces") for r in t["runs"]):
+            t.pop("session")
+            return self.stop(
+                n, t, f"{why} — снова не нашлась: новая сессия вместо потерянной уже была"
+            )
+        if self.hold(n, "новая сессия вместо потерянной"):
+            return
+        task = t.get("task")
+        findings = st.step == "ready" and not (st["ready"] or {}).get("reviewed")
+        self.launch(n, task=task)
+        if t["phase"] != "session":
+            return  # предел тикета: отчёт об остановке уже в тикете
+        t["runs"][-1]["replaces"] = True
+        branch = st.branch()
+        say(f"#{n}: {why} — новая сессия на той же ветке")
+        same = "с тем же заданием оркестратора" if task else f"с шага маршрута «{st.step}»"
+        if findings and t.get("reviewed"):
+            same += "; отчёт ревью ошибок тот же, второго ревью нет"
+        try:  # запуск уже идёт: сбой записи не должен оставить тикет и на месте, и в очереди
+            self.comment(
+                n, f"Оркестратор: {why} — новая сессия на той же ветке `{branch}` {same}.\n"
+            )
+        except core.Failure as exc:
+            say(f"#{n}: запись о новой сессии в тикет не ушла — {exc}")
+
+    def stop(
+        self, n: int, t: dict, reason: str, remove: tuple[str, ...] = (), by_owner: bool = False
+    ) -> None:
         """Отчёт об остановке «Причина / Сделано / Доступно» с упоминанием владельца (решение
         16.10, п. 11: уведомление), `agent:stopped` и `ready-for-human`; ветка и PR сохраняются.
+        `by_owner` — стоп по `agent:stop` владельца: без упоминания, это его команда (#264).
         Шаг остановки — в `resume` (с него продолжит `agent:go`). Метки — до комментария: их сбой
         не повторит комментарий на следующем такте."""
         if t["phase"] not in ("stopped", "queued"):
             t["resume"] = t["phase"]
-        body = self.report(n, t, reason)
+        body = self.report(n, t, reason, by_owner)
         self.labels(n, add=(STOPPED, HUMAN), remove=remove)
         self.comment(n, body)
-        t.update(phase="stopped", reason=reason, pings=t["pings"] + 1)
+        t.update(phase="stopped", reason=reason, reports=t.get("reports", 0) + 1)
+        if by_owner:
+            t["owner_stops"] = t.get("owner_stops", 0) + 1
         self.free(n)
         say(f"#{n}: остановка — {reason}")
 
-    def report(self, n: int, t: dict, reason: str) -> str:
+    def report(self, n: int, t: dict, reason: str, by_owner: bool = False) -> str:
         st = self.route(n)
-        spent, _ = self.costs(t, st)
+        cost = self.costs(t, st)
+        spent = cost["limit"]
         where = PHASES.get(t.get("resume") or t["phase"], t["phase"])
         if t["runs"]:
             kept = f"ветка `{st.branch()}`" + (f", PR {st['pr']}" if st["pr"] else "")
             done = f"шаг «{where}», запусков сессии: {len(t['runs'])}; {kept} — сохранены"
         else:
             done = f"шаг «{where}», сессия не запускалась"
-        done += f"; расход {spent:.2f} USD в ценах API из {TICKET_LIMIT} USD на тикет."
+        done += f"; расход в ценах API: {money(cost['fact'], cost['estimate'])}"
+        done += f"; в счёт предела тикета {spent:.2f} из {TICKET_LIMIT} USD"
+        if cost["excluded"]:
+            done += f" (оценка запусков, прерванных `{STOP}` владельца, в предел не входит)"
+        done += "."
         if t.get("resume") in ("ci", "merge"):
             go = "снова проверка CI и отметка `review`, черновик PR снимается"
         elif t.get("resume") == "settle":
@@ -2581,6 +2968,8 @@ class Orchestrator:
         if exhausted(spent) and t.get("resume") not in ("ci", "merge", "settle"):
             go += f" — но предел тикета исчерпан: запуск сразу остановится, нужен `{RETRY}`"
         owner = self.repo.split("/")[0]
+        mention = "" if by_owner else f"@{owner}, "  # стоп владельца — без упоминания (#264)
+        human = f"{mention}нужен человек: метка `{HUMAN}`."
         return (
             f"{core.REPORT_MARK} (оркестратор)\n\n"
             f"**Причина:** {reason}\n\n"
@@ -2590,7 +2979,7 @@ class Orchestrator:
             f"- `{RETRY}` — с чистого листа: PR закрыт с комментарием, ветка, worktree и "
             "состояние удалены, тикет снова в очереди;\n"
             "- ничего не ставить — тикет ждёт, место оркестратора свободно.\n\n"
-            f"@{owner}, нужен человек: метка `{HUMAN}`.\n"
+            + f"{human[0].upper()}{human[1:]}\n"
         )
 
     # --- ревью ошибок ---
@@ -2628,7 +3017,7 @@ class Orchestrator:
     def review(self, n: int, t: dict, st) -> None:
         if self.hold(n, "ревью ошибок"):
             return
-        spent, _ = self.costs(t, st)
+        spent = self.costs(t, st)["limit"]
         if exhausted(spent):
             return self.stop(
                 n,
@@ -2640,6 +3029,10 @@ class Orchestrator:
             # одно ревью на тикет — тот же отчёт снова, один раз; второй круг — остановка.
             if t.get("handovers", 0) >= 1:
                 return self.stop(n, t, "сессия дважды кончилась до разбора находок ревью")
+            if t["runs"] and t["runs"][-1].get("replaces"):
+                return self.stop(
+                    n, t, "новая сессия вместо потерянной кончилась до разбора находок ревью"
+                )
             self.hand_over(n, st)
             self.launch(n, resume=t["session"])
             if t["phase"] == "session":  # засчитан только начатый запуск (сбой подготовки — нет)
@@ -2663,20 +3056,41 @@ class Orchestrator:
         try:
             res = run(*review, cwd=checkout, env=env, timeout=REVIEW_TIMEOUT)
         except subprocess.TimeoutExpired:
-            return self.stop(n, t, f"ревью ошибок не кончилось за {REVIEW_TIMEOUT // 60} мин")
+            why = f"ревью ошибок не кончилось за {max(REVIEW_TIMEOUT // 60, 1)} мин"
+            return self.review_failed(n, t, budget, why)
         finally:
             self.drop_checkout(checkout)
         if res.returncode != 0:
-            return self.stop(n, t, f"ревью ошибок не состоялось: {tail(res.stderr or res.stdout)}")
+            log = self.output_log(n, "review", res.stdout + res.stderr)
+            said = ship.failure(res.stderr or res.stdout, log, "на Mac")
+            return self.review_failed(
+                n, t, budget, f"ревью ошибок не состоялось (код {res.returncode}): {said}"
+            )
         try:
             data = json.loads(report.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            return self.stop(n, t, f"отчёт ревью не прочитан: {exc}")
+            return self.review_failed(n, t, budget, f"отчёт ревью не прочитан: {exc}")
         cost = data.get("total_cost_usd")
         t["cost"]["review"] = cost if isinstance(cost, (int, float)) else 0
         t["reviewed"] = True
         self.hand_over(n, st)
         self.launch(n, resume=t["session"])  # находки — той же сессии заданием маршрута
+
+    def review_failed(self, n: int, t: dict, budget: str, reason: str) -> None:
+        """Ревью без годного итога (таймаут, код ≠ 0, нечитаемый отчёт): расход неизвестен —
+        оценка худшим случаем, его `--max-budget-usd`, в предел тикета (#275): иначе `agent:go`
+        гонял бы новое ревью мимо предела. Затем — отчёт об остановке."""
+        spent = t["cost"].get("review_estimate") or 0
+        t["cost"]["review_estimate"] = round(spent + float(budget), 4)
+        self.stop(n, t, reason)
+
+    def output_log(self, n: int, kind: str, text: str) -> str:
+        """Полный вывод упавшей команды — в файл рядом с состоянием оркестратора на Mac (#275):
+        в отчёт на GitHub — только первая строка ошибки и этот путь, от главного чекаута."""
+        path = self.dir / "logs" / f"ticket-{n}-{kind}-{stamp().replace(':', '')}.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return str(path.relative_to(self.main)) if path.is_relative_to(self.main) else str(path)
 
     # --- PRD ---
 
@@ -2738,6 +3152,8 @@ class Orchestrator:
             except (Failure, core.Failure, *COMMAND_ERRORS) as exc:
                 errors.append(f"PRD #{key}: {exc}")
                 say(f"PRD #{key}: не разобран — {exc}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self.fault(int(key), exc))
         return errors
 
     def prd_step(self, p: int, prd: dict) -> None:
@@ -2827,14 +3243,16 @@ class Orchestrator:
                 if pr.get("state") == "MERGED":
                     self.merged(n, t, st, pr)
                 else:
-                    self.forget(n, t, None, self.costs(t, st)[0])
+                    self.forget(n, t, None, self.costs(t, st))
                     say(f"#{n}: закрыт на остановке — больше не ведём")
             except (Failure, core.Failure, start.StartError, *COMMAND_ERRORS) as exc:
                 errors.append(f"#{n} закрыт на остановке: {exc}")
                 say(f"#{n}: закрытие на остановке не разобрано — {exc}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self.fault(n, exc))
         return errors
 
-    def forget(self, n: int, t: dict, pr: str | None, cost: float) -> None:
+    def forget(self, n: int, t: dict, pr: str | None, cost: dict) -> None:
         """Тикет уходит из состояния: меры — в его PRD (для сводки, с прошлыми попытками до
         `agent:retry`), место и очередь освобождаются."""
         prd = self.data["prds"].get(str(t.get("prd")))
@@ -2842,8 +3260,9 @@ class Orchestrator:
         if prd is not None:
             prd["done"][str(n)] = {
                 "pr": pr,
-                "pings": t["pings"] + before.get("pings", 0),
-                "cost": round(cost + before.get("cost", 0), 4),
+                **{k: t.get(k, 0) + before.get(k, 0) for k in COUNTS},
+                "cost": round(cost["fact"] + before.get("cost", 0), 4),
+                "estimate": round(cost["estimate"] + before.get("estimate", 0), 4),
                 "runs": len(t["runs"]) + before.get("runs", 0),
             }
         del self.data["tickets"][str(n)]
@@ -2871,10 +3290,13 @@ class Orchestrator:
         rows = [
             f"- #{n} — "
             + (f"слит, PR {d['pr']}" if d["pr"] else "закрыт без слияния")
-            + f"; дёргали владельца {d['pings']} раз, расход {d['cost']:.2f} USD, "
-            f"запусков сессии {d['runs']}"
+            + f"; {counts_text(*counts(d))}; "
+            f"расход {money(d['cost'], d.get('estimate') or 0)}; запусков сессии {d['runs']}"
             for n, d in done
         ]
+        total = [sum(c) for c in zip(*(counts(d) for _, d in done))] or [0, 0, 0]
+        fact = sum(d["cost"] for _, d in done)
+        estimate = sum(d.get("estimate") or 0 for _, d in done)
         owner = self.repo.split("/")[0]
         lines = [f"Оркестратор: PRD завершён — сводка, @{owner}.", "", "**Тикеты:**"]
         lines += rows or ["- ни одного тикета не взято"]
@@ -2889,9 +3311,9 @@ class Orchestrator:
         lines += [
             "",
             "**Меры:**",
-            f"- дёргали владельца: {sum(d['pings'] for _, d in done)} раз",
+            f"- {counts_text(*total)}",
             f"- время от `{GO}` до сводки: {duration(prd['queued'])}",
-            f"- расход: {sum(d['cost'] for _, d in done):.2f} USD в ценах API",
+            f"- расход в ценах API: {money(fact, estimate)}",
             f"- запусков сессии: {sum(d['runs'] for _, d in done)}",
             f"- ускользнувших дефектов (`{ESCAPED}`): {self.escaped(prd['done'])}",
         ]
@@ -2952,9 +3374,9 @@ class Orchestrator:
             self.drop_checkout(checkout)
             self.git("branch", "-q", "-D", branch)
         if res.returncode != 0:
-            return self.stop(
-                n, t, f"отметка review не поставлена: {tail(res.stderr or res.stdout)}"
-            )
+            log = self.output_log(n, "mark", res.stdout + res.stderr)
+            said = ship.failure(res.stderr or res.stdout, log, "на Mac")
+            return self.stop(n, t, f"отметка review не поставлена (код {res.returncode}): {said}")
         t.update(phase="merge", marked=head, pr=st["pr"])
         say(f"#{n}: отметка review и авто-мёрж на {head[:7]}")
 
@@ -3088,13 +3510,14 @@ class Orchestrator:
 
     def merged(self, n: int, t: dict, st, pr: dict) -> None:
         gone, problems = self.retire(n, pr.get("headRefOid"))
-        total, parts = self.costs(t, st)
+        cost = self.costs(t, st)
         lines = [
             f"Оркестратор: тикет слит — PR {st['pr']}.",
             "",
-            f"- дёргали владельца: {t['pings']} раз",
+            f"- {counts_text(*counts(t))}",
             f"- время от очереди до слияния: {duration(t['queued'])}",
-            f"- расход: {total:.2f} USD в ценах API ({', '.join(parts)})",
+            f"- расход в ценах API: "
+            f"{money(cost['fact'], cost['estimate'], parts=', '.join(cost['parts']))}",
             f"- запусков сессии: {len(t['runs'])}",
         ]
         if problems:
@@ -3102,15 +3525,19 @@ class Orchestrator:
         self.comment(n, "\n".join(lines) + "\n")
         for suffix in (".json", ".md"):  # отчёт этого круга новой работе по тикету не годится
             self.own_report(n).with_suffix(suffix).unlink(missing_ok=True)
-        self.forget(n, t, st["pr"], total)
+        self.forget(n, t, st["pr"], cost)
         for other in self.data["tickets"].values():  # ещё не слиты: основа ушла вперёд
             other["behind"] = True
-        say(f"#{n}: слит, {'убрано' if gone and not problems else 'уборка не доделана'}")
+        say(
+            f"#{n}: слит, "
+            + (f"уборка не доделана: {'; '.join(problems)}" if problems else "убрано")
+        )
 
     def retire(self, n: int, head) -> tuple[bool, list[str]]:
         """Уборка после мёржа — изнутри песочницы (`session-run N --retire <head>`): worktree,
         ветка, ресурсы проекта, метка `in-progress` — механикой `session-start`. Итог — (ветки
-        больше нет, что не доделано)."""
+        больше нет, что не доделано); ветка осталась без причины в итоге — причиной идёт хвост
+        stderr уборки."""
         if not isinstance(head, str) or not SHA.fullmatch(head):
             return False, [f"head слитого PR — не коммит: {head!r}"]
         try:
@@ -3119,14 +3546,23 @@ class Orchestrator:
             return False, [f"сбой уборки в песочнице: {exc}"]
         try:
             data = json.loads(res.stdout.strip().splitlines()[-1])
-            return bool(data["gone"]), [str(p) for p in data["problems"]]
+            gone, problems = (
+                bool(data["gone"]),
+                [" ".join(str(p).split()) for p in data["problems"]],
+            )
         except (ValueError, IndexError, KeyError, TypeError):
             return False, [f"сбой уборки в песочнице: {tail(res.stderr or res.stdout)}"]
+        # Итог без причины (`session-run` другой версии, чем этот оркестратор) — причина в выводе
+        # уборки; строки — через «; », чтобы пункт комментария и запись service.log не рвались.
+        if not gone and not problems:
+            told = "; ".join(x.strip() for x in tail(res.stderr).splitlines() if x.strip())
+            problems = [f"ветка не убрана, вывод уборки: {told or 'пуст'}"]
+        return gone, problems
 
 
 def fresh(prd: int | None = None) -> dict:
     """Новый тикет в очереди: ни запусков, ни расхода; тикет PRD помнит его номер."""
-    t = {"phase": "queued", "queued": stamp(), "pings": 0, "runs": [], "cost": {}}
+    t = {"phase": "queued", "queued": stamp(), "runs": [], "cost": {}, **dict.fromkeys(COUNTS, 0)}
     return {**t, "prd": prd} if prd else t
 
 
