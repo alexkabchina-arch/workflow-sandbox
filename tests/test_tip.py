@@ -8,7 +8,7 @@ def test_tip_options_of_round_sum():
     assert tip_options_kop(10000) == [500, 1000, 1500]
 
 
-def test_tip_options_round_half_up():
+def test_tip_options_round_to_nearest():
     # 16,65 → 17, 33,3 → 33, 49,95 → 50
     assert tip_options_kop(333) == [17, 33, 50]
 
