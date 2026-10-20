@@ -76,6 +76,9 @@ def test_installments_invariants(total, months, first_pct, fee_pct):
     fee = (total * fee_pct + 50) // 100
     assert sum(schedule) == total + fee
     payments = schedule[1:] if first_pct > 0 else schedule
+    if first_pct > 0:
+        # Взнос — от суммы без комиссии, половина вверх; остаток под него подстроился бы сам
+        assert schedule[0] == (total * first_pct + 50) // 100
     assert len(payments) == months
     assert len(set(payments[:-1])) == 1
     assert 0 <= payments[-1] - payments[0] < months
@@ -88,30 +91,33 @@ def test_installments_months_bounds_allowed(months):
 
 @pytest.mark.parametrize("months", [1, 25, 0, -1])
 def test_installments_months_out_of_bounds(months):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="срок рассрочки"):
         installments_kop(100000, months)
 
 
 @pytest.mark.parametrize("pct", [0, 50])
 def test_installments_pct_bounds_allowed(pct):
-    installments_kop(100000, 2, first_pct=pct)
-    installments_kop(100000, 2, fee_pct=pct)
+    with_first = installments_kop(100000, 2, first_pct=pct)
+    assert len(with_first) == (3 if pct > 0 else 2)
+    assert sum(with_first) == 100000
+    assert sum(installments_kop(100000, 2, fee_pct=pct)) == 100000 + 1000 * pct
 
 
 @pytest.mark.parametrize("pct", [-1, 51, 100])
 def test_installments_first_pct_out_of_bounds(pct):
-    with pytest.raises(ValueError):
+    # match: при -1 ValueError бросил бы и percent_kop, но со своим текстом
+    with pytest.raises(ValueError, match="первый взнос"):
         installments_kop(100000, 2, first_pct=pct)
 
 
 @pytest.mark.parametrize("pct", [-1, 51, 100])
 def test_installments_fee_pct_out_of_bounds(pct):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="комиссия"):
         installments_kop(100000, 2, fee_pct=pct)
 
 
 def test_installments_negative_total():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="сумма"):
         installments_kop(-1, 2)
 
 
@@ -138,6 +144,24 @@ def test_installments_table_of_zero_total():
     assert installments_table(0, 2) == "1. 0.00\u00a0₽\n2. 0.00\u00a0₽\nитого: 0.00\u00a0₽"
 
 
-def test_installments_table_validates_like_schedule():
-    with pytest.raises(ValueError):
-        installments_table(100000, 1)
+def test_installments_table_with_zero_first_payment():
+    # Условие #144: строка взноса — при first_pct > 0, даже если взнос округлился до 0 коп.
+    assert installments_table(10, 2, first_pct=1) == (
+        "взнос: 0.00\u00a0₽\n1. 0.05\u00a0₽\n2. 0.05\u00a0₽\nитого: 0.10\u00a0₽"
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "kwargs", "match"),
+    [
+        ((100000, 1), {}, "срок рассрочки"),
+        ((-1, 2), {}, "сумма"),
+        ((100000, 2), {"first_pct": 51}, "первый взнос"),
+        ((100000, 2), {"first_pct": -1}, "первый взнос"),
+        ((100000, 2), {"fee_pct": 51}, "комиссия"),
+        ((100000, 2), {"fee_pct": -1}, "комиссия"),
+    ],
+)
+def test_installments_table_validates_like_schedule(args, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        installments_table(*args, **kwargs)
