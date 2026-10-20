@@ -21,6 +21,20 @@ def test_split_parts_differ_by_at_most_one_kopeck():
     assert max(shares) - min(shares) <= 1
 
 
+@pytest.mark.parametrize("total", [*range(-25, 26), 10**6 + 7, -(10**6 + 7)])
+@pytest.mark.parametrize("parts", range(1, 8))
+def test_split_invariants(total, parts):
+    # Сумма сохраняется; части по модулю не возрастают и отличаются не больше копейки;
+    # у возврата все части не больше нуля, у продажи — не меньше
+    shares = split_kop(total, parts)
+    sizes = [abs(s) for s in shares]
+    assert len(shares) == parts
+    assert sum(shares) == total
+    assert sizes == sorted(sizes, reverse=True)
+    assert sizes[0] - sizes[-1] <= 1
+    assert all(s <= 0 for s in shares) if total < 0 else all(s >= 0 for s in shares)
+
+
 def test_split_into_one_part():
     # Одна часть — вся сумма
     assert split_kop(34990, 1) == [34990]
@@ -36,6 +50,8 @@ def test_refund_split_mirrors_sale():
     # Возврат делится зеркально продаже: лишняя копейка — тоже первым частям
     assert split_kop(-100, 3) == [-34, -33, -33]
     assert split_kop(-101, 3) == [-34, -34, -33]
+    assert split_kop(-300, 3) == [-100, -100, -100]
+    assert split_kop(-2, 5) == [-1, -1, 0, 0, 0]
 
 
 def test_split_exact_on_large_sum():
