@@ -44,8 +44,19 @@ import types
 from pathlib import Path
 
 LIMIT = 2
-STOP_TAIL = 10  # строк вывода красной проверки в отчёте об остановке
-STOP_WIDTH = 300  # символов в строке хвоста: комментарий GitHub — до 65 536
+STOP_WIDTH = 300  # символов в строке ошибки отчёта об остановке
+# Строка ошибки в выводе проверки: в отчёт об остановке на GitHub — только первая такая строка, не
+# хвост вывода: тест, печатающий окружение или DSN, выложил бы их в комментарий (#275). Слова —
+# целиком (`SENTRY_ERROR_DSN`, `FAILOVER_…` — не ошибка), исключения Python — по суффиксу.
+ERROR_LINE = re.compile(
+    r"\b(?:error|errors|fail|failed|failure|failures|traceback|ошибк\w*)\b|\w(?:Error|Exception)\b",
+    re.IGNORECASE,
+)
+# Строка-итог упавшего теста (`FAILED x::y - …` pytest, `FAIL: test_x` unittest) — лучше любой
+# другой: в ней имя теста и причина.
+ERROR_SUMMARY = re.compile(r"^(?:FAILED|ERROR|FAIL:|ERROR:)\s+\S")
+# Не строка ошибки: присваивание окружения (`ИМЯ=значение`) и баннер (`==== FAILURES ====`).
+NOT_ERROR = re.compile(r"^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=|^[=\-_*#\s]+\w[\w ]*[=\-_*#\s]+$")
 RUN_LOG_END = re.compile(r"^run-log: завершено с кодом \S+ · лог: ")
 TRACE = "verify: /verify оставил в рабочем дереве"  # след /verify; при коде 1 — в stderr
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -177,6 +188,9 @@ SUMMARY_TASK = """Напиши «Что сделано» в `.ticket/summary.md`
 профиль) или обезличивание — первая строка «Меняются правила процесса: <что и зачем>».
 Closes, тесты, ревью, `/verify` и догон базы скрипт допишет сам."""
 
+# Строки следа `verify` (`moved`): историю ветки сменил сам `/verify` — по `TRACE_TASK` вопрос.
+REWRITTEN = ("история ветки переписана", "ветка сменилась")
+
 TRACE_TASK = """Разобрать каждый пункт: рецепт `.claude/skills/run-*` — откатить (отслеживаемое —
 `git checkout -- <путь>`, новое — удалить): итог проверки не засчитан, /verify пройдёт заново;
 `.claude/skills/verify/` — удалить; тестовые файлы — откатить; коммиты /verify поверх ветки —
@@ -205,6 +219,30 @@ def load_review() -> types.ModuleType:
 
 def tail(text: str, lines: int = 20) -> str:
     return "\n".join(text.strip().splitlines()[-lines:])
+
+
+def first_error(text: str) -> str:
+    """Строка ошибки вывода без цвета, обрезанная: первая строка-итог упавшего теста, иначе
+    первая строка со словом ошибки (`ERROR_LINE`), кроме присваиваний и баннеров; нет — пустая."""
+    found = []
+    for raw in text.splitlines():
+        line = ANSI.sub("", raw).strip()
+        if not line or RUN_LOG_END.match(line) or NOT_ERROR.match(line):
+            continue
+        if ERROR_SUMMARY.match(line):
+            return line[:STOP_WIDTH]
+        if ERROR_LINE.search(line):
+            found.append(line)
+    return found[0][:STOP_WIDTH] if found else ""
+
+
+def failure(text: str, log, place: str = "на машине сессии") -> str:
+    """Сбой команды для отчёта на GitHub (#275): первая строка ошибки и где полный вывод — сам
+    вывод остаётся в логе `place` (под оркестратором сессия идёт в песочнице)."""
+    error = first_error(text)
+    said = f"первая строка ошибки: {error}" if error else "строки с ошибкой в выводе нет"
+    where = f"лог `{log}` {place}" if log else "лога нет"
+    return f"{said}; полный вывод — {where}"
 
 
 def parse_decisions(text: str, count: int, weakening_needed: bool):
@@ -454,8 +492,9 @@ class Route:
         """Метка остановки — с тикета и открытого PR ветки: владелец ответил «продолжай», ждать
         больше некого, как после ответа на `ticket ask` (#190). На PR метка остаётся, если на нём
         и признак перерасхода ревью или `/verify` (комментарий `ready-for-human: …` финиша): это
-        свой сигнал владельцу, а финиш второй раз его не ставит. Сбой `gh` — не стоп: строкой
-        в выводе."""
+        свой сигнал владельцу, а финиш второй раз его не ставит. Сигнал — только от своих
+        (участник или App, `trusted`) и не скрытый, как фильтры #196: посторонний «ready-for-human:
+        …» метку не удержит (#204, п. 7). Сбой `gh` — не стоп: строкой в выводе."""
         core, n = self.core, str(self.n)
 
         def labelled(item: dict) -> bool:
@@ -469,8 +508,13 @@ class Route:
             for pr in [pr for pr in prs[:1] if labelled(pr)]:
                 number = str(pr["number"])
                 said = core.gh_json("pr", "view", number, "--json", "comments") or {}
-                bodies = [c.get("body") or "" for c in said.get("comments") or []]
-                if not any(body.startswith(f"{LABEL}: ") for body in bodies):
+                # Автор — после пометки (REST у App), сбой сверки — `Failure`: метка остаётся.
+                signals = [
+                    c
+                    for c in said.get("comments") or []
+                    if (c.get("body") or "").startswith(f"{LABEL}: ") and not c.get("isMinimized")
+                ]
+                if not any(core.trusted(c, strict=True) for c in signals):
                     core.gh("pr", "edit", number, "--remove-label", LABEL)
         except core.Failure as exc:
             core.say(f"ticket: метку {LABEL} снять не удалось — {exc}; сними руками")
@@ -566,11 +610,27 @@ class Route:
             mine = all(load_review().is_docs(f) for f in files.splitlines())
         return verdict if fresh and mine else None
 
-    def pr_merged(self) -> bool:
+    def pr_state(self) -> str | None:
         if not self.state["pr"]:
-            return False
+            return None
         data = self.core.gh_json("pr", "view", self.state["pr"], "--json", "state") or {}
-        return data.get("state") == "MERGED"
+        return data.get("state")
+
+    def pr_merged(self) -> bool:
+        return self.pr_state() == "MERGED"
+
+    def closed_pr(self) -> str | None:
+        """PR маршрута закрыт без мёржа — причина остановки, иначе None (#204, п. 4). Финиш
+        (`find_pr` ищет только открытые) создал бы новый PR с авто-мёржем вопреки владельцу —
+        после «продолжай» и после новых коммитов. Отчёт — в тикет: `ship-finish --unconfirmed`
+        без открытого PR пишет туда и PR не создаёт."""
+        if self.pr_state() != "CLOSED":
+            return None
+        fresh = "`agent:retry`" if self.core.orchestrated() else f"`session-run {self.n} --discard`"
+        return (
+            f"PR {self.state['pr']} закрыт владельцем без слияния — продолжать нечего: новый PR "
+            f"только по решению владельца — {fresh} (маршрут с чистого листа)"
+        )
 
     def step_review(self):
         core, st = self.core, self.state
@@ -594,8 +654,9 @@ class Route:
             res = core.canon("review", str(st.dir / "review.json"))
             core.say(res.stdout.rstrip())
             if res.returncode != 0:
-                why = f"ревью ошибок не состоялось (код {res.returncode}): {tail(res.stderr, 5)}"
-                return self.stop(why)
+                log = self.keep_output("review", res.stdout + res.stderr)
+                said = failure(res.stderr + res.stdout, log)
+                return self.stop(f"ревью ошибок не состоялось (код {res.returncode}): {said}")
             verdict = self.reviewed()
             if verdict is None:
                 return self.stop("ревью ошибок не оставило годного отчёта")
@@ -732,12 +793,21 @@ class Route:
                 argv = [sys.executable, str(core.HERE / "run-log"), "-l", name, "--", *argv]
             res = core.run(*argv, cwd=self.root)
             log = re.search(r"лог: (\S+)", res.stdout)
+            output = res.stdout + res.stderr
+            if res.returncode != 0 and log:  # строка ошибки — из полного лога, не из хвоста
+                try:
+                    output = Path(log.group(1)).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
+            # Без значений секретов gitleaks (#258): строка ошибки уходит в отчёт на GitHub.
+            hide = core.without_secret_fields
             results.append(
                 {
                     "name": name,
                     "code": res.returncode,
                     "log": log.group(1) if log else None,
-                    "tail": tail(res.stdout + res.stderr, 30),
+                    "tail": tail(hide(res.stdout + res.stderr), 30),
+                    "error": first_error(hide(output)),
                 }
             )
         st["checks_run"] = {"head": current, "results": [self.brief(r) for r in results]}
@@ -758,15 +828,21 @@ class Route:
 
     @staticmethod
     def brief(result: dict) -> dict:
-        """Запись проверки в состояние; у красной — хвост вывода для отчёта об остановке: без
-        итоговой строки `run-log` (путь к логу есть в `log`), без цвета, строки обрезаны (#182)."""
+        """Запись проверки в состояние: без хвоста вывода (он — в задании сессии и в логе), у
+        красной — первая строка ошибки и путь к логу для отчёта об остановке (#182, #275)."""
         kept = {k: v for k, v in result.items() if k != "tail"}
-        if result["code"] != 0:
-            lines = [ln for ln in result["tail"].splitlines() if not RUN_LOG_END.match(ln)]
-            kept["tail"] = "\n".join(
-                ANSI.sub("", ln)[:STOP_WIDTH] for ln in lines[-STOP_TAIL:]
-            ).strip()
+        if result["code"] == 0:
+            kept.pop("error", None)
         return kept
+
+    def keep_output(self, name: str, text: str) -> Path:
+        """Полный вывод упавшей команды — в каталог состояния тикета: в отчёт об остановке
+        на GitHub уходит только первая строка ошибки и этот путь (#275)."""
+        st = self.state
+        st.dir.mkdir(parents=True, exist_ok=True)
+        path = st.dir / f"{name}-{self.core.now().replace(':', '')}.log"
+        path.write_text(text, encoding="utf-8")
+        return path
 
     def local_paths(self, text: str) -> str:
         """Текст для GitHub без путей машины сессии: worktree, главный чекаут, временный каталог,
@@ -798,15 +874,33 @@ class Route:
         paths = moved.splitlines() + tree.splitlines()
         return any(".claude/skills/run-" in p for p in paths)
 
-    def trace_left(self, before: str) -> bool:
-        """След `/verify` не разобран: правка рецепта (файлом или коммитом), незакоммиченные правки
-        отслеживаемых файлов или коммиты поверх head до прогона (`before`), — после «продолжай»
-        общее задание о незакоммиченном предложило бы закоммитить их в PR тикета (#190, п. 6)."""
-        core = self.core
-        if self.dirty() or self.recipe_touched(before):
+    def tree(self) -> set[str]:
+        """Опись рабочего дерева, как у `leftovers()` в `verify`: правки и неотслеживаемые файлы.
+        Строки целиком, без среза пробела первой (`core.git` его срезает); сбой — `Failure`."""
+        res = self.core.run("git", "status", "--porcelain", "--untracked-files=all")
+        if res.returncode != 0:
+            raise self.core.Failure(f"git status: {(res.stderr or res.stdout).strip()}")
+        return set(res.stdout.splitlines())
+
+    def trace_left(self, trace: dict) -> bool:
+        """След `/verify` не разобран: правка рецепта (файлом или коммитом), правки и новые файлы
+        в дереве сверх описи до прогона (`tree`: `.claude/skills/verify/`, новые тесты — #204,
+        п. 1) или коммиты поверх head до прогона (`head`), — после «продолжай» общее задание о
+        незакоммиченном предложило бы закоммитить их в PR тикета (#190, п. 6). История
+        переписана (`head` — не предок `HEAD`) — не след: по `TRACE_TASK` это вопрос в
+        `.ticket/stop.md`, а он уже есть (#204, п. 2) — если переписал сам `/verify` (так и в
+        строке следа); переписала сессия при разборе — след. Опись до прогона не записана (след
+        до #204) — как раньше, только правки отслеживаемых."""
+        core, before = self.core, trace["head"]
+        if "tree" in trace:
+            left = bool(self.tree() - set(trace["tree"]))
+        else:
+            left = bool(self.dirty())
+        if left or self.recipe_touched(before):
             return True
-        known = core.git_ok("cat-file", "-e", f"{before}^{{commit}}")
-        return known and bool(core.git("diff", "--name-only", before, "HEAD"))
+        if not core.git_ok("merge-base", "--is-ancestor", before, "HEAD"):
+            return not any(m in trace["line"] for m in REWRITTEN)
+        return bool(core.git("diff", "--name-only", before, "HEAD"))
 
     def docs_only_since(self, sha: str | None) -> bool:
         if not sha:
@@ -873,7 +967,7 @@ class Route:
             text += f"\n\nКомментарии не участников репозитория ({strangers}) не включены."
         criteria.write_text(text + "\n", encoding="utf-8")
         report = st.dir / "verify.json"
-        before = core.head()
+        before, tree = core.head(), sorted(self.tree())
         stamp = report.stat().st_mtime_ns if report.exists() else None
         core.say("ticket: /verify — до 7 минут, ждите")
         res = core.canon("verify", str(report), "--criteria-file", str(criteria))
@@ -886,18 +980,20 @@ class Route:
         if human:
             st["ready_for_human"] = human[0]
         left = [x for x in lines if x.startswith(TRACE)]
-        trace = {"line": left[0], "head": before} if left else None
+        trace = {"line": left[0], "head": before, "tree": tree} if left else None
         if res.returncode != 0:  # след разбирается и тут — до отчёта об остановке (#190, п. 6)
             errors = "\n".join(x for x in res.stderr.splitlines() if not x.startswith(TRACE))
-            why = f"/verify не состоялся (код {res.returncode}): {tail(errors, 5)}"
+            log = self.keep_output("verify", res.stdout + res.stderr)
+            why = f"/verify не состоялся (код {res.returncode}): {failure(errors, log)}"
             return self.stop(why, trace)
         if "verify: пропущено" in res.stdout:
             verdict = "пропущено"
         else:
             m = re.search(r"— (PASS|FAIL) \(", res.stdout)
             verdict = m.group(1) if m else None
-        if verdict is None:
-            return self.stop("итог /verify не распознан: " + tail(res.stdout, 3), trace)
+        if verdict is None:  # вывод /verify — в лог, не в отчёт на GitHub (#275)
+            log = self.keep_output("verify", res.stdout + res.stderr)
+            return self.stop(f"итог /verify не распознан: полный вывод — лог `{log}`", trace)
         if left and self.recipe_touched(before):
             verdict = None  # рецепт менял сам /verify (файлом или коммитом) — итог не засчитан
         decision.update(verdict=verdict, head=before, criteria=digest)
@@ -1071,6 +1167,8 @@ class Route:
 
     def step_finish(self):
         core, st = self.core, self.state
+        if why := self.closed_pr():
+            return self.stop(why)
         body = st.dir / "pr-body.md"
         if self.reviewed() is None:
             st.go("review")  # отчёт ревью устарел (ветка переписана) — ревью заново
@@ -1207,7 +1305,7 @@ class Route:
         # След /verify — до отчёта (#190, п. 6): его правки дожили бы до «продолжай», а там общее
         # задание о незакоммиченном предлагает закоммитить их в PR тикета. Не разобран за два
         # круга — отчёт уходит и так, со строкой о нём: владельцу важнее узнать об остановке.
-        held = bool(trace) and self.trace_left(trace["head"])
+        held = bool(trace) and self.trace_left(trace)
         if held and st.attempt("stop_trace") <= LIMIT:
             body = (
                 f"Отчёт об остановке не опубликован: след /verify не разобран — {trace['line']}\n"
@@ -1261,12 +1359,12 @@ class Route:
         if trace := (st["stop"] or {}).get("trace"):
             left = trace["line"].removeprefix(f"{TRACE}:").strip()
             lines.append(f"- След /verify в worktree: {left}" + ("; не разобран" if held else ""))
+        for r in (run or {}).get("results", []):
+            if r["code"] != 0:  # хвост вывода не уходит на GitHub: в нём бывают секреты (#275)
+                said = failure(r.get("error") or "", r.get("log"))
+                lines.append(f"- `{r['name']}` — код {r['code']}, {said}")
         total = sum(v for v in st["cost"].values() if isinstance(v, (int, float)))
         lines.append(f"- Расход: {total:.2f} USD")
-        for r in (run or {}).get("results", []):
-            if r.get("tail"):
-                fence = "~" * max([3, *(len(m) + 1 for m in re.findall(r"~{3,}", r["tail"]))])
-                lines += ["", f"Последние строки `{r['name']}`:", "", fence, r["tail"], fence]
         return self.local_paths("\n".join(lines) + "\n")
 
     def publish_stop(self, text: str, saved: Path) -> str:

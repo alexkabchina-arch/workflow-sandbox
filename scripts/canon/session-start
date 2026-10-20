@@ -343,17 +343,19 @@ def write_registry(entries: dict) -> None:
     os.replace(tmp.name, path)
 
 
-def clean_resources(path: str, main: Path) -> bool:
-    """Проектная `cleanup <путь>` из главного worktree; нет команды — убирать нечего."""
+def clean_resources(path: str, main: Path) -> str | None:
+    """Проектная `cleanup <путь>` из главного worktree; нет команды — убирать нечего.
+
+    Итог — вывод неудачной команды (None — убрано)."""
     command = main / CLEANUP
     if not command.is_file():
-        return True
+        return None
     code, output = project_command([str(command), path], main)
     if code != 0:
         note(f"уборка {path} не удалась ({CLEANUP}): {output}; повтор при следующем старте")
-        return False
+        return output or f"код {code}"
     note(f"убраны ресурсы worktree {path}")
-    return True
+    return None
 
 
 def cleanup(main: Path) -> set[str]:
@@ -363,7 +365,7 @@ def cleanup(main: Path) -> set[str]:
     entries = read_registry()
     pending = set()
     for path in sorted(set(entries) - alive):
-        if not clean_resources(path, main):
+        if clean_resources(path, main) is not None:
             pending.add(path)
             continue
         del entries[path]
@@ -423,7 +425,7 @@ def sweep_merged(main: Path, keep: str, here: Path | None) -> set[str]:
         if branch == keep or not SESSION_BRANCH.match(branch):
             continue
         try:
-            if path := sweep_branch(branch, holders.get(branch), main, here):
+            if path := sweep_branch(branch, holders.get(branch), main, here)[0]:
                 pending.add(path)
         except StartError as exc:
             note(f"пропуск {branch}: {exc}")
@@ -453,59 +455,65 @@ def fetch_head(sha: str, number: int, main: Path) -> None:
     git_ok("fetch", "-q", "origin", f"pull/{number}/head", cwd=main)
 
 
-def sweep_branch(branch: str, path: Path | None, main: Path, here: Path | None) -> str | None:
-    """Одна ветка `sweep_merged`; итог — путь worktree, чьи ресурсы убрать не удалось."""
+def sweep_branch(
+    branch: str, path: Path | None, main: Path, here: Path | None
+) -> tuple[str | None, list[str]]:
+    """Одна ветка `sweep_merged`; итог — (путь worktree, чьи ресурсы убрать не удалось; что не
+    доделано — строками машинного итога уборки, #263). Каждая строка печатается и в stderr."""
+    left = []
+    failed = None
+
+    def skip(why: str) -> tuple[str | None, list[str]]:
+        note(f"пропуск {branch}: {why}")
+        left.append(f"ветка {branch} не убрана: {why}")
+        return failed, left
+
     if has_ref(f"refs/remotes/origin/{branch}"):
-        return None
+        return None, []
     end = tip(f"refs/heads/{branch}")
     if end is None:  # ветку уже удалили
-        return None
+        return None, []
     merged = merged_heads(branch)
     url = merged_url(end, merged, main)
     if url is None:
         if merged:
-            note(
-                f"пропуск {branch}: конец ветки — не head слитого PR и не его предок "
+            return skip(
+                "конец ветки — не head слитого PR и не его предок "
                 "(новые коммиты поверх слитого или head слитого PR не получен с сервера)"
             )
-        return None
+        return None, []
     if path == main:
-        note(f"пропуск {branch}: на ней главный чекаут")
-        return None
+        return skip("на ней главный чекаут")
     # По реестру тоже: живая сессия могла уйти с ветки в detached HEAD.
     if busy := session_busy(branch):
-        note(f"пропуск {branch}: в {busy} идёт сессия")
-        return None
+        return skip(f"в {busy} идёт сессия")
     if path is not None and here is not None and here.is_relative_to(path):
-        note(f"пропуск {branch}: из {path} идёт этот вызов (сессия ещё в worktree)")
-        return None
-    failed = None
+        return skip(f"из {path} идёт этот вызов (сессия ещё в worktree)")
     if path is not None:
         result = subprocess.run(
             ["git", "worktree", "remove", str(path)], capture_output=True, text=True
         )
         if result.returncode != 0:
-            note(f"пропуск {branch}: {path} не убран — {result.stderr.strip()}")
-            return None
+            return skip(f"{path} не убран — {result.stderr.strip()}")
         note(f"убран worktree {path} слитого PR {url}")
         entries = read_registry()
-        if clean_resources(str(path), main):
+        if (error := clean_resources(str(path), main)) is None:
             entries.pop(str(path), None)
         else:
             entries.setdefault(str(path), {"branch": branch})
             failed = str(path)
+            left.append(f"ресурсы {path} не убраны ({CLEANUP}): {error}")
         write_registry(entries)
     # Конец ветки — head слитого PR или его предок (проверено выше): работы сверх слитой нет.
     # `-d` отказал бы на squash-мёрже (ветки нет в `origin/main`) и сверял бы её с HEAD главного
     # чекаута, который мог не догнаться. `-D`, а не `update-ref -d`: он убирает и настройки ветки в
     # конфиге и не трогает ветку, которую перебазируют в другом worktree.
     if tip(f"refs/heads/{branch}") != end:
-        note(f"пропуск {branch}: ветку сдвинули во время уборки")
-        return failed
+        return skip("ветку сдвинули во время уборки")
     run("git", "branch", "-q", "-D", branch)
     note(f"удалена ветка {branch} слитого PR {url}")
     unmark_merged(branch)
-    return failed
+    return failed, left
 
 
 def unmark_merged(branch: str) -> None:
@@ -564,15 +572,16 @@ def retire_merged(branch: str, head: str, here: Path | None) -> tuple[bool, list
                 problems.append("главный чекаут не догнан до origin/main")
             holders = {w.get("branch"): Path(w["path"]) for w in worktrees()}
             if tip(f"refs/heads/{branch}") is not None:
-                if failed := sweep_branch(branch, holders.get(branch), main, here):
-                    problems.append(f"ресурсы {failed} не убраны ({CLEANUP})")
+                problems += sweep_branch(branch, holders.get(branch), main, here)[1]
     finally:
         end = tip(f"refs/heads/{branch}")
         if end is not None and git_ok("merge-base", "--is-ancestor", end, head, cwd=main):
             unmark_merged(branch)  # ветка осталась, но работы сверх слитой в ней нет
     gone = tip(f"refs/heads/{branch}") is None
-    if not gone and not problems:
-        problems.append(f"ветка {branch} не убрана (причина — выше)")
+    told = any(p.startswith(f"ветка {branch} ") for p in problems)
+    if not gone and not told:
+        # `sweep_branch` молча оставляет ветку, лишь когда `gh` не вернул её слитых в main PR.
+        problems.append(f"ветка {branch} не убрана: слитых в main PR ветки `gh pr list` не вернул")
     return gone, problems
 
 
@@ -604,12 +613,12 @@ def failed_guard(pr: dict) -> dict | None:
     return next((item for item in rollup if item.get("name") == GUARD and is_red(item)), None)
 
 
-def rerun_guard(item: dict) -> tuple[str, str]:
-    """Перезапуск упавшего прогона сторожа: (`rerun`, …) — перезапущен; (`wait`, …) — уже идёт
-    или зелёный; (`stuck`, причина) — перезапуск не поможет: попыток `GUARD_ATTEMPTS` больше нет
-    (в счёте все перезапуски, и `review-guard-rerun`) или прогон не от сторожа канона — джоб с тем
-    же именем из workflow ветки (сторож идёт только по `pull_request_target`). Сбой `gh` —
-    `StartError`."""
+def guard_run(item: dict) -> tuple[str, str]:
+    """Прогон сторожа без перезапуска: (`rerun`, …) — упал, перезапуск поможет; (`wait`, …) — уже
+    идёт или зелёный; (`stuck`, причина) — перезапуск не поможет: попыток `GUARD_ATTEMPTS` больше
+    нет (в счёте все перезапуски, и `review-guard-rerun`) или прогон не от сторожа канона — джоб с
+    тем же именем из workflow ветки (сторож идёт только по `pull_request_target`). Ею же читает
+    сторожа `ticket status` (#204, п. 5). Сбой `gh` — `StartError`."""
     url = item.get("detailsUrl") or ""
     match = GUARD_RUN.fullmatch(url)
     if not match:
@@ -623,6 +632,16 @@ def rerun_guard(item: dict) -> tuple[str, str]:
         return "wait", "прогон идёт или уже зелёный"
     if (info.get("attempt") or 1) >= GUARD_ATTEMPTS:
         return "stuck", f"красный и после {GUARD_ATTEMPTS - 1} перезапусков"
+    return "rerun", "прогон упал"
+
+
+def rerun_guard(item: dict) -> tuple[str, str]:
+    """Перезапуск упавшего прогона сторожа: (`rerun`, …) — перезапущен; `wait` и `stuck` — как у
+    `guard_run`. Сбой `gh` — `StartError`."""
+    action, why = guard_run(item)
+    if action != "rerun":
+        return action, why
+    repo, run_id = GUARD_RUN.fullmatch(item["detailsUrl"]).groups()
     run("gh", "run", "rerun", run_id, "-R", repo, "--failed")
     return "rerun", "прогон перезапущен"
 

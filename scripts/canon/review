@@ -6,9 +6,10 @@
 Из корня проекта, на закоммиченной ветке. Агент сам не может вызвать скилл `review` — только
 набранной командой, поэтому скрипт запускает дочерний процесс обычным вызовом, не в фоне:
 
-    claude -p --model claude-opus-5-5 --max-budget-usd <предел> --output-format stream-json \\
-        --verbose --json-schema <схема находок> --disallowedTools=Agent,Workflow,Monitor \\
-        --append-system-prompt <предел заголовка> "/review xhigh origin/main...HEAD" < /dev/null
+    CLAUDE_CODE_REPORT_FINDINGS=1 claude -p --model claude-opus-5-5 --max-budget-usd <предел> \\
+        --output-format stream-json --verbose --json-schema <схема находок> \\
+        --disallowedTools=Agent,Workflow,Monitor --append-system-prompt <предел заголовка> \\
+        "/review xhigh origin/main...HEAD" < /dev/null
 
 Уровень и модель одни для любого диффа (итог разведки workflow#2). Дифф только из документов
 (`docs/**`, `*.md`) — ревью пропускается; конфиги, CI и всё под `.claude/` на любой глубине
@@ -19,9 +20,13 @@
 своим инструментом `ReportFindings`, последняя реплика (`result`) — только сводка «подробности
 выше»: брать её — терять находки. С `--output-format json` `/review` уходит в локальный режим
 (`local_command`, 0 ходов, `result` «Command completed») — итог мимо `claude -p` целиком;
-с `stream-json --verbose` идёт обычными ходами. Поэтому — поток, итог из события `result`, и
-схема (`--json-schema`, список `findings`): CLI после ревью требует ответ по ней — так «находок
-нет» (пустой список) отличимо от сбоя. Сами находки — из принятых вызовов
+с `stream-json --verbose` идёт обычными ходами. Второе условие ходов — переменная
+`CLAUDE_CODE_REPORT_FINDINGS=1`: её ставит своим сессиям только приложение Claude, под службой
+`launchd` оркестратора и в терминале её нет, и `/review` и с потоком уходит в локальный режим
+(#260, проверено 19.10.2026) — скрипт задаёт её дочернему `claude` сам (`CHILD_ENV`),
+независимо от окружения родителя. Поэтому — поток, итог из события `result`, и схема
+(`--json-schema`, список `findings`): CLI после ревью требует ответ по ней — так «находок нет»
+(пустой список) отличимо от сбоя. Сами находки — из принятых вызовов
 `ReportFindings` верхнего уровня до принятого ответа по схеме (оригинал; отклонённый вход модель
 повторяет — он не в счёт, принятые вызовы склеиваются без повторов; вызов в лишнем ходе после
 ответа — не в счёт); нет их — из ответа по схеме (пересказ модели) со строкой
@@ -137,6 +142,9 @@ SCHEMA = {
     "additionalProperties": False,
 }
 REPORT_TOOL = "ReportFindings"  # инструмент, которым `/review` отдаёт находки
+# Без `CLAUDE_CODE_REPORT_FINDINGS=1` `/review` идёт локальной командой: 0 ходов, нет ответа по
+# схеме (#260). Приложение Claude ставит её своим сессиям, служба `launchd` и терминал — нет.
+CHILD_ENV = {"CLAUDE_CODE_REPORT_FINDINGS": "1"}
 # Краткий заголовок находки длиннее 60 символов `ReportFindings` отклоняет, и модель повторяет вызов
 # (ретро A4: 5 ревью из 14) — предел называется заранее, в системном промпте: в аргументе `/review`
 # он слился бы с диапазоном диффа.
@@ -344,7 +352,9 @@ def run_review(report: Path, base: str, budget: str, scope: dict) -> dict:
     events: list[dict] = []
     try:
         limit = ["--append-system-prompt", SUMMARY_LIMIT]
-        data = claude_run.run_claude([*limit, prompt(base)], report, budget, SCHEMA, events)
+        data = claude_run.run_claude(
+            [*limit, prompt(base)], report, budget, SCHEMA, events, env=CHILD_ENV
+        )
         items, source = findings(data, events, report)
     except claude_run.ChildError as exc:
         kept = keep_reported(events, report)
