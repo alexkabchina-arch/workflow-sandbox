@@ -537,6 +537,23 @@ def secrets_command(text: str | None, profile) -> list[str] | None:
     return dict(parse_checks(text, profile)).get("secrets")
 
 
+def canon_secrets(argv: list[str], here: Path) -> list[str]:
+    """Помощник канона `secrets` в команде профиля (`python3 scripts/canon/secrets`, в самом
+    каноне — `project/scripts/canon/secrets`, и под обёрткой `run-log`) — копией в `here` рядом
+    с вызывающим скриптом, под его Python (#283): как идёт проверка, решает не файл ветки.
+    Прочие команды — как есть."""
+    for i, arg in enumerate(argv):
+        if Path(arg).parts[-3:] == ("scripts", "canon", "secrets"):
+            start = i  # интерпретатор профиля (`python3.12`, `python3 -u`) — тоже под замену
+            while start and (
+                Path(argv[start - 1]).name.startswith("python")
+                or (argv[start - 1].startswith("-") and argv[start - 1] != "--")
+            ):
+                start -= 1
+            return [*argv[:start], sys.executable, str(here / "secrets"), *argv[i + 1 :]]
+    return argv
+
+
 def say(text: str) -> None:
     print(text, flush=True)
 
