@@ -29,6 +29,12 @@
   клон — на запись, скрипты копии канона — только на чтение; память — `--memory` или
   `git config canon.sandboxMemory` (иначе по умолчанию `sbx` — половина памяти Mac). Песочница
   смонтирована иначе — отказ: `rm` и снова `up`;
+- **gitleaks внутри** (#283) — версии, закреплённой в каноне (`GITLEAKS_VERSION`; на Mac нужна
+  та же): проверка `secrets` шага маршрута идёт внутри. Архив релиза linux под архитектуру
+  песочницы качает Mac с GitHub и сверяет контрольную сумму (`GITLEAKS_SHA256`), файл `gitleaks`
+  из архива — в кэш `~/.canon/tools/`, внутрь — потоком через `sbx exec -i` в `/usr/local/bin`;
+  сети песочнице не нужно. Нужная версия внутри уже есть — ничего не качается; на Mac другая
+  версия или gitleaks нет — строка об этом;
 - **сеть песочницы** — поверх общего запрета разрешены домены GitHub, pypi, npm и Docker Hub
   (`HOSTS`) и `git config canon.sandboxHosts` (через запятую); домены Anthropic даёт сам `sbx`.
   Разрешённое сверх списка (убрано из настройки, добавлено руками) `up` снимает. Память,
@@ -45,7 +51,7 @@
 — например, ssh прода) и `--probe хост:порт` на запрос не отдаёт данных (соединение без ответа —
 ❌: закрытость не доказана); снаружи — смонтировано ровно клон и копия канона, сеть песочницы
 разрешает только список, проброс агента выключен, общая политика ничего не пускает, общих
-ключей нет. Вход Claude — строкой, не ❌.
+ключей нет; gitleaks внутри — на PATH, той же версии, что на Mac. Вход Claude — строкой, не ❌.
 
 `login` — интерактивный `sbx run` песочницы: владелец набирает `/login` (подписка Claude) один
 раз на все песочницы: `sbx` хранит вход на хосте общим секретом `anthropic` и подставляет его
@@ -63,12 +69,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -99,6 +109,25 @@ AGENT_SETTING = "ssh.agentForwardingEnabled"
 # Общие секреты sbx, которым место во всех песочницах: вход Claude по подписке (`/login` внутри
 # сохраняет его общим секретом на хосте, внутрь попадает только заглушка).
 SHARED_SECRETS = {"anthropic"}
+# gitleaks внутри песочницы (#283): версия — та же, что в CI и на Mac; суммы архивов linux —
+# из `gitleaks_<версия>_checksums.txt` релиза. Каталог установки внутри — `CANON_SANDBOX_BIN`
+# (только для тестов: их «песочница» — хост).
+GITLEAKS_VERSION = "8.30.1"
+GITLEAKS_SHA256 = {
+    "arm64": "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080",
+    "x64": "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
+}
+GITLEAKS_URL = (
+    "https://github.com/gitleaks/gitleaks/releases/download/v{v}/gitleaks_{v}_linux_{arch}.tar.gz"
+)
+GITLEAKS_LIMIT = 200 * 2**20  # архив и файл больше — не gitleaks
+ARCHES = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x64", "amd64": "x64"}
+GITLEAKS_INSIDE = "command -v gitleaks >/dev/null && gitleaks version"
+INSTALL = (
+    'd="${CANON_SANDBOX_BIN:-/usr/local/bin}"; t=$(mktemp) || exit 1; cat > "$t" && '
+    '{ install -m 755 "$t" "$d/gitleaks" 2>/dev/null || sudo -n install -m 755 "$t" '
+    '"$d/gitleaks"; }; rc=$?; rm -f "$t"; exit $rc'
+)
 ENV_NAMES = ("", ".local", ".production", ".prod", ".development", ".dev", ".test")
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".claude"}
 
@@ -274,6 +303,59 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def version_of(text: str) -> str | None:
+    """Версия из вывода `gitleaks version` (`8.30.1` или `v8.30.1`)."""
+    lines = text.strip().splitlines()
+    return (lines[-1].strip().removeprefix("v") or None) if lines else None
+
+
+def mac_gitleaks() -> str | None:
+    """Версия gitleaks на PATH Mac; нет его или не ответил — None."""
+    if shutil.which("gitleaks") is None:
+        return None
+    res = run("gitleaks", "version")
+    return version_of(res.stdout) if res.returncode == 0 else None
+
+
+def gitleaks_file(arch: str) -> Path:
+    """Файл `gitleaks` релиза `GITLEAKS_VERSION` под linux `arch` из кэша `~/.canon/tools/`;
+    нет — архив с GitHub, сверка суммы, из архива — только файл `gitleaks`. В кэш попадает
+    только сверенное."""
+    if arch not in GITLEAKS_SHA256:
+        raise Failure(f"gitleaks для песочницы: архитектура {arch!r} не поддержана")
+    tools = Path.home() / ".canon/tools"
+    cached = tools / f"gitleaks-{GITLEAKS_VERSION}-linux-{arch}"
+    if cached.is_file():
+        return cached
+    url = GITLEAKS_URL.format(v=GITLEAKS_VERSION, arch=arch)
+    tools.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=tools) as tmp:
+        archive = Path(tmp) / "gitleaks.tar.gz"
+        try:
+            with urllib.request.urlopen(url, timeout=120) as res, open(archive, "wb") as out:
+                while chunk := res.read(2**20):
+                    out.write(chunk)
+                    if out.tell() > GITLEAKS_LIMIT:
+                        raise Failure(f"архив gitleaks больше {GITLEAKS_LIMIT // 2**20} МБ")
+        except (OSError, http.client.HTTPException) as exc:  # и обрыв посреди архива
+            raise Failure(f"архив gitleaks не скачан ({url}): {exc!r}") from None
+        if digest(archive) != GITLEAKS_SHA256[arch]:
+            raise Failure(f"контрольная сумма архива gitleaks не совпала ({url}) — не ставим")
+        try:
+            with tarfile.open(archive, "r:gz") as tar:
+                member = tar.getmember("gitleaks")
+                if not member.isfile() or member.size > GITLEAKS_LIMIT:
+                    raise Failure("в архиве gitleaks `gitleaks` — не обычный файл")
+                data = tar.extractfile(member).read()
+        except (tarfile.TarError, KeyError) as exc:
+            raise Failure(f"архив gitleaks не разобран: {exc}") from None
+        part = Path(tmp) / "gitleaks"
+        part.write_bytes(data)
+        part.chmod(0o755)
+        part.replace(cached)
+    return cached
+
+
 class Sandbox:
     def __init__(self):
         res = run("git", "worktree", "list", "--porcelain")
@@ -437,8 +519,44 @@ class Sandbox:
             sbx_ok("policy", "rm", "network", "--sandbox", self.name, "--resource", host)
             say(f"сеть: {host} больше не разрешён (нет в списке)")
         say(f"сеть: запрещено всё, кроме {len(self.hosts())} доменов и доменов Anthropic")
+        self.install_gitleaks()
         if not self.logged_in():
             say("вход Claude в песочнице не выполнен — `sandbox login` (один раз)")
+
+    def gitleaks_inside(self) -> str | None:
+        """Версия gitleaks на PATH внутри песочницы; нет — None."""
+        res = sbx("exec", self.name, "sh", "-c", GITLEAKS_INSIDE)
+        return version_of(res.stdout) if res.returncode == 0 else None
+
+    def install_gitleaks(self) -> None:
+        """gitleaks `GITLEAKS_VERSION` внутрь (#283): уже стоит — без скачивания; поставленный —
+        сверка версии; на Mac другая версия — строка (проверка `secrets` идёт и там)."""
+        if self.gitleaks_inside() == GITLEAKS_VERSION:
+            say(f"gitleaks {GITLEAKS_VERSION} в песочнице уже есть")
+        else:
+            machine = sbx("exec", self.name, "uname", "-m").stdout.strip()
+            binary = gitleaks_file(ARCHES.get(machine, machine))
+            with open(binary, "rb") as data:
+                res = subprocess.run(
+                    ["sbx", "exec", "-i", self.name, "sh", "-c", INSTALL],
+                    stdin=data,
+                    capture_output=True,
+                )
+            have = self.gitleaks_inside()
+            if res.returncode != 0 or have != GITLEAKS_VERSION:
+                why = res.stderr.decode(errors="replace").strip() or f"код {res.returncode}"
+                raise Failure(
+                    f"gitleaks {GITLEAKS_VERSION} в песочницу не встал ({why}; внутри — "
+                    f"{have or 'нет'}): без него проверка `secrets` внутри красная; файл из "
+                    f"кэша — {binary}: удалите его, `up` скачает заново"
+                )
+            say(f"gitleaks {GITLEAKS_VERSION} поставлен в песочницу")
+        mac = mac_gitleaks()
+        if mac != GITLEAKS_VERSION:
+            say(
+                f"на Mac gitleaks {mac or 'нет'}, а в песочнице {GITLEAKS_VERSION} — нужна та же "
+                "версия (docs/secrets.md)"
+            )
 
     def logged_in(self) -> bool:
         res = sbx("exec", self.name, "claude", "auth", "status")
@@ -538,6 +656,16 @@ class Sandbox:
                 "name": "policy",
                 "ok": not problems,
                 "detail": "; ".join(problems) or "общая — запрещено всё",
+            }
+        )
+        inside, mac = self.gitleaks_inside(), mac_gitleaks()
+        same = inside == mac == GITLEAKS_VERSION  # и та же, что закреплена в каноне (и в CI)
+        rows.append(
+            {
+                "name": "gitleaks",
+                "ok": same,
+                "detail": f"внутри {inside or 'нет'}, на Mac {mac or 'нет'}"
+                + ("" if same else f" — нужна {GITLEAKS_VERSION} в обоих местах: `sandbox up`"),
             }
         )
         secrets = self.global_secrets()

@@ -152,9 +152,9 @@ Docker Sandbox проекта (`sbx exec`), в клоне оркестратор
 «код готов» сессия отправляет на GitHub изнутри (`git push` токеном сессии), ревью, отметка и
 догон — в своём клоне (`canon-orchestrator/repo`) по ветке с сервера; файлы клона (состояние
 маршрута, копия отчёта, токен сессии) — без перехода по символическим ссылкам. Образы проекта
-(`canon.sandboxImages`) собирает Mac (`canon.sandboxBuild`) и загружает в песочницу, когда образ
-сменился; база-шаблон (`canon.sandboxSeedFrom` → `canon.sandboxSeedInto`) — раз в сутки. Пауза
-по памяти — по памяти внутри песочницы.
+(`canon.sandboxImages` или вывод `canon.sandboxImagesFrom`) собирает Mac (`canon.sandboxBuild`)
+и загружает в песочницу, когда образ сменился; база-шаблон (`canon.sandboxSeedFrom` →
+`canon.sandboxSeedInto`) — раз в сутки. Пауза по памяти — по памяти внутри песочницы.
 
 **Лицо агента** (`docs/github-app.md`): GitHub в такте — токеном оркестратора
 (`app-token issue --kind orchestrator`, `GH_TOKEN`); сессии — токен сессии App: его выдаёт Mac
@@ -267,9 +267,11 @@ PROFILE = "docs/agents/profile.md"
 SECRETS_REF = "refs/canon-secrets"
 BUNDLE_LIMIT = 512 * 2**20
 SECRETS_TIMEOUT = 600
-# Внутри песочницы: своих коммитов у head нет — код 3 (проверять нечего); иначе бандл коммитов
+# Внутри песочницы: своих коммитов у head нет — код 3 (проверять нечего, если head есть и в
+# `origin/main` своего клона: ссылку песочницы правит сессия, #283); иначе бандл коммитов
 # после `origin/main` по временной ссылке, ссылка убирается в любом случае.
 NOTHING_TO_PACK = 3
+GITLEAKS_INSIDE = "command -v gitleaks >/dev/null && gitleaks version"  # внутри песочницы
 PACK = (
     'n=$(git rev-list --count origin/main.."$2") || exit 1; [ "$n" -gt 0 ] || exit 3; '
     'git update-ref "$1" "$2" && git bundle create "$3" "$1" --not origin/main; rc=$?; '
@@ -278,6 +280,9 @@ PACK = (
 # Интерпретаторы: их первый аргумент-файл в чекауте ветки — код ветки (`mac_command`).
 INTERPRETERS = {"sh", "bash", "zsh", "python", "python3", "perl", "ruby", "node"}
 IMAGES_KEY, BUILD_KEY = "canon.sandboxImages", "canon.sandboxBuild"
+IMAGES_FROM_KEY = "canon.sandboxImagesFrom"  # команда проекта: имена образов — её вывод
+NAMES_TIMEOUT = 60  # команда имён образов — вычисление тега, не сборка
+IMAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*")
 SEED_FROM_KEY, SEED_INTO_KEY = "canon.sandboxSeedFrom", "canon.sandboxSeedInto"
 BUILD_TIMEOUT = 1800  # сборка образа или перенос базы-шаблона дольше получаса — сбой
 INSIDE_TIMEOUT = 600  # уборка, push и прочие команды внутри песочницы
@@ -1229,9 +1234,11 @@ class Orchestrator:
         Mac не выполняет, поэтому коммиты ветки после `origin/main` собирает в бандл git внутри
         песочницы; Mac забирает файл (`take_inside`) в свой клон и гоняет проверку в своём
         чекауте head. Профиль — из `origin/main` своего клона, а не из ветки: ветка проверку из
-        профиля не уберёт. В профиле её нет — пропуск с записью в вывод такта; своих коммитов
-        у ветки нет — проверять нечего. Итог — причина остановки (без значения секрета) или
-        None."""
+        профиля не уберёт; помощник канона `secrets` в команде — копия рядом, конфиг gitleaks в
+        нём — из `origin/main` (#283). В профиле её нет — пропуск с записью в вывод такта; своих
+        коммитов у ветки нет — проверять нечего, если head есть в `origin/main` своего клона:
+        `origin/main` клона песочницы правит сессия. Итог — причина остановки (без значения
+        секрета) или None."""
         self.own_repo()
         shown = self.git("show", f"origin/main:{PROFILE}")
         try:
@@ -1242,15 +1249,21 @@ class Orchestrator:
         if argv is None:
             say(f"#{n}: в профиле нет проверки `secrets` — head {head[:7]} уходит без gitleaks")
             return None
-        argv, problem = mac_command(argv)
+        argv, problem = mac_command(core.canon_secrets(argv, HERE))
         if problem:
             return problem
         rel = st.rel / "secrets.bundle"
         res = self.inside(
             "sh", "-c", PACK, "sh", SECRETS_REF, head, str(self.clone / rel), workdir=worktree
         )
-        if res.returncode == NOTHING_TO_PACK:
-            return None
+        if res.returncode == NOTHING_TO_PACK:  # решила песочница — сверка по своему клону
+            self.own_repo(refetch=True)
+            if self.git("merge-base", "--is-ancestor", head, "origin/main").returncode == 0:
+                return None
+            return (
+                f"head {head[:7]} не на основе `origin/main`: песочница не нашла у него своих "
+                "коммитов, а в `origin/main` его нет — head не опубликован без проверки `secrets`"
+            )
         if res.returncode != 0:
             return f"коммиты ветки для проверки `secrets` не собраны: {tail(res.stderr)}"
         bundle, ref = self.dir / "bundles" / f"ticket-{n}.bundle", f"{SECRETS_REF}/ticket-{n}"
@@ -1315,41 +1328,46 @@ class Orchestrator:
         self.prepared = True
 
     def images(self) -> None:
-        """Образы проекта (`canon.sandboxImages`, через запятую) — с Mac: сборка внутри не
-        проходит (прокси подменяет TLS, разведка #210). Сначала `canon.sandboxBuild` в своём
-        клоне на `origin/main` (кэш Docker пересоберёт только при смене зависимостей), затем образ
-        загружается внутрь (`docker save` → `docker load`), если его id на Mac сменился с прошлой
-        загрузки или внутри его нет. Сбой — сбой запуска: тикет остаётся в очереди."""
+        """Образы проекта — с Mac: сборка внутри не проходит (прокси подменяет TLS, разведка
+        #210). Имена — `canon.sandboxImages` (через запятую) или, если задан, вывод
+        `canon.sandboxImagesFrom` (`image_names`: образ, названный по хешу зависимостей). Всё —
+        в своём клоне на `origin/main`: `canon.sandboxBuild`, если `origin/main` сменился с прошлой
+        сборки или образа на Mac нет (кэш Docker пересоберёт только при смене зависимостей), имена
+        — после неё. Затем образ загружается внутрь (`docker save` → `docker load`), если его id
+        на Mac сменился с прошлой загрузки или внутри его нет. Сбой — сбой запуска: тикет остаётся
+        в очереди."""
+        names_from = self.config(IMAGES_FROM_KEY)
         images = [x.strip() for x in self.config(IMAGES_KEY).split(",") if x.strip()]
-        if not images:
+        if not (names_from or images):
             return
         record = self.data.setdefault("sandbox", {})
         own = self.own_repo()
         base = self.git("rev-parse", "origin/main").stdout.strip()
+        res = self.git("checkout", "-q", "--force", "--detach", "origin/main")
+        if res.returncode != 0:
+            raise Failure(f"свой клон на origin/main: {tail(res.stderr)}")
         build = self.config(BUILD_KEY)
-        on_mac = all(
+        built = False
+        if build and record.get("built") != base:
+            shell_command(own, build, f"сборка образов (`{BUILD_KEY}`)")
+            record["built"] = base
+            built = True
+        if names_from:
+            try:
+                images = image_names(own, names_from)
+            except Failure:
+                if not build or built:
+                    raise
+                images = []  # имена могут зависеть от сборки: сначала она
+        on_mac = bool(images) and all(
             run("docker", "image", "inspect", image, env=without_tokens()).returncode == 0
             for image in images
         )
-        if build and (record.get("built") != base or not on_mac):  # main тот же — сборка не нужна
-            res = self.git("checkout", "-q", "--force", "--detach", "origin/main")
-            if res.returncode != 0:
-                raise Failure(f"свой клон на origin/main: {tail(res.stderr)}")
-            try:
-                res = subprocess.run(
-                    ["sh", "-c", build],
-                    cwd=own,
-                    env=without_tokens(),
-                    capture_output=True,
-                    text=True,
-                    timeout=BUILD_TIMEOUT,
-                    stdin=subprocess.DEVNULL,
-                )
-            except subprocess.TimeoutExpired:
-                raise Failure(f"сборка образов дольше {BUILD_TIMEOUT // 60} мин") from None
-            if res.returncode != 0:
-                raise Failure(f"сборка образов (`{BUILD_KEY}`): {tail(res.stderr or res.stdout)}")
+        if build and not built and not on_mac:  # main тот же и образы на Mac — сборка не нужна
+            shell_command(own, build, f"сборка образов (`{BUILD_KEY}`)")
             record["built"] = base
+            if names_from:
+                images = image_names(own, names_from)
         loaded = record.setdefault("images", {})
         for image in images:
             res = run("docker", "image", "inspect", "-f", "{{.Id}}", image, env=without_tokens())
@@ -1380,6 +1398,9 @@ class Orchestrator:
                 raise Failure(f"образ {image} не загружен в песочницу: {tail(load.stderr)}")
             loaded[image] = have
             say(f"образ {image} загружен в песочницу ({have[:19]})")
+        # Имена по хешу зависимостей сменяются — прежние в состоянии не копятся. Внутри образ не
+        # удаляется: тикет на старой основе ищет старый (docs/orchestrator.md).
+        record["images"] = {k: v for k, v in loaded.items() if k in images}
 
     def seed(self) -> None:
         """База-шаблон на места — раз в местные сутки, перед первым запуском: вывод
@@ -2095,6 +2116,27 @@ class Orchestrator:
             fcntl.flock(lock, fcntl.LOCK_EX)
         return lock
 
+    def gitleaks_inside(self, path: str) -> None:
+        """Шаг маршрута «тесты и линтеры» гоняет `secrets` внутри песочницы (#283): gitleaks там
+        должен быть той же версии, что на Mac (`sandbox up` ставит его); иначе — сбой."""
+
+        def version(res: subprocess.CompletedProcess) -> str:
+            lines = res.stdout.strip().splitlines() if res.returncode == 0 else []
+            return lines[-1].strip().removeprefix("v") if lines else ""
+
+        mac = version(run("gitleaks", "version", env={**without_tokens(), "PATH": path}))
+        inside = version(self.inside("sh", "-c", GITLEAKS_INSIDE, timeout=120))
+        if not inside:
+            raise Failure(
+                "в песочнице нет gitleaks — проверка `secrets` внутри была бы красной на каждом "
+                "тикете: `sandbox up` копией канона (docs/sandbox.md)"
+            )
+        if inside != mac:
+            raise Failure(
+                f"gitleaks в песочнице {inside}, а на Mac {mac or 'не ответил'} — версии должны "
+                "совпасть (docs/secrets.md)"
+            )
+
     def service_install(self) -> None:
         """Служба ставится (или переставляется) одной командой: plist из образца рядом со
         скриптом — этот Python и эта копия канона, главный чекаут проекта, PATH установки (без
@@ -2113,6 +2155,8 @@ class Orchestrator:
             raise Failure(
                 f"нет {names} на PATH — такт службы их не нашёл бы; поставьте и повторите"
             )
+        if "gitleaks" in tools:
+            self.gitleaks_inside(path)
         try:
             data = plistlib.loads((HERE / PLIST).read_bytes())
         except (OSError, plistlib.InvalidFileException) as exc:
@@ -2894,10 +2938,16 @@ class Orchestrator:
         st = self.route(n)
         why = f"сессия `{t['session'][:8]}` не нашлась при возобновлении ({summary['result']})"
         if any(r.get("replaces") for r in t["runs"]):
-            t.pop("session")
-            return self.stop(
-                n, t, f"{why} — снова не нашлась: новая сессия вместо потерянной уже была"
-            )
+            # Id забыт до отчёта («новая сессия запустится»), но вернётся при сбое меток или
+            # комментария: следующий такт снова дойдёт сюда, а не упадёт на `KeyError` (#283).
+            lost = t.pop("session")
+            try:
+                return self.stop(
+                    n, t, f"{why} — снова не нашлась: новая сессия вместо потерянной уже была"
+                )
+            except BaseException:
+                t["session"] = lost
+                raise
         if self.hold(n, "новая сессия вместо потерянной"):
             return
         task = t.get("task")
@@ -3701,6 +3751,51 @@ def write_json(path: Path, data: dict) -> None:
     with os.fdopen(fd, "w", encoding="utf-8") as out:
         json.dump(data, out, ensure_ascii=False)
     os.replace(tmp, path)
+
+
+def shell_command(cwd: Path, command: str, what: str, timeout: int = BUILD_TIMEOUT) -> str:
+    """Команда проекта из git config (`sh -c`) в `cwd` без токенов — её вывод; ненулевой код или
+    дольше `timeout` — `Failure` со строкой `what`, по пределу вся группа процессов убита."""
+    proc = subprocess.Popen(
+        ["sh", "-c", command],
+        cwd=cwd,
+        env=without_tokens(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Сразу SIGKILL группе: `kill_group` ждал бы невыбранного зомби `sh` (Linux) до предела.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        span = f"{timeout // 60} мин" if timeout % 60 == 0 else f"{timeout} с"
+        raise Failure(f"{what} дольше {span}") from None
+    if proc.returncode != 0:
+        raise Failure(f"{what}: {tail(err or out)}")
+    return out
+
+
+def image_names(cwd: Path, command: str) -> list[str]:
+    """Имена образов — вывод `canon.sandboxImagesFrom` (через запятую или по строке). Пустой
+    вывод или строка не в форме имени образа Docker (`-…`, пробел, предупреждение) — `Failure`."""
+    what = f"имена образов (`{IMAGES_FROM_KEY}`)"
+    out = shell_command(cwd, command, what, NAMES_TIMEOUT)
+    names = [x.strip() for x in re.split(r"[,\n]", out) if x.strip()]
+    if not names:
+        raise Failure(f"{what}: пустой вывод")
+    for name in names:
+        if not IMAGE_NAME.fullmatch(name):
+            raise Failure(f"{what}: «{name[:80]}» — не имя образа")
+    return names
 
 
 def without_tokens() -> dict:

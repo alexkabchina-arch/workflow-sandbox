@@ -58,6 +58,10 @@ ERROR_SUMMARY = re.compile(r"^(?:FAILED|ERROR|FAIL:|ERROR:)\s+\S")
 # Не строка ошибки: присваивание окружения (`ИМЯ=значение`) и баннер (`==== FAILURES ====`).
 NOT_ERROR = re.compile(r"^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=|^[=\-_*#\s]+\w[\w ]*[=\-_*#\s]+$")
 RUN_LOG_END = re.compile(r"^run-log: завершено с кодом \S+ · лог: ")
+# Пароль в URL строки ошибки (`postgresql://u:pass@db`, `redis://:pass@host`) — маской до
+# отчёта на GitHub (#283): схема, логин и хост остаются, пароль — `***`.
+# Пароль — до последнего `@` в слове: в нём бывают `/` и `@`; лишнее под маской не вредит.
+URL_PASSWORD = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]*:)\S+(@)")
 TRACE = "verify: /verify оставил в рабочем дереве"  # след /verify; при коде 1 — в stderr
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 CANON_REPO = "alexkabchina-arch/workflow"
@@ -223,10 +227,11 @@ def tail(text: str, lines: int = 20) -> str:
 
 def first_error(text: str) -> str:
     """Строка ошибки вывода без цвета, обрезанная: первая строка-итог упавшего теста, иначе
-    первая строка со словом ошибки (`ERROR_LINE`), кроме присваиваний и баннеров; нет — пустая."""
+    первая строка со словом ошибки (`ERROR_LINE`), кроме присваиваний и баннеров; нет — пустая.
+    Пароль в URL — маской (`URL_PASSWORD`)."""
     found = []
     for raw in text.splitlines():
-        line = ANSI.sub("", raw).strip()
+        line = URL_PASSWORD.sub(r"\1***\2", ANSI.sub("", raw).strip())
         if not line or RUN_LOG_END.match(line) or NOT_ERROR.match(line):
             continue
         if ERROR_SUMMARY.match(line):
@@ -789,6 +794,8 @@ class Route:
                 results.append({"name": name, "code": 0, "note": note})
                 continue
             core.say(f"ticket: {name} …")
+            if name == "secrets":  # помощник — копия рядом, а не файл ветки (#283)
+                argv = core.canon_secrets(argv, core.HERE)
             if Path(argv[0]).name != "run-log":
                 argv = [sys.executable, str(core.HERE / "run-log"), "-l", name, "--", *argv]
             res = core.run(*argv, cwd=self.root)
