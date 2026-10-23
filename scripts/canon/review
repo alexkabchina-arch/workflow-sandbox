@@ -40,15 +40,25 @@
 агента, правила или обезличивание (пустая строка — нет). Ответ — в `canon_review.weakening`,
 в `<отчёт>.md` и строкой `review: ослабление защиты: …`; ответа нет — пометка
 `NO_WEAKENING_ANSWER`, не «нет». Без решения сессии по нему `ship-finish` откажет.
+Чистая установка канона (#309, решение канона
+`docs/decisions/2026-10-22-install-pr-review-skip.md`): в диффе есть `.canon.lock`, и файл
+диффа — под замком с суммой замка и побайтно равен файлу тега (blob в дереве канона на коммите
+замка через `gh api`; скилл Мэтта — в дереве его репозитория на коммите `matt-skills.lock.json`
+тега; `.claude/settings.json` — склейка базы тега и добавок проекта) или убран тегом из замка.
+Коммит замка — в `main` канона. Такие файлы и сам замок не ревьюятся: всё остальное —
+документы — пропуск «чистая установка», есть код — ревью только его (список в системном
+промпте). Сверка не прошла (нет `gh`, сети, доступа к канону, файл не сходится) — строка
+`review: предупреждение: …` и обычное ревью: сбой только в сторону ревью.
 Пропуск тоже пишет `<отчёт.json>` (без `.md`). В блоке `canon_review` отчёта — что проверено:
 `base` (как передан), `base_sha` (начало диффа — merge-base базы и HEAD), `head` (HEAD на
 старте ревью), `skipped`, у состоявшегося ревью — `findings` (число находок), `findings_source`
-и `weakening`. По ним `ship-finish` ставит отметку ревью: `head` отчёта — HEAD ветки или его
-предок, коммиты после него ревью не проходят (их проверяют тесты, CI и `/verify`, решение
-канона `docs/decisions/2026-10-03-no-re-review.md`); у
-несостоявшегося ревью блока нет — отметки по нему нет. Ревью — одно полное на ветку: отметку
-`ship-finish` ставит только по отчёту, чьё начало диффа — в `origin/main`; прицельного
-повторного ревью исправлений (`--base <head прошлого отчёта>`) в `/ship` нет.
+и `weakening`; при чистой установке — `install` (версия замка и файлы установки без ревью).
+По ним `ship-finish` ставит отметку ревью: `head` отчёта — HEAD ветки или его предок, коммиты
+после него ревью не проходят (их проверяют тесты, CI и `/verify`, решение канона
+`docs/decisions/2026-10-03-no-re-review.md`); у несостоявшегося ревью блока нет — отметки по
+нему нет. Ревью — одно полное на ветку: отметку `ship-finish` ставит только по отчёту, чьё
+начало диффа — в `origin/main`; прицельного повторного ревью исправлений
+(`--base <head прошлого отчёта>`) в `/ship` нет.
 
 Код выхода 0 — ревью готово или пропущено; 1 — ревью не состоялось или неполное (сбой `claude`,
 пустой `modelUsage`, не та модель, локальный режим, нет ответа по схеме или без оригинала
@@ -73,6 +83,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import types
@@ -158,6 +169,31 @@ NO_CATEGORY = "без категории"  # тег находки без `categ
 NO_WEAKENING_ANSWER = "ревью не ответило на вопрос об ослаблении защиты — оценить дифф самому"
 PLAIN_NO = {"", "нет", "ослабления нет", "не ослабляет", "no", "none"}  # ответ «нет» словами
 
+# Чистая установка канона (#309): файлы под замком сверяются с деревом тега на GitHub.
+CANON_REPO = "alexkabchina-arch/workflow"
+CANON_MAIN = "main"
+CANON_PREFIX = "project/"
+LOCK = ".canon.lock"
+SETTINGS = ".claude/settings.json"
+SETTINGS_BASE = ".claude/settings.base.json"
+SETTINGS_PROJECT = ".claude/settings.project.json"
+CHECKER = "scripts/canon/check_lock.py"
+# Сам канон (#310, #311): `scripts/canon` — ссылка на исходники, база настроек переведена
+# `self_base` из `canon-sync` тега.
+SELF_LINK, SYNC, SELF_PREFIX = "scripts/canon", "canon-sync", ".claude/"
+GITHUB_REPO = re.compile(r"github\.com[\w.-]*[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$")
+MATT_LOCK = "matt-skills.lock.json"
+SKILLS_DIR = ".claude/skills/"
+COMMIT = re.compile(r"[0-9a-f]{40}")
+# Версия замка и пути, которые идут в системный промпт ревью: без них текст замка или имя файла
+# могли бы дать ревьюеру указание (версия замка `check_lock` не сверяет).
+VERSION = re.compile(r"[\w.-]{1,64}")
+SAFE_PATH = re.compile(r"[\w./@+-]+")
+INSTALL_SCOPE = (
+    "Ревьюй только эти файлы диффа: {code}. Остальные файлы диффа — чистая установка канона "
+    "{version}: побайтно равны файлам тега и прошли ревью в каноне, их не ревьюить."
+)
+
 
 def prompt(base: str) -> str:
     return f"/review {LEVEL} {base}...HEAD"
@@ -209,6 +245,257 @@ def changed_files(base: str) -> list[str]:
     if result.returncode != 0:
         raise UsageError(f"git diff {base}...HEAD: {result.stderr.strip()}")
     return [p for p in result.stdout.split("\0") if p]
+
+
+class Unverified(Exception):
+    """Чистая установка не подтверждена — причина для строки предупреждения; дальше ревью."""
+
+
+def git_bytes(*args: str) -> bytes | None:
+    result = subprocess.run(["git", *args], capture_output=True)
+    return result.stdout if result.returncode == 0 else None
+
+
+def read_lock(rev: str) -> dict | None:
+    """Файлы `.canon.lock` коммита `rev` (путь → сумма); замка нет — None."""
+    data = git_bytes("show", f"{rev}:{LOCK}")
+    if data is None:
+        return None
+    try:
+        lock = json.loads(data)
+    except ValueError:
+        raise Unverified(f"{LOCK} в {rev[:7]} — не JSON") from None
+    files = lock.get("files") if isinstance(lock, dict) else None
+    if not isinstance(files, dict) or not all(isinstance(v, str) for v in files.values()):
+        raise Unverified(f"{LOCK} в {rev[:7]}: нет словаря files")
+    return lock
+
+
+def gh_json(path: str):
+    try:
+        result = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+    except OSError as exc:
+        raise Unverified(f"не запустился gh ({exc})") from None
+    if result.returncode != 0:
+        raise Unverified(f"gh api {path}: {(result.stderr or result.stdout).strip()[-200:]}")
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        raise Unverified(f"gh api {path}: ответ не JSON") from None
+
+
+def origin_repo() -> str | None:
+    """`owner/name` из адреса `origin` на GitHub (как записан в настройке); иначе None."""
+    url = (git_bytes("config", "--get", "remote.origin.url") or b"").decode().strip()
+    found = GITHUB_REPO.search(url)
+    return found.group(1) if found else None
+
+
+class Install:
+    """Сверка замка `head` с тегом канона: файл под замком — blob дерева тега на GitHub.
+
+    Блобы `git` сравниваются как есть: равный blob — тот же файл побайтно."""
+
+    def __init__(self, base_sha: str, head: str):
+        self.head = head
+        lock = read_lock(head)
+        if lock is None:
+            raise Unverified(f"нет {LOCK} в {head[:7]}")
+        self.files = lock["files"]
+        self.old = (read_lock(base_sha) or {"files": {}})["files"]
+        commit = lock.get("commit")
+        if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
+            raise Unverified(f"{LOCK}: commit — не полный sha коммита")
+        version = lock.get("version")
+        self.version = version if isinstance(version, str) and VERSION.fullmatch(version) else None
+        if self.version is None:
+            raise Unverified(f"{LOCK}: версия — не имя тега или коммита")
+        compare = gh_json(f"repos/{CANON_REPO}/compare/{commit}...{CANON_MAIN}")
+        status = compare.get("status") if isinstance(compare, dict) else None
+        if status not in ("ahead", "identical"):
+            raise Unverified(f"коммит замка {commit[:12]} не в {CANON_MAIN} канона ({status})")
+        self.trees: dict[tuple[str, str], dict[str, str]] = {}
+        self.canon = self.tree(CANON_REPO, commit)
+        self._matt: dict | None = None
+        # Блобы `head` одним `ls-tree`, содержимое и итог сверки — по разу на файл.
+        listing = git_bytes("ls-tree", "-r", "-z", head) or b""
+        self.blobs, modes = {}, {}
+        for line in filter(None, listing.decode(errors="surrogateescape").split("\0")):
+            meta, _, rel = line.partition("\t")
+            if meta.split()[1:2] == ["blob"]:
+                self.blobs[rel], modes[rel] = meta.split()[2], meta.split()[0]
+        self.contents: dict[str, bytes | None] = {}
+        self.checked: dict[str, bool] = {}
+        # Сам канон: проверка замка и перевод базы — файлы дерева тега (по blob с GitHub), а не
+        # `head`: исходники в ветке могут быть новее тега.
+        # Только в репозитории канона: проект со своей ссылкой выдал бы переведённую (более
+        # узкую) базу за установку.
+        self.self_mode = modes.get(SELF_LINK) == "120000" and origin_repo() == CANON_REPO
+        if self.self_mode:
+            self.checker = self.tag_module(CHECKER)
+            self.sync = self.tag_module(SYNC, prefix="")
+        else:
+            if not self.from_tag(CHECKER):
+                raise Unverified(f"{CHECKER} не совпадает с тегом {self.version}")
+            self.checker = types.ModuleType("canon_check_lock")
+            exec(compile(self.content(CHECKER) or b"", CHECKER, "exec"), self.checker.__dict__)
+
+    def tag_bytes(self, path: str) -> bytes:
+        """Файл дерева канона на коммите замка — по blob из дерева GitHub (git сверяет blob по
+        содержимому); blob'а нет локально — не подтверждено."""
+        blob = self.canon.get(path)
+        data = git_bytes("cat-file", "blob", blob) if blob else None
+        if data is None:
+            raise Unverified(f"{path} тега {self.version} не прочитан")
+        return data
+
+    def tag_module(self, rel: str, prefix: str = CANON_PREFIX) -> types.ModuleType:
+        module = types.ModuleType(f"canon_tag_{rel.replace('/', '_').replace('.', '_')}")
+        try:
+            exec(compile(self.tag_bytes(prefix + rel), rel, "exec"), module.__dict__)
+        except Unverified:
+            raise
+        except Exception as exc:  # noqa: BLE001 — файл тега не загрузился: полное ревью
+            raise Unverified(f"{rel} тега {self.version} не загрузился ({exc})") from None
+        return module
+
+    def tree(self, repo: str, ref: str) -> dict[str, str]:
+        if (repo, ref) not in self.trees:
+            data = gh_json(f"repos/{repo}/git/trees/{ref}?recursive=1")
+            entries = data.get("tree") if isinstance(data, dict) else None
+            if not isinstance(entries, list) or data.get("truncated"):
+                raise Unverified(f"дерево {repo}@{ref[:12]} не получено целиком")
+            self.trees[(repo, ref)] = {
+                e["path"]: e["sha"]
+                for e in entries
+                if isinstance(e, dict) and e.get("type") == "blob"
+            }
+        return self.trees[(repo, ref)]
+
+    def blob(self, rel: str) -> str | None:
+        return self.blobs.get(rel)
+
+    def content(self, rel: str) -> bytes | None:
+        if rel not in self.contents:
+            blob = self.blob(rel)
+            self.contents[rel] = git_bytes("cat-file", "blob", blob) if blob else None
+        return self.contents[rel]
+
+    def from_tag(self, rel: str) -> bool:
+        blob = self.blob(rel)
+        return blob is not None and self.canon.get(CANON_PREFIX + rel) == blob
+
+    def matt(self) -> dict:
+        """Скиллы `matt-skills.lock.json` тега (файл в `head` — файл тега); иначе пусто."""
+        if self._matt is None:
+            self._matt = {}
+            if self.from_tag(MATT_LOCK):
+                try:
+                    skills = json.loads(self.content(MATT_LOCK) or b"").get("skills")
+                except (ValueError, AttributeError):
+                    skills = None
+                self._matt = skills if isinstance(skills, dict) else {}
+        return self._matt
+
+    def matt_source(self, rel: str) -> tuple[str, str, str] | None:
+        """Репозиторий, коммит и путь файла скилла Мэтта в его репозитории; не скилл — None."""
+        if not rel.startswith(SKILLS_DIR):
+            return None
+        name, _, rest = rel[len(SKILLS_DIR) :].partition("/")
+        entry = self.matt().get(name)
+        if not rest or not isinstance(entry, dict):
+            return None
+        source, ref, path = (entry.get(k) for k in ("source", "ref", "skillPath"))
+        if not all(isinstance(x, str) for x in (source, ref, path)):
+            return None
+        if not COMMIT.fullmatch(ref) or not re.fullmatch(r"[\w.-]+/[\w.-]+", source):
+            return None
+        return source, ref, str(PurePosixPath(path).parent / rest)
+
+    def base_ok(self, data: bytes | None) -> bool:
+        """База настроек самого канона — база тега, переведённая `self_base` его `canon-sync`."""
+        try:
+            base = json.loads(self.tag_bytes(CANON_PREFIX + SETTINGS_BASE))
+            return data == self.checker.render_json(self.sync.self_base(base))
+        except Exception:  # noqa: BLE001 — тег до `self_base` (откат до #310) или сбой: ревью
+            return False
+
+    def settings_ok(self, data: bytes) -> bool:
+        """`settings.json` — склейка базы тега и добавок проекта той же склейкой тега."""
+        if self.self_mode:
+            if not self.base_ok(self.content(SETTINGS_BASE)):
+                return False
+        elif not self.from_tag(SETTINGS_BASE):
+            return False
+        checker = self.checker
+        additions = self.content(SETTINGS_PROJECT)
+        try:
+            base = json.loads(self.content(SETTINGS_BASE) or b"")
+            built = checker.build_settings(base, json.loads(additions) if additions else None)
+        except (ValueError, checker.MergeError):
+            return False
+        return built == data
+
+    def verified(self, rel: str) -> bool:
+        """Файл `rel` в `head` — под замком с его суммой и равен файлу тега."""
+        if rel not in self.checked:
+            self.checked[rel] = self.check(rel)
+        return self.checked[rel]
+
+    def check(self, rel: str) -> bool:
+        if self.self_mode and not rel.startswith(SELF_PREFIX):
+            return False  # в каноне `--self` ставит только `.claude/` — прочее ревьюится
+        data = self.content(rel)
+        if data is None or rel not in self.files:
+            return False
+        if self.checker.file_hash(data) != self.files[rel]:  # сумма — функцией тега
+            return False
+        if rel == SETTINGS:
+            return self.settings_ok(data)
+        if rel == SETTINGS_BASE and self.self_mode:
+            return self.base_ok(data)
+        if CANON_PREFIX + rel in self.canon:
+            return self.from_tag(rel)
+        source = self.matt_source(rel)
+        return source is not None and self.tree(*source[:2]).get(source[2]) == self.blob(rel)
+
+    def dropped(self, rel: str) -> bool:
+        """Файл убран тегом: был в старом замке, нет в новом, в `head` и в тег не входит."""
+        if self.content(rel) is not None or rel not in self.old or rel in self.files:
+            return False
+        if self.self_mode and not rel.startswith(SELF_PREFIX):
+            return False
+        if rel == SETTINGS or CANON_PREFIX + rel in self.canon:
+            return False
+        source = self.matt_source(rel)
+        return source is None or source[2] not in self.tree(*source[:2])
+
+    def lock_ok(self) -> bool:
+        """Каждая новая или изменённая строка замка — файл тега, каждая убранная — убрана тегом."""
+        changed = [rel for rel, digest in self.files.items() if self.old.get(rel) != digest]
+        removed = [rel for rel in self.old if rel not in self.files]
+        return all(map(self.verified, changed)) and all(map(self.dropped, removed))
+
+
+def needs_review(files: list[str], base_sha: str, head: str) -> tuple[list[str], dict | None, str]:
+    """Файлы кода диффа, которым нужно ревью; сведения о чистой установке (`version`, `files`
+    без ревью) или None; причина, почему установка не подтверждена, или пустая строка.
+
+    Правило одно для `review` и для перепроверки пропуска в `ship-finish`."""
+    install, note, covered = None, "", set()
+    if LOCK in files:
+        try:
+            check = Install(base_sha, head)
+            if not check.lock_ok():
+                raise Unverified(f"{LOCK} не сходится с тегом {check.version}")
+            mine = {LOCK} | {p for p in files if check.verified(p) or check.dropped(p)}
+            rest = [p for p in files if p not in mine and not is_docs(p)]
+            if not all(SAFE_PATH.fullmatch(p) for p in rest):
+                raise Unverified("имя файла кода не годится для списка ревью")
+            covered, install = mine, {"version": check.version, "files": sorted(mine)}
+        except Unverified as exc:
+            note = str(exc)
+    return [p for p in files if p not in covered and not is_docs(p)], install, note
 
 
 def is_finding(item) -> bool:
@@ -343,15 +630,24 @@ def render(items: list[dict], weakened: str | None = None) -> str:
     return "\n".join(lines) + tail
 
 
-def run_review(report: Path, base: str, budget: str, scope: dict) -> dict:
+def run_review(
+    report: Path, base: str, budget: str, scope: dict, only: list[str] | None = None
+) -> dict:
     """Запускает ревью и сохраняет результат; возвращает блок `canon_review` отчёта.
+
+    `only` — при чистой установке: ревьюить только эти файлы (версия — `scope["install"]`).
 
     Не состоялось (нет ответа по схеме, а без оригинала `ReportFindings` — и ответ не по схеме) —
     `ChildError`: отчёт без `canon_review`, отметки по нему нет.
     """
     events: list[dict] = []
     try:
-        limit = ["--append-system-prompt", SUMMARY_LIMIT]
+        system = SUMMARY_LIMIT
+        if only:
+            listed = ", ".join(f"`{p}`" for p in only)
+            version = scope["install"]["version"]
+            system += "\n" + INSTALL_SCOPE.format(code=listed, version=version)
+        limit = ["--append-system-prompt", system]
         data = claude_run.run_claude(
             [*limit, prompt(base)], report, budget, SCHEMA, events, env=CHILD_ENV
         )
@@ -387,15 +683,26 @@ def main(argv: list[str] | None = None) -> int:
     try:
         files = changed_files(args.base)
         scope = reviewed_range(args.base)
-        code = [p for p in files if not is_docs(p)]
+        code, install, note = needs_review(files, scope["base_sha"], scope["head"])
+        if note:
+            print(
+                f"review: предупреждение: чистая установка канона не подтверждена — {note}; "
+                "ревью всех файлов кода"
+            )
+        if install:
+            scope["install"] = install
         if not code:
             write_skipped(args.report, scope, files)
+            what = (
+                f"чистая установка канона {install['version']}" if install else "только документы"
+            )
             print(
-                f"review: пропущено — в {args.base}...HEAD только документы "
+                f"review: пропущено — в {args.base}...HEAD {what} "
                 f"(файлов: {len(files)}); отчёт — {args.report}"
             )
             return 0
-        result = run_review(args.report, args.base, args.max_budget_usd, scope)
+        only = code if install else None
+        result = run_review(args.report, args.base, args.max_budget_usd, scope, only)
     except UsageError as exc:
         print(f"review: {exc}", file=sys.stderr)
         return 2
@@ -408,6 +715,11 @@ def main(argv: list[str] | None = None) -> int:
         f"{'?' if cost is None else f'{cost:.2f}'} USD, находок: {result['findings']}); "
         f"находки — {args.report.with_suffix('.md')}"
     )
+    if install:
+        print(
+            f"review: чистая установка канона {install['version']} — без ревью файлов: "
+            f"{len(install['files'])}; ревью — только остальных"
+        )
     if result["weakening"]:
         lines = [line.strip() for line in result["weakening"].splitlines() if line.strip()]
         print(f"review: ослабление защиты: {' / '.join(lines)}")

@@ -8,6 +8,8 @@
                                         через `ticket ask` (`ticket_start.py`)
     scripts/canon/ticket ask <N>        вопрос владельцу комментарием в тикет, пауза до ответа
                                         (`ticket_ask.py`)
+    scripts/canon/ticket fresh <N>      под оркестратором: свежая копия прода в песочницу,
+                                        ожидание ответа оркестратора (`ticket_fresh.py`)
     scripts/canon/ticket wait <N>       ожидание мёржа PR и уборка сразу после него
                                         (`ticket_wait.py`)
 

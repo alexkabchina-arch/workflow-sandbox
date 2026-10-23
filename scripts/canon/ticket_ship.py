@@ -23,6 +23,10 @@
 Под оркестратором (`CANON_ORCHESTRATOR=1`, #214) ревью ошибок сессия не гоняет: без отчёта —
 «код готов» (head в состоянии, шаг `ready`), отчёт кладёт оркестратор; финиш — `ship-finish
 --pr-only` (push и PR без авто-мёржа и отметки) и снова «код готов». Отметку ставит оркестратор.
+Время снимка копии прода в песочнице (#307) — в задании `/verify` и в теле PR («проверено на
+копии прода от …»); снимок старше суток при критериях «на проде» — до `/verify` задание
+`ticket fresh N` (#301). Пункты «после выката» (#301) — не критерий PR: `/verify` их не проверяет,
+тело PR несёт их списком «После выката».
 `--again` — продолжить после остановки (владелец ответил «продолжай»): метка `ready-for-human`
 снимается, остановка после финиша — снова финиш; после остановки на `/verify` решение владельца
 «verify — не нужен» (его комментарий в тикете или PR после отчёта; не `.ticket/reply.md` — его
@@ -41,6 +45,7 @@ import re
 import sys
 import tempfile
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 LIMIT = 2
@@ -63,6 +68,14 @@ RUN_LOG_END = re.compile(r"^run-log: завершено с кодом \S+ · л�
 # Пароль — до последнего `@` в слове: в нём бывают `/` и `@`; лишнее под маской не вредит.
 URL_PASSWORD = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]*:)\S+(@)")
 TRACE = "verify: /verify оставил в рабочем дереве"  # след /verify; при коде 1 — в stderr
+# `/verify` вернул BLOCKED (#292): строка `verify` в stderr, отчёт — `verify.raw.md`. Причина —
+# из строки вердикта отчёта («**Verdict:** BLOCKED. …»; после BLOCKED пусто — следующая строка),
+# иначе первая строка не-заголовок. Значения присваиваний (`ИМЯ=значение`) — маской, как
+# пароль в URL: строка уходит на GitHub (#275).
+BLOCKED_MARK = "/verify не смог проверить (BLOCKED)"
+BLOCKED_REASON = re.compile(r"\bBLOCKED\b[\s*_.:;,—–-]*(.*)")
+MARKDOWN = re.compile(r"^(?:[#>\s]+|[-*+]\s+|\d+[.)]\s+)+|\*\*")
+ASSIGNMENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*=)\S+")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 CANON_REPO = "alexkabchina-arch/workflow"
 LABEL = "ready-for-human"
@@ -81,10 +94,27 @@ VERIFY = re.compile(rf"^/?verify{DASH}(не нужен|нужен){DASH}(.*)$", 
 DECIDED = re.compile(
     r"^[ \t*_]*/?verify[ \t—–:-]*(не нужен|нужен)\b[*_]*[ \t—–:,.-]*([^\n]*)$", re.I | re.M
 )
+# Чем продолжить после строки о `/verify` (#289): под оркестратором продолжает только метка
+# `agent:go` владельца, «продолжай» — ответ в чат ручной сессии.
 WAIVE_HINT = (
     "Проверка не нужна — строка «verify — не нужен: почему» комментарием в тикете (или под этим "
-    "отчётом), затем «продолжай»: маршрут пойдёт на финиш без /verify."
+    "отчётом), затем {then}: маршрут пойдёт на финиш без /verify."
 )
+
+
+def waive_hint(core) -> str:
+    return WAIVE_HINT.format(then="метка `agent:go`" if core.orchestrated() else "«продолжай»")
+
+
+def with_mention(text: str, owner: str, need: str = f"метка `{LABEL}`") -> str:
+    """Текст с упоминанием владельца в конце (`need` — что его ждёт), парная копия
+    `with_mention` в `ship-finish`; владелец не известен или уже упомянут — как есть."""
+    mentioned = re.compile(rf"(?<![\w@.-])@{re.escape(owner)}(?![\w-])", re.I)
+    if not owner or mentioned.search(text):
+        return text
+    return f"{text.rstrip()}\n\n@{owner}, нужен человек: {need}."
+
+
 ITEM = re.compile(r"^(\d+)\. (.*)$")
 # Комментарии тикета в критериях `/verify` (#178): пометки маршрута (`ticket ask`) и подпись
 # вопроса — служебное, отчёт об остановке — не критерий. Предел — `docs/ticket.md`, раздел
@@ -92,6 +122,42 @@ ITEM = re.compile(r"^(\d+)\. (.*)$")
 OWN_MARK = re.compile(r"<!--\s*canon-ticket[^>]*-->")
 ASK_FOOTER = re.compile(r"\n-{3,}\s*\n(?:@\S+\s+)?Ответ — комментарием в этом тикете.*\Z", re.S)
 REPORT = re.compile(r"^[#*\s]*Отчёт об остановке")
+# Под оркестратором живого прода нет (#307, решение 22.10): критерии «на проде» — на обезличенной
+# копии в песочнице; время её снимка — в задании `/verify` и свидетельствах тикета.
+PROD_COPY_CRITERIA = (
+    "Живого прода нет: данные прода — обезличенная копия прода в песочнице, снимок от {copy}. "
+    "Критерии «на проде» проверяй на ней; в отчёте — строка «проверено на копии прода от {copy}»."
+)
+# Снимок копии старше суток, а в критериях «на проде» (#301): до `/verify` — задание запросить
+# свежую (`ticket fresh`), а не остановка; раз на маршрут. Порог — как `COPY_STALE` оркестратора:
+# сутки с часом запаса на суточное обновление шаблона, иначе каждая сессия к концу суток гоняла бы
+# принудительный снимок прода.
+COPY_AGE = timedelta(hours=25)
+STALE_COPY = (
+    "Копия прода в песочнице — снимок от {copy}, старше суток, а в критериях тикета — «на "
+    "проде». До /verify запроси свежую копию вызовом ({long}) ниже и выполни его задание: "
+    "оркестратор снимет её на Mac и ответит в том же вызове. Затем снова этот маршрут: /verify "
+    "пойдёт на копии, какая будет; старая — с пометкой в свидетельствах, второй раз маршрут "
+    "свежую не попросит."
+)
+STALE_NOTE = "снимок старше суток — свежей копии не дали"
+# Критерии «после выката» (#301, решение 22.10): проверить их до слияния нельзя — не критерий
+# PR. Формат — блок брифа `.claude/canon/ticket-ownership.md`: только строки-галочки (проза брифа
+# и комментариев — не пункт); пункт «после выката» — галочка, начатая с «После выката:» или «На
+# проде после выката:», галочка под заголовком «После выката» или часть галочки со слов «на проде
+# после выката» до конца строки. Жирный шрифт не мешает, отметка галочки сохраняется.
+CHECKBOX = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\[([ xX])\]\s+(.*?)\s*$")
+HEADING = re.compile(r"^\s*#{1,6}\s+(.*?)[\s#:]*$")
+MARKUP = re.compile(r"\*\*|__")
+AFTER_HEADING = re.compile(r"(?:на\s+проде\s+)?после\s+выката", re.I)
+WHOLE = re.compile(r"(?:на\s+проде\s+)?после\s+выката\s*:", re.I)
+INSIDE = re.compile(r"на\s+проде\s+после\s+выката", re.I)
+ON_PROD = re.compile(r"на\s+проде", re.I)
+AFTER_DEPLOY_CRITERIA = (
+    "Пункты «после выката» — не критерий этого PR: их проверяет владелец после выката, маршрут "
+    "переносит их в тело PR списком «После выката». Не проверяй их и не ставь из-за них FAIL "
+    "или BLOCKED:\n{items}"
+)
 COMMENT_LIMIT = 4_000
 COMMENT_HEAD = 1_000  # длинный комментарий — начало и конец: критерии брифа стоят в конце
 COMMENTS_LIMIT = 20_000
@@ -213,7 +279,7 @@ WAIT = """Затем ожидание мёржа и уборка — сесси�
 
 
 def load_review() -> types.ModuleType:
-    """`review` рядом со скриптом — его `is_docs`: «только документы» тем же правилом."""
+    """`review` рядом со скриптом — его `is_docs` и `needs_review`: пропуск тем же правилом."""
     path = Path(__file__).resolve().parent / "review"
     module = types.ModuleType("canon_review_for_ticket")
     module.__file__ = str(path)
@@ -248,6 +314,32 @@ def failure(text: str, log, place: str = "на машине сессии") -> st
     said = f"первая строка ошибки: {error}" if error else "строки с ошибкой в выводе нет"
     where = f"лог `{log}` {place}" if log else "лога нет"
     return f"{said}; полный вывод — {where}"
+
+
+def blocked_reason(report: str) -> str:
+    """Причина BLOCKED из отчёта `/verify` для отчёта об остановке (#292): текст после BLOCKED в
+    строке вердикта (после BLOCKED пусто — следующая строка не-заголовок), иначе первая строка не
+    заголовок и не вердикт; без разметки, пароль в URL и значения присваиваний — маской, обрезано.
+    Нечего взять — пустая."""
+    lines = [MARKDOWN.sub("", ANSI.sub("", raw).strip()).strip() for raw in report.splitlines()]
+    texts = [
+        x for raw, x in zip(report.splitlines(), lines) if x and not raw.lstrip().startswith("#")
+    ]
+    found, after = "", False
+    for line in texts:
+        m = BLOCKED_REASON.search(line)
+        if after and not m:
+            found = line
+            break
+        if m:
+            found = m.group(1).strip()
+            if found:
+                break
+            after = True  # причина — ниже строки вердикта
+    if not found and not after:
+        found = next((x for x in texts if not BLOCKED_REASON.search(x)), "")
+    found = ASSIGNMENT.sub(r"\1***", URL_PASSWORD.sub(r"\1***\2", found))
+    return found[:STOP_WIDTH]
 
 
 def parse_decisions(text: str, count: int, weakening_needed: bool):
@@ -306,6 +398,64 @@ def review_items(md: str) -> dict[int, str]:
         else:
             number = None
     return items
+
+
+def criteria_items(text: str) -> list[tuple[bool, str, bool]]:
+    """Галочки в тексте тикета: (отмечена, текст без жирного, под заголовком «После выката»)."""
+    items, section = [], False
+    for line in text.splitlines():
+        if heading := HEADING.match(line):
+            section = bool(AFTER_HEADING.fullmatch(MARKUP.sub("", heading.group(1)).strip()))
+        elif box := CHECKBOX.match(line):
+            items.append((box.group(1) != " ", MARKUP.sub("", box.group(2)).strip(), section))
+    return items
+
+
+def after_deploy(text: str) -> list[tuple[bool, str]]:
+    """Пункты «после выката» (#301): (отмечен, текст) без повторов."""
+    found: list[tuple[bool, str]] = []
+    for done, item, section in criteria_items(text):
+        if section or WHOLE.match(item):
+            part = item
+        elif inside := INSIDE.search(item):
+            part = item[inside.start() :]
+        else:
+            continue
+        part = part[:1].upper() + part[1:]
+        if part and part not in (known for _, known in found):
+            found.append((done, part))
+    return found
+
+
+def on_prod(text: str) -> bool:
+    """В галочках есть «на проде» до реализации или на копии — не в пункте «после выката»."""
+    return any(
+        ON_PROD.search(INSIDE.split(item, 1)[0])
+        for _, item, section in criteria_items(text)
+        if not section and not WHOLE.match(item)
+    )
+
+
+def snapshot_time(copy: str) -> datetime | None:
+    """Время снимка копии прода — как `snapshot_time` оркестратора: `Z` и пояс `+07`, `+0700` —
+    как `+07:00`, доли секунды отбрасываются (Python до 3.11 их не разбирает), без пояса —
+    местное; не разобрать — None."""
+    text = re.sub(r"(:\d{2})\.\d+", r"\1", copy.strip().replace(" ", "T", 1))
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    elif found := re.search(r"T.*?([+-]\d{2})(\d{2})?$", text):
+        text = f"{text[: found.start(1)]}{found.group(1)}:{found.group(2) or '00'}"
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return when.astimezone() if when.tzinfo is None else when
+
+
+def stale(copy: str | None) -> bool:
+    """Снимок копии прода старше `COPY_AGE`; время не разобрать — не старше (не просим зря)."""
+    when = snapshot_time(copy) if copy else None
+    return when is not None and datetime.now(timezone.utc) - when > COPY_AGE
 
 
 def comments_text(comments: list[dict], trusted, member=None) -> tuple[str, int]:
@@ -610,9 +760,12 @@ class Route:
         fresh = core.git_ok("merge-base", "--is-ancestor", verdict["base_sha"], "origin/main")
         mine = core.git_ok("merge-base", "--is-ancestor", verdict["head"], "HEAD")
         if verdict.get("skipped") is True and fresh and mine:
-            # Пропуск годен, пока в ветке только документы (`ship-finish` проверит так же).
+            # Пропуск годен, пока в ветке только документы и чистая установка канона (#309) —
+            # тем же правилом `needs_review`, что выдал пропуск и что перепроверит `ship-finish`.
             files = core.git("diff", "--name-only", "--no-renames", "origin/main...HEAD")
-            mine = all(load_review().is_docs(f) for f in files.splitlines())
+            base = core.git("merge-base", "origin/main", "HEAD").strip()
+            code, _, _ = load_review().needs_review(files.splitlines(), base, core.head())
+            mine = not code
         return verdict if fresh and mine else None
 
     def pr_state(self) -> str | None:
@@ -672,11 +825,13 @@ class Route:
         st["review"] = {
             "head": verdict["head"],
             "skipped": verdict.get("skipped") is True,
+            "install": (verdict.get("install") or {}).get("version"),
             "findings": verdict.get("findings") or 0,
             "weakening": verdict.get("weakening") or "",
         }
         if st["review"]["skipped"]:
-            st["verify"] = {"needed": False, "why": "только документы"}
+            why = "чистая установка канона" if st["review"]["install"] else "только документы"
+            st["verify"] = {"needed": False, "why": why}
             st.go("checks")
             return None
         st.go("findings")
@@ -763,9 +918,22 @@ class Route:
             lines.append(f"{n}. {items.get(n, '(текст находки — в отчёте ревью)')}")
             lines.append(f"   Решение сессии: {decisions[n][1]}")
         body = "\n".join(lines)
+        # Строки владений (#289): по ним оркестратор пустит тикет параллельно; флаг — в триаже.
+        # Тикет «канон» — в трекере канона: управляемые файлы там лежат под `project/`.
+        paths = self.finding_paths(items, new, "project/" if repo else "")
         if record["url"]:
+            # Второй пакет — и в строку владений тела (оркестратор читает тело), если она есть:
+            # нет — первый пакет путей не дал, тикет идёт один. До комментария: правка
+            # повторима, а сбой после комментария повторил бы его.
+            if paths:
+                found = core.gh_json("issue", "view", record["url"], "--json", "body") or {}
+                old = found.get("body") or ""
+                if core.OWNS_LINE.search(old) and (merged := core.add_owns(old, paths)) != old:
+                    core.gh("issue", "edit", record["url"], "--body", merged)
             core.gh("issue", "comment", record["url"], "--body", body)
         else:
+            if paths:
+                body = core.add_owns(body, paths)
             area = re.search(r"`([^`:]+)", items.get(new[0], "")) or None
             full = f"{title}: {area.group(1)}" if area else title
             args = ["issue", "create", "--title", full, "--label", label, "--body", body]
@@ -773,6 +941,23 @@ class Route:
         record["numbers"] = record["numbers"] + new
         st[key] = record
         st.save()
+
+    def finding_paths(self, items: dict[int, str], numbers: list[int], prefix: str) -> list[str]:
+        """Пути находок для строки «Владения»: находка начинается с `` `путь:строка` `` — номер
+        строки отбрасывается, каталог — с `/`, `prefix` — перед путём. Путь хоть одной находки не
+        разобрать (маска, `..`, нет пути) — пусто: тикет пойдёт один, а не уже, чем правит."""
+        paths = []
+        for n in numbers:
+            found = re.match(r"`([^`]+)`", items.get(n, ""))
+            raw = re.sub(r":[\d\-–,]*$", "", found.group(1)) if found else ""
+            path = self.core.claim_path(raw) if raw else None
+            if path is None:
+                return []
+            if not path.endswith("/") and (self.root / path).is_dir():
+                path += "/"
+            if prefix + path not in paths:
+                paths.append(prefix + path)
+        return paths
 
     # --- тесты и линтеры ---
 
@@ -969,9 +1154,24 @@ class Route:
         if passed and decision.get("criteria") == digest and self.docs_only_since(decision["head"]):
             st.go("sync")
             return None
+        copy = core.prod_copy(st)
+        old = stale(copy) and on_prod(text)
+        if old and not st["verify_fresh"]:
+            st["verify_fresh"] = copy  # раз на маршрут: свежей не дали — /verify на этой
+            fresh = core.command("fresh", self.n)
+            body = STALE_COPY.format(copy=copy, long=core.LONG_CALL)
+            return (core.TURN, f"Тикет #{self.n}: копия прода старше суток", body, (fresh,))
         criteria = st.dir / "verify-criteria.txt"
+        if items := after_deploy(text):  # #301: вне суммы — производное от тех же критериев
+            listed = "\n".join(f"- {item}" for _, item in items)
+            text += f"\n\n{AFTER_DEPLOY_CRITERIA.format(items=listed)}"
         if strangers:
             text += f"\n\nКомментарии не участников репозитория ({strangers}) не включены."
+        # Копия прода (#307) — тоже вне суммы: новый снимок не перезапускает платный /verify.
+        if copy:
+            text += f"\n\n{PROD_COPY_CRITERIA.format(copy=copy)}"
+            if old:
+                text += f" Этот {STALE_NOTE}: так и напиши в отчёте."
         criteria.write_text(text + "\n", encoding="utf-8")
         report = st.dir / "verify.json"
         before, tree = core.head(), sorted(self.tree())
@@ -991,7 +1191,17 @@ class Route:
         if res.returncode != 0:  # след разбирается и тут — до отчёта об остановке (#190, п. 6)
             errors = "\n".join(x for x in res.stderr.splitlines() if not x.startswith(TRACE))
             log = self.keep_output("verify", res.stdout + res.stderr)
-            why = f"/verify не состоялся (код {res.returncode}): {failure(errors, log)}"
+            raw = st.dir / "verify.raw.md"
+            reason = ""
+            if BLOCKED_MARK in res.stderr and raw.is_file():
+                reason = blocked_reason(raw.read_text(encoding="utf-8", errors="replace"))
+            if reason:
+                why = (
+                    f"{BLOCKED_MARK}: {reason}; отчёт /verify — `{raw}`, полный вывод — лог "
+                    f"`{log}` на машине сессии"
+                )
+            else:
+                why = f"/verify не состоялся (код {res.returncode}): {failure(errors, log)}"
             return self.stop(why, trace)
         if "verify: пропущено" in res.stdout:
             verdict = "пропущено"
@@ -1003,7 +1213,7 @@ class Route:
             return self.stop(f"итог /verify не распознан: полный вывод — лог `{log}`", trace)
         if left and self.recipe_touched(before):
             verdict = None  # рецепт менял сам /verify (файлом или коммитом) — итог не засчитан
-        decision.update(verdict=verdict, head=before, criteria=digest)
+        decision.update(verdict=verdict, head=before, criteria=digest, copy=copy, stale=old)
         st["verify"] = decision
         if verdict == "PASS":
             st["attempts"].pop("verify", None)
@@ -1014,7 +1224,10 @@ class Route:
             if verdict == "FAIL":
                 st.go("checks")  # после уборки и починки — тесты и /verify заново
                 report_md = (st.dir / "verify.md").read_text(encoding="utf-8").strip()
-                failed = f"/verify: FAIL — почини и это (коммит):\n{report_md}\n\n"
+                failed = (
+                    f"/verify: FAIL — почини и это (коммит):\n{report_md}\n\nКритерий не "
+                    f"подтверждается и починить нельзя — {self.cannot_fix()}.\n\n"
+                )
             return self.turn(
                 "След /verify в worktree",
                 f"{failed}{left[0]}\n{TRACE_TASK}",
@@ -1031,8 +1244,19 @@ class Route:
             "/verify: FAIL",
             f"{report_md}\n\nПочини в ветке (коммит, сообщение одной строкой `-m`); тесты и "
             f"/verify пройдут заново. Попытка {attempt} из {LIMIT}; критерий не подтверждается "
-            "и починить нельзя — вопрос в `.ticket/stop.md`, не просить одобрить непроверенное.",
+            f"и починить нельзя — {self.cannot_fix()}; не просить одобрить непроверенное.",
             long="тесты и /verify — до 45 минут",
+        )
+
+    def cannot_fix(self) -> str:
+        """Куда вопрос, если FAIL `/verify` починить нельзя: под оркестратором — `ticket ask`
+        (ответ комментарием сам вернёт тикет в очередь, #289), иначе — отчёт об остановке."""
+        if not self.core.orchestrated():
+            return "вопрос в `.ticket/stop.md`"
+        return (
+            "вопрос владельцу о продукте — в `.ticket/ask.md`, затем вызов "
+            f"`{self.core.command('ask', self.n)}`; отчёт об остановке (`.ticket/stop.md`) — "
+            "только для тупика без вопроса"
         )
 
     # --- догон базы ---
@@ -1107,6 +1331,8 @@ class Route:
     def review_line(self) -> str:
         st = self.state
         review = st["review"] or {}
+        if review.get("skipped") and review.get("install"):
+            return f"Ревью ошибок: пропущено — чистая установка канона {review['install']}"
         if review.get("skipped"):
             return "Ревью ошибок: пропущено — только документы"
         decisions = st["decisions"] or {}
@@ -1142,11 +1368,28 @@ class Route:
         if not decision.get("needed"):
             return f"/verify не нужен: {decision.get('why', '')}"
         cost = self.state["cost"].get("verify") or 0
-        return f"/verify: {decision.get('verdict')} ({cost:.2f} USD)"
+        line = f"/verify: {decision.get('verdict')} ({cost:.2f} USD)"
+        if copy := self.verify_copy():
+            line += f", проверено на копии прода от {copy}"
+            if decision.get("stale"):
+                line += f" ({STALE_NOTE})"
+        return line
+
+    def verify_copy(self) -> str | None:
+        """Копия прода, на которой прошёл засчитанный `/verify` (#307); без копии — None."""
+        decision = self.state["verify"] or {}
+        if self.state["verify_off"] or not decision.get("needed"):
+            return None
+        return decision.get("copy") if decision.get("verdict") in ("PASS", "FAIL") else None
 
     def pr_body(self, summary: str) -> str:
         core, st = self.core, self.state
-        lines = [summary, "", f"Closes #{self.n}", "", "## Evidence", ""]
+        lines = [summary, "", f"Closes #{self.n}", ""]
+        text, *_ = self.verify_criteria({})
+        if items := after_deploy(text):  # #301: проверяет и отмечает владелец после выката
+            lines += ["## После выката", "", "Проверяет владелец после выката, отмечает здесь.", ""]
+            lines += [f"- [{'x' if done else ' '}] {item}" for done, item in items] + [""]
+        lines += ["## Evidence", ""]
         lines.append(f"- {self.checks_line()}")
         if note := core.read_answer(self.root, "checks.md"):
             lines.append(f"- Красное по пути: {note}")
@@ -1156,6 +1399,8 @@ class Route:
             report = verify_md.read_text(encoding="utf-8").strip()
             lines += ["", "<details><summary>Что проверил /verify</summary>", "", report]
             lines += ["", "</details>", ""]
+        if not self.verify_copy() and (copy := core.prod_copy(st)):
+            lines.append(f"- Данные прода — копия в песочнице, снимок от {copy}")  # #307
         lines.append(f"- {self.review_line()}")
         for n, (kind, said) in (st["decisions"] or {}).items():
             if kind == "отклонено":
@@ -1340,10 +1585,10 @@ class Route:
         if not self.stopped_on_verify():
             return ""
         if self.core.orchestrated():
-            return " " + WAIVE_HINT
+            return " " + waive_hint(self.core)
         return (
-            f" {WAIVE_HINT} Владелец снял проверку в чате — попроси его написать эту строку "
-            "комментарием: из чата маршрут её не принимает, сама сессия её в тикет не пишет."
+            f" {waive_hint(self.core)} Владелец снял проверку в чате — попроси его написать эту "
+            "строку комментарием: из чата маршрут её не принимает, сама сессия её в тикет не пишет."
         )
 
     def stop_report(self, reason: str, question: str, held: bool = False) -> str:
@@ -1352,7 +1597,7 @@ class Route:
         lines = [f"Отчёт об остановке: {reason}", "", question, ""]
         step = (st["stop"] or {}).get("step")
         if self.stopped_on_verify():
-            lines += [WAIVE_HINT, ""]
+            lines += [waive_hint(self.core), ""]
         lines += ["## Данные маршрута", ""]
         name = self.core.STEP_NAMES.get(step, step)
         lines.append(f"- Ветка `{st['branch']}`, head `{self.core.head()[:7]}`, шаг «{name}»")
@@ -1376,12 +1621,20 @@ class Route:
 
     def publish_stop(self, text: str, saved: Path) -> str:
         """`ship-finish --unconfirmed`; не прошёл — то же кодом, без `gh pr merge` (#152):
-        PR в черновик (черновик не сливается и с включённым авто-мёржем), метка, комментарий."""
+        PR в черновик (черновик не сливается и с включённым авто-мёржем), метка, комментарий; с
+        упоминанием владельца и ссылкой в тикете, как у `ship-finish` (#295)."""
         core = self.core
         res = core.canon("ship-finish", "--unconfirmed", text)
         if res.returncode == 0:
             m = re.search(r"отчёт об остановке — (.*?), ждёт", res.stdout)
             return m.group(1) if m else "опубликован"
+        # Упоминание и ссылка в тикете — как у `ship-finish` (#295): без них нет пуша. Владелец
+        # не узнан — отчёт без упоминания: отчёт важнее пуша.
+        try:
+            owner = core.gh("repo", "view", "--json", "owner", "-q", ".owner.login")
+        except core.Failure:
+            owner = ""
+        text = with_mention(text, owner)
         try:
             fields = ["--state", "open", "--json", "number,url,isDraft"]
             prs = core.gh_json("pr", "list", "--head", self.state["branch"], *fields)
@@ -1391,7 +1644,14 @@ class Route:
                 if not pr.get("isDraft"):
                     core.gh("pr", "ready", number, "--undo")
                 core.gh("pr", "edit", number, "--add-label", LABEL)
-                core.gh("pr", "comment", number, "--body", text)
+                posted = core.gh("pr", "comment", number, "--body", text)
+                url = posted if posted.startswith("https://") else pr["url"]
+                link = f"{core.REPORT_MARK} — на PR: {url}"
+                link = with_mention(link, owner, f"отчёт и метка `{LABEL}` — на PR")
+                try:  # отчёт уже на PR: сбой ссылки — не «отчёт не опубликован»
+                    core.gh("issue", "comment", str(self.n), "--body", link)
+                except core.Failure:
+                    pass
                 return f"{pr['url']} (черновик)"
             core.gh("issue", "edit", str(self.n), "--add-label", LABEL)
             core.gh("issue", "comment", str(self.n), "--body", text)

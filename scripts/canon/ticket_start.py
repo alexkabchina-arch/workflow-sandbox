@@ -19,9 +19,11 @@
    архив рядом с состоянием, задание — `/implement N`.
 
 Под оркестратором (`CANON_ORCHESTRATOR=1`, #214) `session-start` PR автора не берёт; задание —
-то же `/implement N` с самопроверкой `/code-review`, конец — «код готов» или вопрос. Вопрос ждёт
-— задание забрать ответ (`ticket ask N`): сессию возобновил оркестратор после ответа. Маршрут
-остановлен — задание `ticket ship N --again`: оркестратор возобновляет его по `agent:go`.
+то же `/implement N` с самопроверкой `/code-review`, конец — «код готов» или вопрос; с копией
+прода в песочнице (`CANON_PROD_COPY`, #307) — что «на проде» значит она, время её снимка и запрос
+свежей (`ticket fresh N`). Вопрос ждёт — задание забрать ответ (`ticket ask N`): сессию возобновил
+оркестратор после ответа. Маршрут остановлен — задание `ticket ship N --again`: оркестратор
+возобновляет его по `agent:go`.
 Дефект слитого PR, найденный сессией, — новый тикет с меткой `escaped-defect` и ссылкой на PR
 (#219): их считает сводка PRD.
 
@@ -59,7 +61,15 @@ ORCHESTRATED_TASK = """
 - нашла дефект, который внёс уже слитый PR (не этого тикета), — заведи новый тикет
   (`gh issue create`) с меткой `escaped-defect` и ссылкой на PR, который его внёс, — в брифе
   строка «Источник: #<тикет PR>, слит ДД.ММ» и ссылка на PR: их считает сводка PRD
-  оркестратора; свой тикет дальше — как обычно;"""
+  оркестратора; в теле — обе строки `**Владения:**` и `**Флаги:**` по образцу
+  `.claude/canon/ticket-ownership.md` (без них тикет пойдёт один); свой тикет дальше — как
+  обычно;"""
+# Копия прода под оркестратором (#307): живого прода и его API в песочнице нет.
+PROD_COPY_TASK = """
+- живого прода в песочнице нет: «на проде» в критериях тикета — обезличенная
+  копия прода в песочнице, снимок от {copy}; нужны данные свежее снимка — вызов `{fresh}`
+  ({long}): оркестратор снимет новую копию на Mac (не чаще раза в час) и ответит в том же
+  вызове;"""
 
 
 def enter(plan: dict) -> str:
@@ -99,6 +109,11 @@ def main(argv: list[str], core) -> int:
     parser.add_argument("ticket", type=int, help="номер тикета")
     n = parser.parse_args(argv).ticket
     st = core.State(n)
+    if core.orchestrated() and isinstance(stale := st["fresh"], dict):
+        # Запуск начинается со старта: запрос свежей копии прошлого запуска (его убили посреди
+        # ожидания) никто не ждёт — ожидание прежнее (#307).
+        st["fresh"], st["waiting"] = None, stale.get("waiting") or core.AGENT
+        st.save()
     if st["question"] and core.orchestrated():
         # Оркестратор возобновляет сессию после ответа владельца в тикете — его и забрать.
         body = (
@@ -171,10 +186,15 @@ def route(core, n: int, st, plan: dict) -> int:
     if st.step == "stopped" and core.orchestrated():
         # Оркестратор возобновляет остановленный тикет только по `agent:go` владельца.
         where = (st["stop"] or {}).get("where", "?")
+        # Ответ на отчёт маршрут сам не читает (#289): отчёт в PR — и ответ под ним.
+        read = f"`gh issue view {n} --comments`"
+        if "/pull/" in where:
+            read += f" и `gh pr view {where} --comments`"
         body = (
             f"{enter(plan)}\nМаршрут был остановлен, отчёт об остановке — {where}; владелец "
-            f"поставил agent:go — продолжить маршрут из worktree тикета, задания — до "
-            f"{core.until()} ({core.LONG_CALL}):"
+            f"поставил agent:go. Сначала прочитай комментарии владельца после отчёта об "
+            f"остановке ({read}): в них его ответ — по нему и иди. Затем продолжить маршрут из "
+            f"worktree тикета, задания — до {core.until()} ({core.LONG_CALL}):"
         )
         again = core.command("ship", n, "--again")
         return core.emit(core.TURN, f"Тикет #{n}: продолжение после остановки", body, (again,))
@@ -195,8 +215,13 @@ def route(core, n: int, st, plan: dict) -> int:
         )
         return core.emit(core.TURN, f"Тикет #{n}: продолжение", body, (core.command("ship", n),))
     st["since"], st["waiting"] = core.now(), core.AGENT
+    if core.orchestrated() and st["copy"] is None and (copy := os.environ.get(core.PROD_COPY)):
+        st["copy"] = copy  # базу сессии клонируют в начале работы — с этой копии (#307)
     st.save()
     extra = ORCHESTRATED_TASK.format(ask=core.ORCHESTRATED_ASK) if core.orchestrated() else ""
+    if copy := core.prod_copy(st):
+        fresh = core.command("fresh", n)
+        extra += PROD_COPY_TASK.format(copy=copy, fresh=fresh, long=core.LONG_CALL)
     task = TASK.format(
         n=n, ask=core.command("ask", n), long=core.LONG_CALL, extra=extra, until=core.until()
     )
