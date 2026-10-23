@@ -35,6 +35,9 @@
   из архива — в кэш `~/.canon/tools/`, внутрь — потоком через `sbx exec -i` в `/usr/local/bin`;
   сети песочнице не нужно. Нужная версия внутри уже есть — ничего не качается; на Mac другая
   версия или gitleaks нет — строка об этом;
+- **браузер для `/verify`** (#292) — образ Playwright версии pin проекта: его имя печатает
+  команда проекта `git config canon.sandboxBrowser` (в главном чекауте); нет на Mac — `docker
+  pull`, внутри другого id или нет — как `load-image`. Ключа нет или сбой — строка, не сбой;
 - **сеть песочницы** — поверх общего запрета разрешены домены GitHub, pypi, npm и Docker Hub
   (`HOSTS`) и `git config canon.sandboxHosts` (через запятую); домены Anthropic даёт сам `sbx`.
   Разрешённое сверх списка (убрано из настройки, добавлено руками) `up` снимает. Память,
@@ -51,7 +54,9 @@
 — например, ssh прода) и `--probe хост:порт` на запрос не отдаёт данных (соединение без ответа —
 ❌: закрытость не доказана); снаружи — смонтировано ровно клон и копия канона, сеть песочницы
 разрешает только список, проброс агента выключен, общая политика ничего не пускает, общих
-ключей нет; gitleaks внутри — на PATH, той же версии, что на Mac. Вход Claude — строкой, не ❌.
+ключей нет; gitleaks внутри — на PATH, той же версии, что на Mac; при `canon.sandboxBrowser` —
+образ браузера pin проекта внутри и Chromium в нём (pin сменили без загрузки — ❌). Вход Claude
+и незаданный браузер — строкой, не ❌.
 
 `login` — интерактивный `sbx run` песочницы: владелец набирает `/login` (подписка Claude) один
 раз на все песочницы: `sbx` хранит вход на хосте общим секретом `anthropic` и подставляет его
@@ -74,6 +79,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -128,6 +134,12 @@ INSTALL = (
     '{ install -m 755 "$t" "$d/gitleaks" 2>/dev/null || sudo -n install -m 755 "$t" '
     '"$d/gitleaks"; }; rc=$?; rm -f "$t"; exit $rc'
 )
+# Браузер для `/verify` под оркестратором (#292): образ Playwright версии pin проекта. Имя образа
+# печатает команда проекта (`sh -c` в главном чекауте) — канон версию не знает.
+BROWSER_KEY = "canon.sandboxBrowser"
+BROWSER_TIMEOUT = 60  # вычисление имени, не сборка
+IMAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*")
+CHROMIUM_INSIDE = "ls -d /ms-playwright/chromium-[0-9]*"  # ревизии Chromium в образе
 ENV_NAMES = ("", ".local", ".production", ".prod", ".development", ".dev", ".test")
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".claude"}
 
@@ -503,7 +515,8 @@ class Sandbox:
                 f"песочница {self.name} смонтирована иначе ({have}), а нужно "
                 f"{', '.join(self.mounts)} — `sandbox rm`, затем `sandbox up`; `rm` удалит "
                 "транскрипты сессий тикетов в работе — сначала полный простой оркестратора "
-                "(`orchestrator status`: «Простой полный», docs/sandbox.md)"
+                "(`orchestrator status`: «Простой полный», docs/sandbox.md); переезд копии канона "
+                "на постоянный адрес — `orchestrator update <тег>`, он ждёт простоя сам"
             )
         else:
             say(f"песочница {self.name} уже есть")
@@ -520,6 +533,13 @@ class Sandbox:
             say(f"сеть: {host} больше не разрешён (нет в списке)")
         say(f"сеть: запрещено всё, кроме {len(self.hosts())} доменов и доменов Anthropic")
         self.install_gitleaks()
+        try:
+            self.deliver_browser()
+        except Failure as exc:  # браузер нужен только тикетам с интерфейсом: строка, не сбой
+            say(
+                f"браузер для /verify не готов: {exc} — тикет с интерфейсом под оркестратором "
+                "остановится на /verify; `sandbox check` — строка `browser`"
+            )
         if not self.logged_in():
             say("вход Claude в песочнице не выполнен — `sandbox login` (один раз)")
 
@@ -591,6 +611,95 @@ class Sandbox:
             except OSError:
                 continue
         return found
+
+    def browser(self) -> str | None:
+        """Образ браузера для `/verify` (#292) — вывод `canon.sandboxBrowser` в главном чекауте:
+        ровно одно имя образа. Ключа нет — None; сбой, пустой вывод или не имя — `Failure`."""
+        command = self.config(BROWSER_KEY)
+        if not command:
+            return None
+        what = f"образ браузера (`{BROWSER_KEY}`)"
+        # Своя группа процессов: по пределу убивается вся, иначе потомок, держащий вывод, повесил
+        # бы `communicate` без предела.
+        proc = subprocess.Popen(
+            ["sh", "-c", command],
+            cwd=self.main,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, err = proc.communicate(timeout=BROWSER_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+            raise Failure(f"{what}: дольше {BROWSER_TIMEOUT} с") from None
+        if proc.returncode != 0:
+            text = (err or out).strip()
+            raise Failure(f"{what}: {text.splitlines()[-1] if text else f'код {proc.returncode}'}")
+        names = out.split()
+        if len(names) != 1 or not IMAGE_NAME.fullmatch(names[0]):
+            raise Failure(f"{what}: нужно одно имя образа, а вывод — «{out.strip()[:80]}»")
+        return names[0]
+
+    def image_id(self, image: str, inside: bool) -> str | None:
+        cmd = ("docker", "image", "inspect", "-f", "{{.Id}}", image)
+        res = sbx("exec", self.name, *cmd) if inside else run(*cmd)
+        return res.stdout.strip() or None if res.returncode == 0 else None
+
+    def deliver_browser(self) -> None:
+        """Образ браузера — в песочницу (#292): нет на Mac — `docker pull`; внутри другого id или
+        нет — `docker save` → `docker load`, как `load-image`. В VM ничего не ставится."""
+        image = self.browser()
+        if image is None:
+            say(
+                f"браузер для /verify не задан (`{BROWSER_KEY}`): тикет с интерфейсом под "
+                "оркестратором остановится на /verify — docs/sandbox.md, «Браузер для /verify»"
+            )
+            return
+        mac = self.image_id(image, inside=False)
+        if mac is None:
+            say(f"браузер для /verify: качаю {image} на Mac")
+            res = run("docker", "pull", image)
+            mac = self.image_id(image, inside=False)
+            if res.returncode != 0 or mac is None:
+                raise Failure(f"docker pull {image}: {tail(res)}")
+        if self.image_id(image, inside=True) == mac:
+            say(f"браузер для /verify: {image} в песочнице уже есть")
+            return
+        self.load_image([image])
+
+    def browser_row(self) -> dict | None:
+        """Строка `browser` проверки (#292): образ pin проекта внутри и Chromium в нём. Ключа нет
+        — None (строка вне ✅/❌: проекту без интерфейса браузер не нужен)."""
+        try:
+            image = self.browser()
+        except Failure as exc:
+            return {"name": "browser", "ok": False, "detail": str(exc)}
+        if image is None:
+            return None
+        if self.image_id(image, inside=True) is None:
+            return {
+                "name": "browser",
+                "ok": False,
+                "detail": f"{image} (pin проекта) в песочнице нет — `sandbox up` загрузит; без "
+                "него тикет с интерфейсом под оркестратором остановится на /verify",
+            }
+        probe = ("docker", "run", "--rm", "--network", "none", "--entrypoint", "sh", image, "-c")
+        res = sbx("exec", self.name, *probe, CHROMIUM_INSIDE)
+        found = [Path(x).name for x in res.stdout.split() if res.returncode == 0]
+        return {
+            "name": "browser",
+            "ok": bool(found),
+            "detail": f"{image}: {', '.join(found)}"
+            if found
+            else f"{image}: Chromium в образе не найден ({tail(res)})",
+        }
 
     def check(self, probes: list[str]) -> int:
         configured = [t.strip() for t in self.config(PROBE_KEY).split(",") if t.strip()]
@@ -676,9 +785,16 @@ class Sandbox:
                 "detail": ", ".join(secrets) or "общих ключей нет",
             }
         )
+        browser = self.browser_row()
+        rows += [browser] if browser else []
         for row in rows:
             print(f"{'✅' if row['ok'] else '❌'} {row['name']} — {row['detail']}")
         print(f"вход Claude: {'есть' if self.logged_in() else 'нет — `sandbox login`'}")
+        if browser is None:
+            print(
+                f"браузер для /verify: не задан (`{BROWSER_KEY}`) — тикет с интерфейсом под "
+                "оркестратором остановится на /verify"
+            )
         return 0 if all(row["ok"] for row in rows) else 1
 
     def status(self) -> None:

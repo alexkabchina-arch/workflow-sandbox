@@ -30,6 +30,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 STATE_DIR = "canon-ticket"
+# Номер формата состояния тикета: у тега другой — выпуск несовместим, обновление копии канона
+# ждёт полного простоя (#311). Совместимая правка формата номер не меняет: образцы прошлого
+# формата в `tests/states/` должны читаться (`tests/test_canon_release.py`).
+STATE_VERSION = 1
 ANSWERS = ".ticket"
 TICKET_BRANCH = re.compile(r"^ticket-(\d+)(?:-.+)?$")
 TURN, DONE, STOPPED = "ход агента", "готово", "остановка"
@@ -154,10 +158,32 @@ REPLY_MARK = "<!-- canon-ticket-reply -->"
 # Режим маршрута «под оркестратором» (#214): флаг окружения от оркестратора. Сессия кончается на
 # «код готов» или на вопросе; ревью ошибок, отметку, авто-мёрж, ожидание и уборку делает он.
 ORCHESTRATED = "CANON_ORCHESTRATOR"
+# Время снимка копии прода в песочнице (#307): оркестратор передаёт его сессии окружением, маршрут
+# пишет его в свидетельства тикета (`/verify`, тело PR).
+PROD_COPY = "CANON_PROD_COPY"
+# Ответ оркестратора на запрос свежей копии прода (`ticket fresh`) — файл рядом с состоянием.
+FRESH_ANSWER = "fresh.json"
 
 
 def orchestrated() -> bool:
     return os.environ.get(ORCHESTRATED) == "1"
+
+
+def prod_copy(st) -> str | None:
+    """Время снимка копии прода, на которой идёт сессия (#307): из состояния тикета — его пишут
+    старт работы над тикетом (`ticket start`: базу сессии клонируют в начале работы) и запрос
+    свежей копии (`ticket fresh`, пусто — база из шаблона без времени), — иначе из окружения
+    запуска (`CANON_PROD_COPY` от оркестратора); не под оркестратором или неизвестно — None."""
+    if not orchestrated():
+        return None
+    if st["copy"] is None:
+        return os.environ.get(PROD_COPY) or None
+    return st["copy"] or None
+
+
+def copy_phrase(copy: str | None) -> str:
+    """«снимок от …» копии прода или «время снимка неизвестно» (#307)."""
+    return f"снимок от {copy}" if copy else "время снимка неизвестно"
 
 
 # Вопрос владельцу под оркестратором — тремя разделами (спека #208): владелец отвечает с
@@ -572,3 +598,85 @@ def emit(status: str, title: str, body: str = "", commands: tuple[str, ...] = ()
             say(f"  ▶ {command}")
     say(f"ticket: {status}")
     return 0
+
+
+# Владения и флаги брифа (`.claude/canon/ticket-ownership.md`): по ним оркестратор решает, какие
+# тикеты идут параллельно; тикеты с общим флагом параллельно не идут. Разбор общий (#289):
+# оркестратор строки читает, `ticket ship` пишет их в тикет техдолга по путям находок.
+FLAGS = ("миграция", "ядро", "экран")
+OWNS_LINE = re.compile(r"^\*\*Владения:\*\*(.*)$", re.M)
+FLAGS_LINE = re.compile(r"^\*\*Флаги:\*\*(.*)$", re.M)
+
+
+def claim_path(raw: str) -> str | None:
+    """Путь строки «Владения» от корня репозитория; маска (`src/*.py`), весь репозиторий (`.`) и
+    `..` буквально с путями не сравнить — None."""
+    path = re.sub(r"^(\./)+|^/+", "", raw.strip())
+    parts = path.rstrip("/").split("/")
+    if not path or re.search(r"[*?\[\]`\s]", path) or "." in parts or ".." in parts:
+        return None
+    return path
+
+
+def claims(body: str | None) -> dict | None:
+    """Владения и флаги брифа: по одной строке `**Владения:**` (пути в обратных кавычках через
+    запятую) и `**Флаги:**` (`нет` или слова из `FLAGS`). Строки нет, их несколько или она не по
+    образцу (слова вместо путей, маска, `.`) — None: тикет идёт один."""
+    owns, flags = OWNS_LINE.findall(body or ""), FLAGS_LINE.findall(body or "")
+    if len(owns) != 1 or len(flags) != 1:
+        return None
+    paths = []
+    for item in owns[0].strip().rstrip(".").split(","):
+        found = re.fullmatch(r"`([^`\s]+)`", item.strip())
+        path = claim_path(found.group(1)) if found else None
+        if path is None:
+            return None
+        paths.append(path)
+    words = [w.strip().lower() for w in flags[0].strip().rstrip(".").split(",")]
+    if words == ["нет"]:
+        words = []
+    if not all(w in FLAGS for w in words):
+        return None
+    return {"paths": paths, "flags": sorted(set(words))}
+
+
+def owner_claims(comments: list[dict], owner: str) -> dict | None:
+    """Владения и флаги из последнего нескрытого комментария владельца репозитория (логин
+    `owner`; `gh … --json comments`) с обеими строками: владелец добавляет их, пока тикет в
+    очереди. App, служебные комментарии маршрута (`ticket ask`, отчёт об остановке — в ручном
+    режиме они от учётной записи владельца) и прочие участники — не владелец. Строки не по образцу
+    — None."""
+    for c in reversed(comments):
+        body = c.get("body") or ""
+        if c.get("isMinimized") or ((c.get("author") or {}).get("login") or "") != owner:
+            continue
+        if not is_answer(body.strip()):
+            continue  # служебное маршрута: в ручном режиме сессия пишет токеном владельца
+        if OWNS_LINE.search(body) and FLAGS_LINE.search(body):
+            return claims(body)
+    return None
+
+
+def owns_line(paths: list[str]) -> str:
+    return "**Владения:** " + ", ".join(f"`{p}`" for p in paths)
+
+
+def add_owns(body: str, paths: list[str]) -> str:
+    """Тело тикета, где строка «Владения» дополнена путями (`paths`, новые — в конец); строки
+    нет — она и «Флаги: нет» (если нет и её) дописываются в конец тела. Строка не по образцу
+    (слова, пометки) не переписывается: её правил владелец, тикет и так идёт один."""
+    line = OWNS_LINE.search(body)
+    if line is None:
+        flags = "" if FLAGS_LINE.search(body) else "\n**Флаги:** нет"
+        return f"{body.rstrip()}\n\n{owns_line(paths)}{flags}"
+    have = []
+    for item in line.group(1).strip().rstrip(".").split(","):
+        found = re.fullmatch(r"`([^`\s]+)`", item.strip())
+        path = claim_path(found.group(1)) if found else None
+        if path is None:
+            return body
+        have.append(path)
+    merged = have + [p for p in paths if p not in have]
+    if merged == have:
+        return body
+    return body[: line.start()] + owns_line(merged) + body[line.end() :]

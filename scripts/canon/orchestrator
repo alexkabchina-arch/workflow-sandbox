@@ -6,6 +6,7 @@
     <копия канона>/project/scripts/canon/orchestrator pause    # «пауза»
     <копия канона>/project/scripts/canon/orchestrator now      # «работай сейчас»
     <копия канона>/project/scripts/canon/orchestrator service install|remove   # служба launchd
+    <копия канона>/project/scripts/canon/orchestrator update <тег>   # копия — на тег, на месте
 
 Запуск — из главного чекаута проекта (служба `launchd` раз в минуту); сам скрипт — из своей
 **доверенной копии канона** на машине владельца (тег канона), а не из проекта: его скрипты рядом
@@ -69,7 +70,9 @@
    снятая `agent:go` — очередь PRD снята, взятые тикеты идут. Тикет на остановке, закрытый на
    GitHub, оркестратор больше не ведёт (PR слит — уборка и меры, как по слиянию).
 2. Каждое занятое место — шаг тикета на нём (сбой шага — по тикету, соседнее место идёт):
-   - **сессия** идёт — токен сессии обновляется, ждём; кончилась — по состоянию тикета маршрута:
+   - **сессия** идёт — токен сессии обновляется, ждём; сессия просит свежую копию прода
+     (`ticket fresh`, #307) — снимок на Mac и перенос (`fresh_copy`), ответ — файлом рядом с
+     состоянием маршрута, она ждёт его в своём вызове; кончилась — по состоянию тикета маршрута:
      «код готов» до ревью — ревью ошибок, затем возобновление той же сессии (`session-run
      --resume`) — она разбирает находки, проходит проверки и открывает PR; «код готов» после PR —
      к CI; вопрос — место свободно до ответа (п. 1а); опубликованный отчёт об остановке сессии
@@ -140,7 +143,16 @@
 `service remove` — `bootout` и plist удалён. `status` — строки `ticket status` со своим шагом,
 кого ждём и расходом; места, очередь, паузы с причинами; только читает. Пока есть занятые места,
 очередь или вопрос владельцу в рабочем окне, такт держит `caffeinate` со своим сроком; без
-них — отпускает. Mac — на зарядке, крышка открыта; обновление канона — сначала «пауза».
+них — отпускает. Mac — на зарядке, крышка открыта.
+
+**Обновление канона** (#300): копия — одна на машине, по постоянному адресу `~/.canon/canon`; на
+него ссылаются службы и монтирование песочниц. `update <тег>` (из этой копии, каталог любой) —
+по службам оркестратора на машине: пауза, ожидание конца идущих запусков сессий и тактов, службы
+сняты, копия на теге на месте, службы переставлены, пауза снята; сессии в песочнице целы.
+Несовместимый выпуск (другой `STATE_VERSION` у тега или `--incompatible`) и переезд на постоянный
+адрес — полный простой (пауза — только у простаивающих проектов), затем то же и пересоздание
+песочниц. Тег без `update` (до #300) — отказ. Старые копии `canon-v*`
+без ссылок и правок удаляются. `status` — версия копии и служба из другой копии строкой.
 
 **Граница — песочница проекта** (#223, #241; `docs/sandbox.md`): сессии идут внутри одной
 Docker Sandbox проекта (`sbx exec`), в клоне оркестратора `~/.canon/sandbox/<проект>-<хеш>/clone`;
@@ -153,8 +165,13 @@ Docker Sandbox проекта (`sbx exec`), в клоне оркестратор
 догон — в своём клоне (`canon-orchestrator/repo`) по ветке с сервера; файлы клона (состояние
 маршрута, копия отчёта, токен сессии) — без перехода по символическим ссылкам. Образы проекта
 (`canon.sandboxImages` или вывод `canon.sandboxImagesFrom`) собирает Mac (`canon.sandboxBuild`)
-и загружает в песочницу, когда образ сменился; база-шаблон (`canon.sandboxSeedFrom` →
-`canon.sandboxSeedInto`) — раз в сутки. Пауза по памяти — по памяти внутри песочницы.
+и загружает в песочницу, когда образ сменился; так же — образ браузера для `/verify` (#292, вывод
+`canon.sandboxBrowser`, нет на Mac — `docker pull`; сбой — строка), его имя — сессиям переменной
+`CANON_BROWSER_IMAGE`; база-шаблон (`canon.sandboxSeedFrom` → `canon.sandboxSeedInto`) — раз в
+сутки и после пересоздания песочницы (#306), а с `canon.sandboxSeedRefresh` (#307) — после
+обновления командой проекта на Mac, когда снимок сменился, и по запросу сессии (принудительно, не
+чаще раза в час); время снимка — сессиям переменной `CANON_PROD_COPY`, сбой обновления — строка
+такта и «статуса». Пауза по памяти — по памяти внутри песочницы.
 
 **Лицо агента** (`docs/github-app.md`): GitHub в такте — токеном оркестратора
 (`app-token issue --kind orchestrator`, `GH_TOKEN`); сессии — токен сессии App: его выдаёт Mac
@@ -195,6 +212,7 @@ import types
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
 HERE = Path(__file__).resolve().parent
 STATE_DIR = "canon-orchestrator"
@@ -209,12 +227,13 @@ READY_FOR_AGENT, HUMAN = "ready-for-agent", "ready-for-human"
 ESCAPED = "escaped-defect"  # тикет ускользнувшего дефекта со ссылкой на слитый тикет или PR
 # Места — сессии, идущие параллельно (решение 16.10): число — настройка проекта.
 SLOTS_KEY, SLOTS = "canon.agentSlots", 2
-# Флаги брифа (`.claude/canon/ticket-ownership.md`): тикеты с общим флагом параллельно не идут.
-FLAGS = ("миграция", "ядро", "экран")
-OWNS_LINE = re.compile(r"^\*\*Владения:\*\*(.*)$", re.M)
-FLAGS_LINE = re.compile(r"^\*\*Флаги:\*\*(.*)$", re.M)
 # Возвраты той же сессии по красному CI на тикет; следующий красный — отчёт об остановке.
 RETURNS = 2
+# Комментарий в тикет без строк «Владения» и «Флаги» при взятии в очередь (#289) — без упоминания.
+ALONE = (
+    "Оркестратор: строк «Владения» и «Флаги» по образцу (`.claude/canon/ticket-ownership.md`) "
+    "нет — тикет пойдёт один. Добавьте строки в тело или своим комментарием, пока он в очереди."
+)
 PULL = re.compile(r"/pull/(\d+)")
 APP_ID = "canon.agentAppId"
 # Окружение сессии — без токенов GitHub такта: у сессии только свой токен через обёртки.
@@ -281,9 +300,23 @@ PACK = (
 INTERPRETERS = {"sh", "bash", "zsh", "python", "python3", "perl", "ruby", "node"}
 IMAGES_KEY, BUILD_KEY = "canon.sandboxImages", "canon.sandboxBuild"
 IMAGES_FROM_KEY = "canon.sandboxImagesFrom"  # команда проекта: имена образов — её вывод
+# Браузер для `/verify` (#292): команда проекта печатает имя образа Playwright версии её pin;
+# сессии получают его переменной окружения.
+BROWSER_KEY, BROWSER_ENV = "canon.sandboxBrowser", "CANON_BROWSER_IMAGE"
+PULL_TIMEOUT = 600  # `docker pull` образа браузера (≈1,5 мин на Mac) — дольше: сбой, строка
 NAMES_TIMEOUT = 60  # команда имён образов — вычисление тега, не сборка
 IMAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*")
 SEED_FROM_KEY, SEED_INTO_KEY = "canon.sandboxSeedFrom", "canon.sandboxSeedInto"
+# Обновление шаблона на Mac (#307): команда проекта снимает копию прода, если снимку больше суток,
+# а с `CANON_SEED_FORCE=1` — сейчас; время снимка — последняя отметка ISO 8601 в её выводе.
+SEED_REFRESH_KEY, SEED_FORCE_ENV = "canon.sandboxSeedRefresh", "CANON_SEED_FORCE"
+SNAPSHOT = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}(?::?\d{2})?)?"
+)
+FORCE_GAP = 3600  # принудительные снимки по запросам сессий — не чаще раза в час: нагрузка на прод
+# Снимок после обновления старше суток с запасом — команда его не обновила (замок у другого прогона
+# с `--if-stale` выходит с кодом 0 и прежним временем): строка такта и «статуса».
+COPY_STALE = 25 * 3600
 BUILD_TIMEOUT = 1800  # сборка образа или перенос базы-шаблона дольше получаса — сбой
 INSIDE_TIMEOUT = 600  # уборка, push и прочие команды внутри песочницы
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -356,6 +389,17 @@ OWNER_PAUSE, OWNER_NOW = "pause.json", "now.json"  # команды владел
 PLIST, SERVICE_LOG, LAUNCH_AGENTS = "orchestrator.plist", "service.log", "Library/LaunchAgents"
 SERVICE_TOOLS = ("git", "gh", "claude", "sbx")  # PATH службы — с установки: без них такт не пойдёт
 LOG_LIMIT = 5 * 2**20  # лог службы больше — в `service.log.1`
+# Копия канона (#300): одна на машине, по постоянному адресу от HOME — на него ссылаются служба и
+# монтирование песочницы; `update <тег>` меняет её содержимое на месте. Старые копии по тегам
+# (`canon-v*`) удаляются после переключения. Номер формата своего состояния: у тега другой —
+# выпуск несовместим, обновление ждёт полного простоя (#311).
+COPY, OLD_COPIES = Path(".canon/canon"), "canon-v*"
+CANON_URL = "https://github.com/alexkabchina-arch/workflow.git"
+STATE_VERSION = 1
+VERSION_LINE = re.compile(r"^STATE_VERSION\s*(?::\s*int\s*)?=\s*(\d+)\b", re.M)
+# Ожидание конца запусков (запуск — до `RUN_TIME`) и опрос, секунды; переменные — для тестов.
+UPDATE_WAIT = RUN_TIME + 600
+UPDATE_POLL = float(os.environ.get("CANON_UPDATE_POLL") or 30)
 # `caffeinate` (#222): Mac не спит, пока есть занятые места, очередь или вопрос владельцу в
 # рабочем окне. Срок `-t` (`AWAKE_FOR`, после `REVIEW_TIMEOUT`) — дольше ревью ошибок внутри
 # такта; без тактов (служба снята, такт упал) Mac снова уснёт; старше `AWAKE_RENEW` — новый.
@@ -405,6 +449,7 @@ def load(name: str, filename: str):
 
 start = load("canon_session_start_orchestrator", "session-start")
 core = start.core
+claims = core.claims  # владения и флаги брифа (#289: разбор общий с `ticket ship`)
 asks = load("canon_ticket_ask_orchestrator", "ticket_ask.py")
 table = load("canon_ticket_status_orchestrator", "ticket_status.py")  # строки «статуса»
 ship = load("canon_ticket_ship_orchestrator", "ticket_ship.py")  # правила конфликта догона
@@ -548,7 +593,13 @@ class Route(core.State):
             if not isinstance(self.data.get(key), (str, type(None))):
                 damaged.append(key)
                 self.data[key] = None
-        for key, fields in (("question", ("stamp", "url")), ("ready", ("head",)), ("checks", ())):
+        fields_of = (
+            ("question", ("stamp", "url")),
+            ("ready", ("head",)),
+            ("checks", ()),
+            ("fresh", ("stamp",)),
+        )
+        for key, fields in fields_of:
             value = self.data.get(key)
             if value is None:
                 continue
@@ -648,6 +699,27 @@ def parse_time(text) -> datetime | None:
 def moment(when: datetime) -> str:
     """Время для причины паузы: «ДД.ММ ЧЧ:ММ» местного времени."""
     return when.astimezone().strftime("%d.%m %H:%M")
+
+
+def snapshot_time(text: str) -> datetime | None:
+    """Время снимка копии прода — отметка `SNAPSHOT`: `Z` и пояс `+07`, `+0700` — как `+07:00`,
+    доли секунды отбрасываются (Python до 3.11 их не разбирает), без пояса — местное; не
+    разобрать — None."""
+    text = re.sub(r"(:\d{2})\.\d+", r"\1", text.replace(" ", "T", 1))
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    elif found := re.search(r"([+-]\d{2})(\d{2})?$", text):
+        text = f"{text[: found.start()]}{found.group(1)}:{found.group(2) or '00'}"
+    return parse_time(text)
+
+
+def later(have: str | None, mine: str | None) -> bool:
+    """Снимок `have` новее `mine` (#307): другой и позже по времени; время не разобрать или
+    `mine` неизвестен — новее по несовпадению."""
+    if not have or have == mine:
+        return False
+    when, then = snapshot_time(have), snapshot_time(mine) if mine else None
+    return when is None or then is None or when > then
 
 
 def seconds_since(since: str) -> float:
@@ -876,11 +948,13 @@ class Orchestrator:
         self.reset()
 
     def reset(self) -> None:
-        """Кэш такта: песочница (`sbx ls`), процессы внутри, свой клон, подготовка песочницы."""
+        """Кэш такта: песочница (`sbx ls`), процессы внутри, свой клон, подготовка песочницы,
+        копия прода по запросам сессий (`fresh_copy`)."""
         self.entry: dict | None = None
         self.procs: list[dict] | None = None
         self.fetched = False
         self.prepared = False
+        self.fresh_answer: dict | None = None
 
     def route(self, n: int) -> Route:
         """Состояние маршрута тикета — в клоне песочницы."""
@@ -1324,6 +1398,7 @@ class Orchestrator:
         except Failure as exc:
             self.prepared = exc
             raise
+        self.browser()
         self.seed()
         self.prepared = True
 
@@ -1370,49 +1445,160 @@ class Orchestrator:
                 images = image_names(own, names_from)
         loaded = record.setdefault("images", {})
         for image in images:
-            res = run("docker", "image", "inspect", "-f", "{{.Id}}", image, env=without_tokens())
-            if res.returncode != 0:
-                raise Failure(f"образа {image} на Mac нет: {tail(res.stderr)}")
-            have = res.stdout.strip()
-            inner = self.inside("docker", "image", "inspect", "-f", "{{.Id}}", image)
-            if loaded.get(image) == have and inner.returncode == 0:
-                continue
-            save = subprocess.Popen(
-                ["docker", "save", image], stdout=subprocess.PIPE, env=without_tokens()
-            )
-            try:
-                load = subprocess.run(
-                    ["sbx", "exec", "-i", self.box.name, "docker", "load"],
-                    stdin=save.stdout,
-                    capture_output=True,
-                    text=True,
-                    env=without_tokens(),
-                    timeout=BUILD_TIMEOUT,
-                )
-            except subprocess.TimeoutExpired:
-                save.kill()
-                raise Failure(f"образ {image} не загружен за {BUILD_TIMEOUT // 60} мин") from None
-            finally:
-                save.stdout.close()
-            if save.wait() != 0 or load.returncode != 0:
-                raise Failure(f"образ {image} не загружен в песочницу: {tail(load.stderr)}")
-            loaded[image] = have
-            say(f"образ {image} загружен в песочницу ({have[:19]})")
+            loaded[image] = self.load_image(image, loaded.get(image))
         # Имена по хешу зависимостей сменяются — прежние в состоянии не копятся. Внутри образ не
         # удаляется: тикет на старой основе ищет старый (docs/orchestrator.md).
         record["images"] = {k: v for k, v in loaded.items() if k in images}
 
-    def seed(self) -> None:
-        """База-шаблон на места — раз в местные сутки, перед первым запуском: вывод
-        `canon.sandboxSeedFrom` (на Mac, в главном чекауте — шаблон у Docker владельца) — на вход
-        `canon.sandboxSeedInto` (внутри песочницы, в клоне). Сбой — строка, не сбой запуска:
-        сессия идёт со старым шаблоном или без него; повтор — в следующие сутки."""
-        source, target = self.config(SEED_FROM_KEY), self.config(SEED_INTO_KEY)
+    def load_image(self, image: str, before: str | None) -> str:
+        """Образ с Mac — внутрь (`docker save` → `docker load`), если его id на Mac не `before`
+        (id прошлой загрузки) или внутри его нет; итог — id. Сбой — `Failure`."""
+        res = run("docker", "image", "inspect", "-f", "{{.Id}}", image, env=without_tokens())
+        if res.returncode != 0:
+            raise Failure(f"образа {image} на Mac нет: {tail(res.stderr)}")
+        have = res.stdout.strip()
+        inner = self.inside("docker", "image", "inspect", "-f", "{{.Id}}", image)
+        if before == have and inner.returncode == 0:
+            return have
+        save = subprocess.Popen(
+            ["docker", "save", image], stdout=subprocess.PIPE, env=without_tokens()
+        )
+        try:
+            load = subprocess.run(
+                ["sbx", "exec", "-i", self.box.name, "docker", "load"],
+                stdin=save.stdout,
+                capture_output=True,
+                text=True,
+                env=without_tokens(),
+                timeout=BUILD_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            save.kill()
+            raise Failure(f"образ {image} не загружен за {BUILD_TIMEOUT // 60} мин") from None
+        finally:
+            save.stdout.close()
+        if save.wait() != 0 or load.returncode != 0:
+            raise Failure(f"образ {image} не загружен в песочницу: {tail(load.stderr)}")
+        say(f"образ {image} загружен в песочницу ({have[:19]})")
+        return have
+
+    def browser(self) -> None:
+        """Браузер для `/verify` (#292): образ Playwright версии pin проекта — его имя печатает
+        `canon.sandboxBrowser` в своём клоне на `origin/main` (`image_names`, ровно одно). Нет на
+        Mac — `docker pull`; внутрь — как образы проекта (`load_image`), id — `sandbox.browser`
+        состояния; имя уходит сессиям переменной `CANON_BROWSER_IMAGE`. Сбой — строка, не сбой
+        запуска: сессии идут с прежним загруженным образом (запись прошлой загрузки цела —
+        временный сбой не гонит 3,7 ГБ заново), а без него — без браузера, и тикет с интерфейсом
+        остановится на `/verify`. `docker pull` — с пределом `PULL_TIMEOUT`: подвисший реестр не
+        держит такт полчаса."""
         record = self.data.setdefault("sandbox", {})
-        today = local_now().date().isoformat()
-        if not (source and target) or record.get("seeded") == today:
+        command = self.config(BROWSER_KEY)
+        if not command:
+            record.pop("browser", None)
             return
-        record["seeded"] = today
+        previous = record.get("browser") or {}
+        before = previous.get("id")
+        try:
+            own = self.own_repo()
+            res = self.git("checkout", "-q", "--force", "--detach", "origin/main")
+            if res.returncode != 0:
+                raise Failure(f"свой клон на origin/main: {tail(res.stderr)}")
+            names = image_names(own, command, BROWSER_KEY)
+            if len(names) != 1:
+                raise Failure(f"`{BROWSER_KEY}`: нужно одно имя образа, а их {len(names)}")
+            (image,) = names
+            if run("docker", "image", "inspect", image, env=without_tokens()).returncode != 0:
+                res = run("docker", "pull", image, env=without_tokens(), timeout=PULL_TIMEOUT)
+                if res.returncode != 0:
+                    raise Failure(f"docker pull {image}: {tail(res.stderr or res.stdout)}")
+            if previous.get("image") != image:
+                before = None
+            record["browser"] = {"image": image, "id": self.load_image(image, before)}
+        except (Failure, subprocess.TimeoutExpired) as exc:
+            then = (
+                f"сессии идут с прежним {previous['image']}"
+                if previous.get("image")
+                else "сессии идут без него, тикет с интерфейсом остановится на /verify"
+            )
+            say(f"браузер для /verify не готов: {exc} — {then}")
+
+    def seed(self, force: bool = False) -> str:
+        """База-шаблон на места перед первым запуском такта: вывод `canon.sandboxSeedFrom` (на
+        Mac, в главном чекауте — шаблон у Docker владельца) — на вход `canon.sandboxSeedInto`
+        (внутри песочницы, в клоне). Шаблон живёт в томах Docker песочницы и уходит с ней
+        (`sandbox rm`), поэтому удачный перенос записан сутками, `id` песочницы из `sbx ls` и
+        временем снимка (`seeded`, #306, #307). В песочницу без шаблона (другой `id` —
+        пересоздана) перенос идёт на первом такте с запуском, хоть сегодня его уже переносили, а
+        сбой повторяется на следующем: сессиям нечего клонировать. `sbx` без `id` — раз в сутки.
+
+        С `canon.sandboxSeedRefresh` (#307) перед переносом — обновление шаблона на Mac
+        (`refresh`; `force` — по запросу сессии, сейчас), время снимка — из его вывода: шаблон в
+        песочнице того же снимка — переноса нет, новый снимок — перенос; сбой переноса — строка,
+        повтор — в следующие сутки или с новым снимком. Сбой обновления — строка: песочница с
+        шаблоном остаётся со старым снимком, без шаблона — получает шаблон Mac как есть. Без
+        настройки или без времени в выводе шаблон, который в песочнице есть, освежается раз в
+        сутки; сбой — строка, не сбой запуска: сессии идут со старым, повтор — в следующие сутки
+        (`seed_tried`). Итог — для ответа на запрос сессии: `refreshed` (перенесён), `unchanged`
+        (тот же снимок), `failed` (обновление не удалось), `not-moved` (перенос не удался),
+        `no-refresh` (нечем обновить), `none` (шаблона у проекта нет)."""
+        source, target = self.config(SEED_FROM_KEY), self.config(SEED_INTO_KEY)
+        command = self.config(SEED_REFRESH_KEY)
+        if not (source and target):
+            return "none"
+        if force and not command:
+            return "no-refresh"
+        record = self.data.setdefault("sandbox", {})
+        today, box = local_now().date().isoformat(), self.sandbox_entry().get("id")
+        seeded = record.get("seeded")
+        # Запись до #306 — сутки строкой, без `id`: куда шёл перенос, неизвестно — как в новую.
+        here = isinstance(seeded, dict) and seeded.get("box") == box
+        snapshot, outcome = None, "refreshed"
+        if not command:
+            record.pop("refresh_failed", None)  # настройку убрали — прошлый сбой не про сейчас
+        else:
+            if force:
+                record["forced"] = stamp()  # принудительный снимок — не чаще `FORCE_GAP`
+            try:
+                snapshot = self.refresh(command, force)
+            except Failure as exc:
+                record["refresh_failed"] = {"at": stamp(), "why": str(exc)}
+                old = core.copy_phrase(seeded.get("stamp")) if here else ""
+                kept = f"сессии идут со старой копией, {old}" if here else "перенос как есть"
+                say(f"копия прода не обновлена — {exc}; {kept}")
+                if here:
+                    return "failed"
+                outcome = "failed"
+            else:
+                when = snapshot_time(snapshot) if snapshot else None
+                if when is not None and (now() - when).total_seconds() > COPY_STALE:
+                    why = (
+                        f"снимок от {snapshot} старше суток: команда его не обновила (например, "
+                        "замок у другого прогона)"
+                    )
+                    record["refresh_failed"] = {"at": stamp(), "why": why}
+                    say(f"копия прода не обновлена — {why}")
+                else:
+                    record.pop("refresh_failed", None)
+        tried = record.get("seed_tried")
+        if here and snapshot is not None:
+            if snapshot == seeded.get("stamp"):
+                return "unchanged"  # шаблон в песочнице — того же снимка
+            if not force and tried == today and record.get("seed_tried_stamp") == snapshot:
+                return "not-moved"  # этот снимок сегодня не перенёсся — повтор в следующие сутки
+        elif here and not force and today in (seeded.get("day"), tried):
+            return "unchanged"
+        record["seed_tried"], record["seed_tried_stamp"] = today, snapshot
+        if why := self.transfer(source, target):
+            retry = "в следующие сутки, сессии — со старой" if here else "на следующем запуске"
+            say(f"база-шаблон в песочницу не перенесена — {why}; повтор — {retry}")
+            return "failed" if outcome == "failed" else "not-moved"
+        record["seeded"] = {"day": today, "box": box, "stamp": snapshot}
+        say("база-шаблон перенесена в песочницу" + (f": снимок от {snapshot}" if snapshot else ""))
+        return outcome
+
+    def transfer(self, source: str, target: str) -> str | None:
+        """Перенос шаблона: вывод `source` на Mac, в главном чекауте, — на вход `target` внутри
+        песочницы, в клоне, потоком. Удался — None, иначе причина."""
         dump = subprocess.Popen(
             ["sh", "-c", source], cwd=self.main, stdout=subprocess.PIPE, env=without_tokens()
         )
@@ -1431,9 +1617,104 @@ class Orchestrator:
         finally:
             dump.stdout.close()
         if dump.wait() != 0 or load.returncode != 0:
-            why = tail(load.stderr or load.stdout) or f"код {dump.returncode}"
-            return say(f"база-шаблон в песочницу не перенесена — {why}; сессии — без свежей")
-        say("база-шаблон перенесена в песочницу")
+            return tail(load.stderr or load.stdout) or f"код {dump.returncode}"
+        return None
+
+    def refresh(self, command: str, force: bool = False) -> str | None:
+        """Обновление шаблона на Mac (`canon.sandboxSeedRefresh`, #307) в главном чекауте:
+        снимок прода, если ему больше суток; `force` — сейчас (`CANON_SEED_FORCE=1`). Итог —
+        время снимка, последняя отметка ISO 8601 в выводе команды; отметки нет — None и строка.
+        Ненулевой код или дольше `BUILD_TIMEOUT` — `Failure`."""
+        env = without_tokens()
+        env.pop(SEED_FORCE_ENV, None)
+        if force:
+            env[SEED_FORCE_ENV] = "1"
+        out = shell_command(self.main, command, f"`{SEED_REFRESH_KEY}`", env=env)
+        found = SNAPSHOT.findall(out)
+        if not found:
+            say(f"`{SEED_REFRESH_KEY}`: времени снимка в выводе нет — шаблон раз в сутки")
+            return None
+        return found[-1]
+
+    def snapshot(self) -> str | None:
+        """Время снимка базы-шаблона в этой песочнице (#307): перенос записан для её `id`; время
+        неизвестно или шаблона в ней нет — None."""
+        seeded = self.data.get("sandbox", {}).get("seeded")
+        if isinstance(seeded, dict) and seeded.get("box") == self.sandbox_entry().get("id"):
+            return seeded.get("stamp")
+        return None
+
+    def fresh_copy(self) -> dict:
+        """Копия прода по запросу сессии (#307): принудительное обновление шаблона на Mac и
+        перенос (`seed` с `force`) — не чаще раза в `FORCE_GAP` (попытка считается и при сбое:
+        нагрузка на прод), в такт — одно на все запросы. Снимок прода и перенос — минуты: перед
+        ними `caffeinate` продлевается, после — токен сессий выдаётся заново (`session_env`).
+        Итог — время снимка в песочнице (`copy`), перенесён ли новый (`refreshed`), что сделано
+        (`outcome`) и текст для задания (`note`)."""
+        if self.fresh_answer is not None:
+            return self.fresh_answer
+        last = parse_time(self.data.setdefault("sandbox", {}).get("forced"))
+        gap = timedelta(seconds=FORCE_GAP)
+        if last is not None and now() < last + gap and self.config(SEED_REFRESH_KEY):
+            outcome = "soon"
+        else:
+            self.try_keep_awake()  # такт с ревью соседа и снимком прода переживёт срок прошлого
+            outcome = self.seed(force=True)
+            self.env = None  # токен, выданный до снимка, к концу такта мог устареть
+        copy = self.snapshot()
+        have = core.copy_phrase(copy)
+        notes = {
+            "refreshed": f"Копия прода обновлена: {have}.",
+            "unchanged": "Копия прода не изменилась — команда проекта не сняла новый снимок; в "
+            f"песочнице {have}.",
+            "failed": "Обновить копию прода не вышло (причина — в выводе такта оркестратора); в "
+            f"песочнице прежняя копия, {have}.",
+            "not-moved": "Новый снимок не перенесён в песочницу (причина — в выводе такта "
+            f"оркестратора); в песочнице прежняя копия, {have}.",
+            "soon": f"Принудительное обновление было {moment(last) if last else '?'} — "
+            f"следующее не раньше {moment(last + gap) if last else '?'}; в песочнице {have}.",
+            "no-refresh": f"У проекта нет команды обновления копии прода (`{SEED_REFRESH_KEY}`); "
+            f"в песочнице {have}.",
+            "none": f"У проекта нет базы-шаблона (`{SEED_FROM_KEY}`, `{SEED_INTO_KEY}`) — копии "
+            "прода в песочнице нет.",
+        }
+        refreshed = outcome == "refreshed"
+        note = notes[outcome]
+        self.fresh_answer = {"copy": copy, "refreshed": refreshed, "outcome": outcome, "note": note}
+        return self.fresh_answer
+
+    def serve_fresh(self, n: int, t: dict) -> None:
+        """Запрос свежей копии прода от идущей сессии (`ticket fresh N`, #307) — ответ файлом
+        рядом с состоянием маршрута (`fresh.json`), сессия ждёт его в своём вызове. Снимок в
+        песочнице новее копии сессии (запрос её называет) — ответ сразу, без снимка прода; иначе
+        — копия на Mac (`fresh_copy`). `new_copy` — в песочнице снимок новее копии сессии: базу
+        пересоздать. Каждый запрос — один раз (`fresh_seen`, после записи ответа: сбой по пути —
+        повтор на следующем такте). Состояние не прочитано — строка: сессия идёт, разбор — когда
+        она кончится."""
+        try:
+            st = self.route(n)
+        except core.Failure as exc:
+            return say(f"#{n}: запрос свежей копии не прочитан — {exc}")
+        request = st["fresh"]
+        if not request or request["stamp"] == t.get("fresh_seen"):
+            return
+        mine = request.get("copy") if isinstance(request.get("copy"), str) else None
+        have = self.snapshot()
+        if later(have, mine):
+            note = (
+                f"В песочнице копия прода новее твоей: снимок от {have}, снимка прода по запросу "
+                "не было; нужна ещё свежее — запроси снова."
+            )
+            copy = {"copy": have, "refreshed": False, "outcome": "newer", "note": note}
+        else:
+            copy = self.fresh_copy()
+        new = later(copy["copy"], mine) or (copy["refreshed"] and copy["copy"] is None)
+        answer = {"request": request["stamp"], "at": stamp(), "new_copy": new, **copy}
+        data = json.dumps(answer, ensure_ascii=False).encode()
+        write_inside(self.clone, st.rel / core.FRESH_ANSWER, data, 0o644)  # читает сессия
+        t["fresh_seen"] = request["stamp"]
+        say(f"#{n}: запрос свежей копии прода — {answer['note']}")
+        self.session_env()  # после снимка прода — токен сессий заново (`fresh_copy`)
 
     def config(self, key: str) -> str:
         return core.run("git", "-C", str(self.main), "config", "--get", key).stdout.strip()
@@ -1838,11 +2119,7 @@ class Orchestrator:
         ещё понадобится их сессия, — у них есть сессия в состоянии (на месте, в очереди, на
         вопросе, остановке, CI или мёрже — до слияния); пересоздание песочницы удалит её
         транскрипт. Без «паузы» владельца простой — на сейчас: следующий такт может взять тикет."""
-        risk = [
-            f"#{key} ({self.where(int(key), t)})"
-            for key, t in sorted(self.data["tickets"].items(), key=lambda kv: int(kv[0]))
-            if t.get("session")
-        ]
+        risk = self.at_risk()
         if not risk and self.owner_file(OWNER_PAUSE) is None:
             return "Простой полный, но паузы нет: сначала `orch pause`, затем обновлять"
         if not risk:
@@ -1851,6 +2128,22 @@ class Orchestrator:
             f"Сессии пропадут при пересоздании песочницы: {'; '.join(risk)} — обновлять копию "
             "канона рано (docs/orchestrator.md, «Обновление канона»)"
         )
+
+    def at_risk(self) -> list[str]:
+        """Тикеты, которым ещё понадобится их сессия: номер и шаг у оркестратора."""
+        return [
+            f"#{key} ({self.where(int(key), t)})"
+            for key, t in sorted(self.data["tickets"].items(), key=lambda kv: int(kv[0]))
+            if t.get("session")
+        ]
+
+    def running_runs(self) -> list[str]:
+        """Тикеты с живым запуском сессии (`live`) — их обновление копии канона ждёт."""
+        return [
+            f"#{key}"
+            for key, t in sorted(self.data["tickets"].items(), key=lambda kv: int(kv[0]))
+            if (t.get("runs") or []) and self.live(t["runs"][-1])
+        ]
 
     def owner_now(self) -> None:
         """«Работай сейчас»: «пауза» снята, расписание переопределено до ближайшей границы окна
@@ -2014,7 +2307,10 @@ class Orchestrator:
         last = parse_time(self.data.get("updated"))
         print(f"Последний такт: {moment(last) if last else 'не было'}")
         print(f"Служба: {self.service_state()}")
+        print(f"Копия канона: {copy_version(HERE.parents[2])} ({HERE.parents[2]})")
         print(f"Песочница: {self.sandbox_state()}")
+        if (copy := self.copy_state()) is not None:
+            print(f"Копия прода: {copy}")
         print(self.idle())
         awake = self.data.get("awake")
         held = isinstance(awake, dict) and alive(awake)
@@ -2026,6 +2322,25 @@ class Orchestrator:
             return f"{self.box.name} — {self.sandbox_entry().get('status')}"
         except Failure as exc:
             return str(exc)
+
+    def copy_state(self) -> str | None:
+        """Копия прода для «статуса» (#307): время снимка базы-шаблона в песочнице и сбой
+        последнего обновления; базы-шаблона у проекта нет — None. Песочница — та, что прочла
+        строка «Песочница» (`entry`): не прочлась — время по записи, без второго `sbx ls`."""
+        if not (self.config(SEED_FROM_KEY) and self.config(SEED_INTO_KEY)):
+            return None
+        seeded = self.data.get("sandbox", {}).get("seeded")
+        recorded = seeded.get("stamp") if isinstance(seeded, dict) else None
+        if self.entry is None:
+            text = f"{core.copy_phrase(recorded)} (по записи: песочница не прочитана)"
+        elif isinstance(seeded, dict) and seeded.get("box") == self.entry.get("id"):
+            text = core.copy_phrase(recorded)
+        else:
+            text = "в песочнице шаблона нет — перенос на следующем запуске"
+        if failed := self.data.get("sandbox", {}).get("refresh_failed"):
+            when = parse_time(failed.get("at"))
+            text += f"; не обновлена {moment(when) if when else '?'} — {failed.get('why')}"
+        return text
 
     def current_pauses(self) -> dict[str, str]:
         """Паузы на сейчас для «статуса»: истёкшие (`until` прошло) не показываются; «пауза»
@@ -2088,11 +2403,23 @@ class Orchestrator:
             loaded = self.service_loaded()
         except Failure:
             return "неизвестно (нет `launchctl`)"
+        if (other := self.service_script()) is not None and other != str(HERE / "orchestrator"):
+            # Служба из другой копии канона (#300): такты идут её скриптами, не этими.
+            where = "стоит" if loaded else "не загружена"
+            return (
+                f"{where}, но из другой копии канона: {other}, а эта — {HERE / 'orchestrator'} — "
+                "`orchestrator update <тег>` (docs/orchestrator.md, «Обновление канона»)"
+            )
         if loaded:
             return "стоит"
         if self.service_plist().exists():
             return "не загружена (plist есть) — `orchestrator service install`"
         return "не стоит"
+
+    def service_script(self) -> str | None:
+        """Скрипт такта в plist службы; plist нет или он не разобран — None."""
+        args = plist_args(read_plist(self.service_plist()))
+        return args[1] if len(args) > 1 else None
 
     def service_unload(self) -> None:
         """`launchctl bootout` и ожидание, пока служба выгрузится (`bootout` идущего задания
@@ -2522,6 +2849,19 @@ class Orchestrator:
         self.data["queue"].append(n)
         self.data["tickets"][str(n)] = fresh()
         say(f"#{n}: в очереди")
+        self.tell_alone(n)
+
+    def tell_alone(self, n: int) -> None:
+        """Взятый в очередь тикет без строк «Владения» и «Флаги» по образцу пойдёт один — об этом
+        один комментарий в тикет без упоминания (#289): в логе оркестратора владелец его не
+        увидит. Сбой — только в лог: тикет уже в очереди, комментарий не повторяется."""
+        try:
+            if self.claims_of(n) is not None:  # тикет только что взят: читается заново
+                return
+            self.comment(n, ALONE)
+        except (core.Failure, *COMMAND_ERRORS) as exc:
+            return say(f"#{n}: комментарий «тикет пойдёт один» не записан — {exc}")
+        say(f"#{n}: строк «Владения» и «Флаги» нет — пойдёт один, в тикете комментарий")
 
     def answered(self) -> list[str]:
         """Тикеты с вопросом владельцу: ответ в тикете — в очередь раньше новых, за другими
@@ -2659,7 +2999,10 @@ class Orchestrator:
         for other in others:
             theirs = self.claims_of(other)
             if mine is None:
-                why = "в брифе нет строк «Владения» и «Флаги» по образцу — тикет идёт один"
+                why = (
+                    "в брифе нет строк «Владения» и «Флаги» по образцу (и в комментарии "
+                    "владельца) — тикет идёт один"
+                )
             elif theirs is None:
                 why = f"#{other} идёт один: в его брифе нет строк «Владения» и «Флаги» по образцу"
             elif clash := conflict(mine, theirs):
@@ -2679,12 +3022,18 @@ class Orchestrator:
         return t.get("phase") == "question" or self.waits_answer(n)
 
     def claims_of(self, n: int, fresh: bool = False) -> dict | None:
-        """Владения и флаги тикета из брифа; `fresh` — бриф заново (тикет занимает место),
-        иначе — запомненные при прошлом чтении."""
+        """Владения и флаги тикета из брифа, а нет в нём строк по образцу — из последнего
+        нескрытого комментария владельца репозитория с обеими строками (#289); `fresh` — заново
+        (тикет в очереди занимает место), иначе — запомненные при прошлом чтении: идущий тикет
+        не перечитывается."""
         t = self.ticket(n)
         if fresh or "claims" not in t:
             found = core.gh_json("issue", "view", str(n), "--json", "body") or {}
             t["claims"] = claims(found.get("body"))
+            if t["claims"] is None:  # лента комментариев — только когда в теле строк нет
+                said = core.gh_json("issue", "view", str(n), "--json", "comments") or {}
+                owner = self.repo.split("/")[0]
+                t["claims"] = core.owner_claims(said.get("comments") or [], owner)
         return t["claims"]
 
     def begin(self, n: int) -> None:
@@ -2749,7 +3098,10 @@ class Orchestrator:
         задание оркестратора — `--prompt` (и новой сессии вместо потерянной), иначе `/start N`;
         `--max-budget-usd` — наименьший из предела запуска и остатка предела тикета."""
         t = self.ticket(n)
-        spent = self.costs(t, self.route(n))["limit"]
+        st = self.route(n)
+        spent = self.costs(t, st)["limit"]
+        if request := st["fresh"]:  # запрос прошлого запуска (#307): его ответа никто не ждёт
+            t["fresh_seen"] = request["stamp"]
         if exhausted(spent):
             return self.stop(
                 n,
@@ -2771,6 +3123,10 @@ class Orchestrator:
         self.sandbox_entry()  # граница — до подготовки: шаблон в не ту песочницу не уйдёт
         self.prepare()  # образы проекта и база-шаблон — до первого запуска такта
         env = self.session_env()
+        if browser := self.data.get("sandbox", {}).get("browser"):
+            env[BROWSER_ENV] = browser["image"]  # рецепт `/verify` запускает драйвер в нём
+        if snapshot := self.snapshot():
+            env[core.PROD_COPY] = snapshot  # время копии прода — в свидетельства маршрута (#307)
         cmd = ["sbx", "exec", "-w", str(self.clone)]
         for key, value in env.items():
             cmd += ["-e", f"{key}={value}"]
@@ -2860,6 +3216,7 @@ class Orchestrator:
                 since=last["started"],
             )
             self.session_env()  # токен сессии свежим: запуск дольше часа не падает на push
+            self.serve_fresh(n, t)  # сессия ждёт свежую копию прода (#307)
             return
         summary = self.finish_run(t, last)
         st = self.route(n)
@@ -3244,6 +3601,7 @@ class Orchestrator:
             self.data["tickets"][str(n)] = fresh(prd=p)
             prd["taken"].append(n)
             say(f"#{n}: тикет PRD #{p} — в очереди")
+            self.tell_alone(n)
         if [n for n in prd["taken"] if str(n) in self.data["tickets"]]:
             prd.pop("stalled", None)
         elif waiting:
@@ -3653,33 +4011,6 @@ def blockers(body: str | None, repo: str) -> list[int]:
     return refs(section(body, "Blocked by"), repo)
 
 
-def claims(body: str | None) -> dict | None:
-    """Владения и флаги брифа по образцу `.claude/canon/ticket-ownership.md`: по одной строке
-    `**Владения:**` (пути в обратных кавычках через запятую) и `**Флаги:**` (`нет` или слова из
-    `FLAGS`). Строки нет, их несколько или она не по образцу (слова вместо путей, маска, `.`) —
-    None: тикет идёт один."""
-    owns, flags = OWNS_LINE.findall(body or ""), FLAGS_LINE.findall(body or "")
-    if len(owns) != 1 or len(flags) != 1:
-        return None
-    paths = []
-    for item in owns[0].strip().rstrip(".").split(","):
-        found = re.fullmatch(r"`([^`\s]+)`", item.strip())
-        if not found:
-            return None
-        path = re.sub(r"^(\./)+|^/+", "", found.group(1))
-        # Маска (`src/*.py`) и весь репозиторий (`.`) буквально с путями не сравнить.
-        parts = path.rstrip("/").split("/")
-        if not path or re.search(r"[*?\[\]]", path) or "." in parts or ".." in parts:
-            return None
-        paths.append(path)
-    words = [w.strip().lower() for w in flags[0].strip().rstrip(".").split(",")]
-    if words == ["нет"]:
-        words = []
-    if not all(w in FLAGS for w in words):
-        return None
-    return {"paths": paths, "flags": sorted(set(words))}
-
-
 def conflict(a: dict, b: dict) -> str | None:
     """Чем пересекаются владения и флаги двух тикетов; None — могут идти параллельно. Путь без
     `/` в конце может оказаться каталогом — сравнивается и как каталог."""
@@ -3753,13 +4084,16 @@ def write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
-def shell_command(cwd: Path, command: str, what: str, timeout: int = BUILD_TIMEOUT) -> str:
-    """Команда проекта из git config (`sh -c`) в `cwd` без токенов — её вывод; ненулевой код или
-    дольше `timeout` — `Failure` со строкой `what`, по пределу вся группа процессов убита."""
+def shell_command(
+    cwd: Path, command: str, what: str, timeout: int = BUILD_TIMEOUT, env: dict | None = None
+) -> str:
+    """Команда проекта из git config (`sh -c`) в `cwd` без токенов (`env` — окружение без них) —
+    её вывод; ненулевой код или дольше `timeout` — `Failure` со строкой `what`, по пределу вся
+    группа процессов убита."""
     proc = subprocess.Popen(
         ["sh", "-c", command],
         cwd=cwd,
-        env=without_tokens(),
+        env=without_tokens() if env is None else env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -3784,10 +4118,10 @@ def shell_command(cwd: Path, command: str, what: str, timeout: int = BUILD_TIMEO
     return out
 
 
-def image_names(cwd: Path, command: str) -> list[str]:
-    """Имена образов — вывод `canon.sandboxImagesFrom` (через запятую или по строке). Пустой
-    вывод или строка не в форме имени образа Docker (`-…`, пробел, предупреждение) — `Failure`."""
-    what = f"имена образов (`{IMAGES_FROM_KEY}`)"
+def image_names(cwd: Path, command: str, key: str = IMAGES_FROM_KEY) -> list[str]:
+    """Имена образов — вывод команды `key` (через запятую или по строке). Пустой вывод или
+    строка не в форме имени образа Docker (`-…`, пробел, предупреждение) — `Failure`."""
+    what = f"имена образов (`{key}`)"
     out = shell_command(cwd, command, what, NAMES_TIMEOUT)
     names = [x.strip() for x in re.split(r"[,\n]", out) if x.strip()]
     if not names:
@@ -3823,6 +4157,336 @@ def ci_green(pr: dict) -> bool:
     )
 
 
+# --- обновление копии канона (#300) ---
+
+
+def copy_version(root: Path) -> str:
+    """Версия копии канона: тег (`git describe`), не на теге — с коммитом; не git — «неизвестна»."""
+    res = run("git", "-C", str(root), "describe", "--tags", "--always")
+    return res.stdout.strip() if res.returncode == 0 and res.stdout.strip() else "неизвестна"
+
+
+def state_version(text: str) -> int:
+    """Номер формата состояния в тексте скрипта оркестратора; до #300 номера не было — 1."""
+    found = VERSION_LINE.search(text)
+    return int(found.group(1)) if found else 1
+
+
+def read_plist(path: Path) -> dict | None:
+    """plist службы; нет, не читается или не разобран (и обрезанный XML) — None."""
+    try:
+        data = plistlib.loads(path.read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException, ExpatError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def plist_args(data: dict | None) -> list[str]:
+    """`ProgramArguments` службы: интерпретатор, скрипт такта, `tick`; не список — пусто."""
+    args = (data or {}).get("ProgramArguments")
+    return [str(a) for a in args] if isinstance(args, list) else []
+
+
+def services() -> list[tuple[Path, dict]]:
+    """Службы оркестратора на машине — plist в `~/Library/LaunchAgents`: файл и содержимое.
+    Не разобранный plist и plist без главного чекаута — строка, служба не обновляется."""
+    found = []
+    for plist in sorted((Path.home() / LAUNCH_AGENTS).glob("canon.orchestrator.*.plist")):
+        data = read_plist(plist)
+        main = Path(str((data or {}).get("WorkingDirectory") or ""))
+        if data is None:
+            say(f"служба {plist.name} не разобрана — не обновляется")
+        elif not data.get("WorkingDirectory") or not main.is_dir():
+            say(f"служба {plist.name}: главного чекаута {main} нет — не обновляется")
+        else:
+            found.append((plist, data))
+    return found
+
+
+class Update:
+    """`update <тег>`: копия канона по постоянному адресу — на тег, на месте (#300). Проекты — по
+    службам оркестратора на машине. Совместимый выпуск: пауза, ожидание конца идущих запусков и
+    тактов, службы сняты, копия на теге, службы переставлены, пауза снята — сессии тикетов в
+    песочнице целы. Несовместимый (номер формата состояния другой или `--incompatible`) и переезд
+    (копии ещё нет, песочница смонтирована не на неё) — ждёт полного простоя (пауза — только у
+    простаивающих проектов), затем то же и пересоздание песочниц. Не дождались — сбой, ничего не
+    изменено, своя пауза снята."""
+
+    def __init__(self, tag: str, wait: float, incompatible: bool):
+        self.tag, self.wait, self.forced = tag, wait, incompatible
+        self.copy = Path.home() / COPY
+        self.script = self.copy / "project/scripts/canon/orchestrator"
+        self.projects = [(plist, Path(d["WorkingDirectory"]), d) for plist, d in services()]
+        self.mark = f"update {tag} {os.getpid()}"  # своя пауза: чужую (владельца) не снимать
+        self.paused: list[Path] = []  # каталоги состояния, где паузу поставила эта команда
+        self.unloaded: list[tuple[Orchestrator, Path, dict]] = []
+
+    def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        res = run("git", "-C", str(self.copy), *args)
+        if check and res.returncode != 0:
+            raise Failure(f"git {args[0]} в копии канона: {tail(res.stderr or res.stdout)}")
+        return res
+
+    def orch(self, main: Path) -> Orchestrator:
+        """Оркестратор проекта со свежим состоянием: каталог процесса — главный чекаут."""
+        os.chdir(main)
+        return Orchestrator()
+
+    def source(self) -> str:
+        """Откуда клонировать копию: `origin` репозитория этого скрипта, иначе GitHub канона."""
+        res = run("git", "-C", str(HERE), "remote", "get-url", "origin")
+        return res.stdout.strip() if res.returncode == 0 and res.stdout.strip() else CANON_URL
+
+    def prepare(self) -> list[str]:
+        """Копия есть — подтянуть теги; нет (или клон прошлой попытки без файлов) — клон без
+        checkout из репозитория этого скрипта. Итог — причины ждать полного простоя."""
+        if HERE.parents[1].name != "project":
+            raise Failure(
+                "update — из копии или чекаута канона (`<канон>/project/scripts/canon`), а не из "
+                "вендоренных в проект скриптов: копия склонировалась бы из репозитория проекта"
+            )
+        why, fresh = [], not self.script.exists()
+        if not fresh:
+            if HERE.parents[2].resolve() != self.copy.resolve():
+                raise Failure(
+                    f"запуск не из копии канона по постоянному адресу — нужен `{self.script} "
+                    f"update {self.tag}`: запуски сессий ищутся её скриптами"
+                )
+            if self.git("status", "--porcelain").stdout.strip():
+                raise Failure(f"в копии канона {self.copy} правки руками — копия не обновлена")
+        if (self.copy / ".git").exists():
+            if fresh:  # клон прошлой попытки: источник — этого запуска
+                self.git("remote", "set-url", "origin", self.source())
+            self.git("fetch", "-q", "--tags", "--force", "origin")
+        else:
+            self.copy.parent.mkdir(parents=True, exist_ok=True)
+            res = run("git", "clone", "-q", "--no-checkout", self.source(), str(self.copy))
+            if res.returncode != 0:
+                raise Failure(f"git clone копии канона: {tail(res.stderr or res.stdout)}")
+        have = None if fresh else self.git("show", "HEAD:project/scripts/canon/orchestrator").stdout
+        if fresh:
+            why.append(f"копии по постоянному адресу {self.copy} ещё нет — переезд")
+        if self.git(
+            "rev-parse", "-q", "--verify", f"{self.tag}^{{commit}}", check=False
+        ).returncode:
+            raise Failure(f"тега {self.tag} в копии канона нет")
+        new = self.git("show", f"{self.tag}:project/scripts/canon/orchestrator").stdout
+        if 'add_parser("update"' not in new:
+            raise Failure(
+                f"в {self.tag} нет `orchestrator update` (тег до #300): с копии на нём следующее "
+                "обновление этой командой не пошло бы — копия не обновлена"
+            )
+        if self.forced:
+            why.append("выпуск помечен несовместимым")
+        elif have is not None and state_version(have) != state_version(new):
+            why.append(
+                f"формат состояния {state_version(have)} → {state_version(new)}: выпуск несовместим"
+            )
+        elif not fresh:  # формат состояния маршрута тикета (`ticket_core`, #311) — тоже
+            route = "project/scripts/canon/ticket_core.py"
+            was = state_version(self.git("show", f"HEAD:{route}", check=False).stdout)
+            will = state_version(self.git("show", f"{self.tag}:{route}", check=False).stdout)
+            if was != will:
+                why.append(f"формат состояния маршрута {was} → {will}: выпуск несовместим")
+        return why
+
+    def boxes(self) -> dict[str, tuple[list[str], str]]:
+        """Песочницы на машине (`sbx ls`): имя → монтирования и состояние."""
+        try:
+            res = run("sbx", "ls", "--json", env=without_tokens(), timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise Failure(f"sbx ls: {exc}") from None
+        if res.returncode != 0:
+            raise Failure(f"sbx ls: {tail(res.stderr or res.stdout)}")
+        try:
+            listed = json.loads(res.stdout)
+        except ValueError:
+            raise Failure("sbx ls: ответ не JSON") from None
+        return {
+            str(b.get("name")): ([str(w) for w in b.get("workspaces") or []], str(b.get("status")))
+            for b in listed
+            if isinstance(b, dict)
+        }
+
+    def recreate(self) -> list[Path]:
+        """Проекты, чья песочница смонтирована не на копию по постоянному адресу (или её нет).
+        Идущая песочница на копии без службы своего проекта — сбой: её запусков не дождаться."""
+        boxes, copy = self.boxes(), self.copy.resolve()
+        found, own = [], set()
+        for _, main, _ in self.projects:
+            os.chdir(main)
+            box = sandbox.Sandbox()
+            own.add(box.name)
+            if boxes.get(box.name, ([], ""))[0] != [str(box.clone), f"{copy / 'project'}:ro"]:
+                found.append(main)
+        stray = [
+            name
+            for name, (mounts, status) in boxes.items()
+            if name not in own
+            and status == "running"
+            and any(Path(m.removesuffix(":ro")).resolve().is_relative_to(copy) for m in mounts)
+        ]
+        if stray:
+            raise Failure(
+                f"песочница {', '.join(stray)} на копии канона идёт, а службы её проекта нет — "
+                "запусков в ней не дождаться: `sbx stop` или `orchestrator service install` проекта"
+            )
+        return found
+
+    def pause(self, o: Orchestrator) -> None:
+        if o.owner_file(OWNER_PAUSE) is None:
+            o.dir.mkdir(parents=True, exist_ok=True)
+            write_json(o.dir / OWNER_PAUSE, {"since": stamp(), "by": self.mark})
+            self.paused.append(o.dir)
+
+    def unpause(self, only: Path | None = None) -> None:
+        """Своя пауза — снять; файл перезаписан владельцем (`orch pause`) — его пауза остаётся."""
+        for state in [p for p in self.paused if only in (None, p)]:
+            path = state / OWNER_PAUSE
+            try:
+                mine = json.loads(path.read_text(encoding="utf-8")).get("by") == self.mark
+            except (OSError, ValueError, AttributeError):
+                mine = False
+            if mine:
+                path.unlink(missing_ok=True)
+            self.paused.remove(state)
+
+    def busy(self, full: bool) -> list[str]:
+        """Что держит обновление: при полном простое — тикеты со своей сессией (пауза — только у
+        простаивающих проектов: у прочих она держала бы следующие запуски тикетов), иначе — живые
+        запуски сессий (пауза — везде). Пустой список — можно."""
+        found = []
+        for _, main, _ in self.projects:
+            o = self.orch(main)
+            if full and (risk := o.at_risk()):
+                self.unpause(o.dir)
+                found += [f"{main.name} {r}" for r in risk]
+                continue
+            self.pause(o)
+            if not full:
+                found += [f"{main.name} {r}" for r in o.running_runs()]
+        return found
+
+    def settle(self, full: bool) -> None:
+        """Дождаться: ничего не держит, службы сняты под замком такта (идущий такт доходит до
+        конца), и после снятия всё ещё ничего не держит; иначе службы — обратно и ждать дальше."""
+        deadline, said = time.monotonic() + self.wait, None
+        while True:
+            found = self.busy(full)
+            if not found:
+                for plist, main, data in self.projects:
+                    o = self.orch(main)
+                    with o.tick_lock():
+                        o.service_unload()
+                    self.unloaded.append((o, plist, data))
+                found = self.busy(full)
+                if not found:
+                    return
+                if lost := self.reload():
+                    raise Failure(f"службы не вернулись: {'; '.join(lost)}")
+            if time.monotonic() >= deadline:
+                what = "полного простоя" if full else "конца запусков сессий"
+                raise Failure(
+                    f"не дождались {what} за {int(self.wait)} с: {', '.join(found)} — копия не "
+                    "обновлена, повторите позже (docs/orchestrator.md, «Обновление канона»)"
+                )
+            if found != said:
+                say(f"ждём {'полного простоя' if full else 'конца запусков'}: {', '.join(found)}")
+                said = found
+            time.sleep(UPDATE_POLL)
+
+    def reload(self) -> list[str]:
+        """Снятые службы — обратно, прежним plist; итог — какие не встали."""
+        lost = []
+        for o, plist, _ in self.unloaded:
+            domain, target = o.service_target()
+            try:
+                o.launchctl("enable", target)
+                res = o.launchctl("bootstrap", domain, str(plist))
+                if res.returncode != 0 and not o.service_loaded():
+                    lost.append(
+                        f"{o.main.name}: launchctl bootstrap: {tail(res.stderr or res.stdout)}"
+                    )
+            except Failure as exc:
+                lost.append(f"{o.main.name}: {exc}")
+        self.unloaded = []
+        return lost
+
+    def call(self, main: Path, name: str, *args: str, service: dict | None = None) -> None:
+        """Скрипт копии канона (уже на теге) в главном чекауте проекта; сбой — сбой обновления.
+        `service` — прежний plist: Python и PATH службы — его, а не этого процесса."""
+        python, env = sys.executable, None
+        if service is not None:
+            prog = plist_args(service)
+            python = prog[0] if prog and Path(prog[0]).exists() else python
+            if path := (service.get("EnvironmentVariables") or {}).get("PATH"):
+                env = {**os.environ, "PATH": str(path)}
+        script = str(self.copy / "project/scripts/canon" / name)
+        res = run(python, script, *args, cwd=main, env=env)
+        print(res.stdout, end="")
+        if res.returncode != 0:
+            raise Failure(f"{main.name}: {name} {' '.join(args)}: {tail(res.stderr or res.stdout)}")
+
+    def apply(self) -> None:
+        full = self.prepare()
+        if recreate := self.recreate():
+            names = ", ".join(main.name for main in recreate)
+            full.append(f"песочница не на копии по постоянному адресу: {names}")
+        if not self.projects:
+            say("служб оркестратора на машине нет — обновляется только копия")
+        elif full:
+            say(f"ждём полного простоя — {'; '.join(full)}")
+        lost = []
+        try:
+            self.settle(bool(full))
+            self.git("checkout", "-q", "--detach", self.tag)
+            say(f"копия канона {self.copy} — на {self.tag}")
+            for main in recreate:
+                say(f"{main.name}: песочница пересоздаётся на копии по постоянному адресу")
+                self.call(main, "sandbox", "rm")
+                self.call(main, "sandbox", "up")
+            # Переставленная служба — из списка: сбой вернёт прежним plist только прочие.
+            for item in list(self.unloaded):
+                self.call(item[0].main, "orchestrator", "service", "install", service=item[2])
+                self.unloaded.remove(item)
+        finally:
+            self.unpause()
+            for why in (lost := self.reload()):
+                say(f"служба не вернулась — {why}: `orchestrator service install` в проекте")
+        if lost:
+            raise Failure(f"службы не вернулись: {'; '.join(lost)}")
+        self.tidy()
+        names = ", ".join(main.name for _, main, _ in self.projects) or "нет"
+        say(f"готово: копия канона {copy_version(self.copy)}, проекты: {names}")
+
+    def tidy(self) -> None:
+        """Старые копии по тегам — удалить, если на них не ссылается ни служба, ни песочница и в
+        них нет правок; иначе — строка."""
+        refs = [Path(a[1]).resolve() for _, d in services() if len(a := plist_args(d)) > 1]
+        try:
+            boxes = self.boxes()
+        except Failure as exc:
+            say(f"старые копии не тронуты: песочницы не прочитаны — {exc}")
+            return
+        refs += [Path(m.removesuffix(":ro")).resolve() for ms, _ in boxes.values() for m in ms]
+        for old in sorted((Path.home() / COPY.parent).glob(OLD_COPIES)):
+            if not old.is_dir():
+                continue
+            if used := [str(r) for r in refs if r.is_relative_to(old.resolve())]:
+                say(f"старая копия {old} оставлена: на неё ссылается {used[0]}")
+                continue
+            res = run("git", "-C", str(old), "status", "--porcelain")
+            if res.returncode != 0 or res.stdout.strip():
+                say(f"старая копия {old} оставлена: в ней правки или это не git")
+                continue
+            try:
+                shutil.rmtree(old)
+            except OSError as exc:
+                say(f"старая копия {old} не удалена — {exc}")
+                continue
+            say(f"старая копия {old} удалена")
+
+
 def inside_project(main: Path) -> bool:
     """Скрипт лежит в проекте, который ведёт, — в главном чекауте или его worktree."""
     for tree in start.worktrees():
@@ -3840,7 +4504,22 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="статус: тикеты, места, очередь, паузы с причинами")
     service = sub.add_parser("service", help="служба launchd: поставить или снять")
     service.add_argument("action", choices=("install", "remove"))
+    update = sub.add_parser("update", help="копия канона по постоянному адресу — на тег, на месте")
+    update.add_argument("tag", help="тег канона, например v2026.10.23.1")
+    update.add_argument(
+        "--wait", type=float, default=UPDATE_WAIT, help="сколько ждать, секунд (0 — не ждать)"
+    )
+    update.add_argument(
+        "--incompatible", action="store_true", help="выпуск несовместим: ждать полного простоя"
+    )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    if args.command == "update":  # машина целиком, а не проект: из любого каталога
+        try:
+            Update(args.tag, args.wait, args.incompatible).apply()
+        except (Failure, core.Failure, start.StartError, sandbox.Failure, OSError) as exc:
+            print(f"orchestrator: {exc}", file=sys.stderr)
+            return 1
+        return 0
     try:
         orch = Orchestrator()
         if inside_project(orch.main):

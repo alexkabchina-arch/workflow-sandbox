@@ -34,8 +34,9 @@
 отчёта — HEAD или его предок. Коммиты после head отчёта (исправления по находкам, тестам,
 `/verify`, возвратам) второго ревью не проходят — их проверяют тесты, CI и `/verify`; они видны в
 описании отметки (head отчёта и число коммитов) и списком в теле PR (решение канона
-`docs/decisions/2026-10-03-no-re-review.md`). Пропуск «только документы» перепроверяется по
-файлам до самого HEAD правилом `review`, ревью — по `modelUsage` на закреплённой модели. Нет
+`docs/decisions/2026-10-03-no-re-review.md`). Пропуск («только документы» или «чистая установка
+канона», #309) перепроверяется по файлам до самого HEAD правилом `review` (`needs_review`), ревью —
+по `modelUsage` на закреплённой модели. Нет
 отчёта, отчёт не один, начало не от `origin/main`, head не предок HEAD, head — код слитого PR ветки
 (его отчёт новой работы не видел; head слитого PR не получен — тоже отказ) — отказ (код 2).
 Перерасход вдвое (`ready_for_human` в отчёте) помечается и без флага.
@@ -59,8 +60,10 @@ HEAD, открытый PR ветки уже есть (черновик — сн�
 (его ищет Stop-хук) и метка `ready-for-human`, без push и без отметки; пустая причина — отказ
 (код 2), отчёт не публикуется; незакоммиченные правки и
 слитый PR не мешают. Открытого PR нет — в тикете N ветки `ticket-N` (или `ticket-N-…`), PR не
-создаётся; есть — на PR, PR переводится в черновик, авто-мёрж выключается. Пишется при каждом
-вызове: Stop-хук засчитывает только отчёт этой сессии.
+создаётся; есть — на PR, PR переводится в черновик, авто-мёрж выключается, а в тикет ветки —
+комментарий со ссылкой на отчёт (#295). Отчёт и ссылка кончаются упоминанием владельца
+(`@<первая часть owner/repo>`, как у оркестратора) — иначе пуша нет; уже упомянут — второй раз
+нет. Пишется при каждом вызове: Stop-хук засчитывает только отчёт этой сессии.
 
 Повторный запуск идемпотентен: второго PR нет, отметка только на итоговом коммите; после мёржа
 — «уже слит». Слитый PR со старым head работе не мешает: новые коммиты ветки идут новым PR, но с
@@ -96,6 +99,7 @@ PR_FIELDS = "number,url,isDraft,labels,autoMergeRequest"
 DESCRIPTION = "ревью ошибок пройдено (/ship)"
 REMOVED_BY = re.compile(r"убрано коммитом\s+`?([0-9a-f]{7,40})\b", re.I)
 DESCRIPTION_SKIPPED = "ревью ошибок не нужно: только документы (/ship)"
+DESCRIPTION_INSTALL = "ревью ошибок не нужно: чистая установка канона (/ship)"
 
 
 class ShipError(Exception):
@@ -224,12 +228,18 @@ def check_report(path: str, data: dict, sha: str, canon) -> None:
     verdict = data["canon_review"]
     if verdict.get("skipped") is True:
         span = f"{TARGET}...{sha}"  # как дифф `review`: слитый в ветку main — не её код
-        files = run("git", "diff", "--name-only", "--no-renames", "-z", span).split("\0")
-        code = [p for p in files if p and not canon.is_docs(p)]
+        files = [
+            p
+            for p in run("git", "diff", "--name-only", "--no-renames", "-z", span).split("\0")
+            if p
+        ]
+        # То же правило, что выдало пропуск: документы и чистая установка канона (#309).
+        code, _, note = canon.needs_review(files, run("git", "merge-base", TARGET, sha), sha)
         if code:
+            why = f" (чистая установка не подтверждена: {note})" if note else ""
             raise UsageError(
-                f"отчёт ревью {path} — пропуск «только документы», а в ветке есть код: "
-                f"{', '.join(code[:5])} — запустить ревью заново"
+                f"отчёт ревью {path} — пропуск ревью, а в ветке есть код: "
+                f"{', '.join(code[:5])}{why} — запустить ревью заново"
             )
     elif canon.MODEL not in (data.get("modelUsage") or {}):
         raise UsageError(
@@ -450,9 +460,17 @@ def report_stop(branch: str, reason: str) -> str:
             '(--unconfirmed "критерий 2 не подтверждён: …")'
         )
     text = reason if reason.lstrip().startswith(REPORT_MARK) else f"{REPORT_MARK}: {reason}"
+    # Упоминание — пуш владельцу (#295): владелец берётся, как у оркестратора и `ticket ask`.
+    # Не узнали — отчёт без упоминания: отчёт важнее пуша.
+    try:
+        owner = run("gh", "repo", "view", "--json", "owner", "-q", ".owner.login")
+    except ShipError as exc:
+        print(f"ship-finish: отчёт без упоминания владельца — {exc}", file=sys.stderr)
+        owner = ""
+    text = with_mention(text, owner)
+    match = TICKET_BRANCH.match(branch)
     pr = find_pr(branch)
     if pr is None:
-        match = TICKET_BRANCH.match(branch)
         if not match:
             raise UsageError(
                 f"ветка {branch}: открытого PR нет, а тикет для отчёта берётся из имени ветки "
@@ -470,8 +488,28 @@ def report_stop(branch: str, reason: str) -> str:
     labels = json.loads(run("gh", kind, "view", number, "--json", "labels")).get("labels") or []
     if not any(label["name"] == LABEL for label in labels):
         run("gh", kind, "edit", number, "--add-label", LABEL)
-    run("gh", kind, "comment", number, "--body", text)
+    posted = run("gh", kind, "comment", number, "--body", text)
+    if kind == "pr" and match:
+        # PR открыт App — владелец там не автор: в тикете ссылка с упоминанием (#295). Первая
+        # строка — отметка отчёта: ответ владельца в тикете маршрут ищет после неё. Парная
+        # копия — запасной путь `publish_stop` в `ticket_ship.py`.
+        url = posted if posted.startswith("https://") else pr["url"]
+        link = f"{REPORT_MARK} — на PR: {url}"
+        body = with_mention(link, owner, f"отчёт и метка `{LABEL}` — на PR")
+        try:  # отчёт уже на PR: сбой ссылки — не сбой отчёта, повтор задвоил бы его
+            run("gh", "issue", "comment", match.group(1), "--body", body)
+        except ShipError as exc:
+            print(f"ship-finish: ссылка на отчёт в тикете не легла — {exc}", file=sys.stderr)
     return where
+
+
+def with_mention(text: str, owner: str, need: str = f"метка `{LABEL}`") -> str:
+    """Текст с упоминанием владельца в конце (`need` — что его ждёт); владелец не известен или
+    уже упомянут — как есть. Парная копия — в `ticket_ship.py`."""
+    mentioned = re.compile(rf"(?<![\w@.-])@{re.escape(owner)}(?![\w-])", re.I)
+    if not owner or mentioned.search(text):
+        return text
+    return f"{text.rstrip()}\n\n@{owner}, нужен человек: {need}."
 
 
 def check_pushed(branch: str, sha: str) -> None:
@@ -568,7 +606,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if not pr.get("autoMergeRequest"):
             run("gh", "pr", "merge", number, "--auto", "--squash")
-        description = DESCRIPTION_SKIPPED if review.get("skipped") is True else DESCRIPTION
+        description = DESCRIPTION
+        if review.get("skipped") is True:
+            description = DESCRIPTION_INSTALL if review.get("install") else DESCRIPTION_SKIPPED
         if unreviewed:
             description += (
                 f"; отчёт по {review['head'][:7]}, коммитов после ревью: {len(unreviewed)}"

@@ -27,7 +27,10 @@
 
 - Под оркестратором (`CANON_ORCHESTRATOR=1` в окружении, #214) — всегда headless, флаг передаётся
   `claude` и Stop-хуку, промпт — режим `/start N` вместо «`/implement`, затем `/ship`»: сессия
-  кончается на «код готов» или на вопросе.
+  кончается на «код готов» или на вопросе. Ещё `--allowedTools` с командами маршрута своего
+  тикета (`ROUTE_COMMANDS`, #308): их классификатор не проверяет — 22.10 он остановил тикет на
+  `ticket ship N --again`. Правила `allow` настроек проекта в `claude -p` не действуют (папке не
+  доверяли), поэтому список здесь; ручные сессии, и `--headless` тоже, флаг не получают.
 - `--resume <id>` — продолжить сессию `claude -p --resume <id>` в worktree тикета (ветка
   `ticket-N` или `ticket-N-…`) под тем же замком и с тем же Stop-хуком; `session-start` не
   вызывается (уборка, PR автора, метка — уже были). Промпт — `--prompt`, по умолчанию `/start N`:
@@ -76,6 +79,18 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DEFAULT_BUDGET = "30"
 HEADLESS_MODE = "auto"
+# Команды, которые печатает сам маршрут (строки `▶` заданий): под оркестратором — без
+# классификатора автоматического режима (#308, решение
+# `docs/decisions/2026-10-23-route-allow-orchestrator-only.md`). Точные, с номером тикета сессии:
+# ни чужого тикета, ни хвоста вроде перенаправления `>`.
+ROUTE_COMMANDS = (
+    "ticket ask {n}",
+    "ticket fresh {n}",
+    "ticket ship {n}",
+    "ticket ship {n} --again",
+    "ticket start {n}",
+    "ticket wait {n}",
+)
 
 
 def load(name: str, filename: str):
@@ -90,6 +105,19 @@ def load(name: str, filename: str):
 claude_run = load("canon_claude_run", "claude_run.py")  # предел — как у `review` и `verify`
 session_start = load("canon_session_start", "session-start")
 core = session_start.core
+
+
+def route_rules(worktree: Path, number: int) -> list[str]:
+    """Правила `--allowedTools` для команд маршрута тикета — путём скриптов в репозитории
+    worktree (в самом каноне — `project/scripts/canon`), как их печатает маршрут сессии и
+    `ticket_cmd` оркестратора: сам `session-run` под оркестратором лежит в его копии канона.
+    В каноне — и путём ссылки `scripts/canon`: им зовут маршрут скиллы `/start` и `/ship`,
+    которые ставит канону `canon-sync --self` (#310)."""
+    own = (worktree / "project/scripts/canon/ticket").exists()
+    prefixes = ("project/scripts/canon", "scripts/canon") if own else ("scripts/canon",)
+    return [
+        f"Bash({scripts}/{cmd.format(n=number)})" for scripts in prefixes for cmd in ROUTE_COMMANDS
+    ]
 
 
 def resume_plan(ticket: str, claim) -> tuple[int, dict | None]:
@@ -248,6 +276,10 @@ def main(argv: list[str] | None = None) -> int:
         cmd += ["-p", "--max-budget-usd", args.max_budget_usd or DEFAULT_BUDGET]
         if "--permission-mode" not in extra:
             cmd += ["--permission-mode", HEADLESS_MODE]
+    if orchestrated:
+        # Только сессии оркестратора: в ручной (и в `--headless` на Mac) классификатор остаётся.
+        number = ticket_number(args.ticket)
+        cmd += ["--allowedTools", *route_rules(Path(plan["worktree"]), number)]
     if args.resume:
         cmd += ["--resume", args.resume]
     # `--` перед промптом: вариадические флаги (`--allowedTools`, `--add-dir`) иначе съедят его.
