@@ -35,7 +35,8 @@ def test_min_of_single_amount():
 
 def test_min_exact_on_large_sum():
     # Целые без float: на 10**17 float не различил бы суммы
-    assert min_kop(10**17, 10**17 + 1) == 10**17
+    # Ответ 10**17 + 1 во float непредставим: float-реализация дала бы 10**17
+    assert min_kop(10**17 + 1, 10**17 + 2) == 10**17 + 1
 
 
 def test_min_of_no_amounts_is_error():
