@@ -7,6 +7,12 @@ def test_max_of_several_amounts():
     assert max_kop(100, 250, -5) == 250
 
 
+def test_max_is_signed_not_by_abs():
+    # Возврат −500 меньше продажи 100: максимум со знаком, не по модулю
+    assert max_kop(-500, 100) == 100
+    assert max_kop(-5, -3) == -3
+
+
 def test_max_of_single_amount():
     assert max_kop(-3) == -3
 
