@@ -5,7 +5,7 @@ name: reviewer-tests
 # тесту. По имени прогона оркестратор его находит; прогон чужой метки зовётся иначе.
 run-name: >-
   ${{ github.event.label.name == 'ci:reviewer-tests'
-  && format('reviewer-tests #{0} {1}', github.event.pull_request.number, github.event.pull_request.head.sha)
+  && format('ВЕТКА reviewer-tests #{0} {1}', github.event.pull_request.number, github.event.pull_request.head.sha)
   || format('reviewer-tests: метка {0} — пропуск', github.event.label.name) }}
 
 on:
@@ -52,6 +52,7 @@ jobs:
         run: |
           rm -rf "$REVIEWER_TESTS" && mkdir -p "$(dirname "$REVIEWER_TESTS")"
           cp -R ".reviewer-head/$REVIEWER_TESTS" "$REVIEWER_TESTS" && rm -rf .reviewer-head
+      - run: echo "ФАЙЛ ВЕТКИ" && exit 1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
