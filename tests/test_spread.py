@@ -1,5 +1,3 @@
-import os
-
 import pytest
 
 from sandbox.money.spread import range_kop
@@ -29,8 +27,3 @@ def test_range_exact_on_large_sum():
 def test_range_of_no_amounts_is_error():
     with pytest.raises(ValueError, match="нужна хотя бы одна сумма"):
         range_kop()
-
-
-def test_ci_probe():
-    # Условие #155: намеренно падает только в CI — проба причин красного CI
-    assert os.environ.get("GITHUB_ACTIONS") != "true"
