@@ -31,7 +31,14 @@ python3.12 -m venv .venv
 Запускается на `pull_request`, на push в `main` и раз в сутки на `main`. Обязательная проверка для
 мёржа — `test`. Контракт CI оркестратора (шаблон профиля канона): отчёт по тестам артефактом
 `test-report-test` (на `main` хранится 90 дней), предел задачи 10 минут, новый push в PR отменяет
-прогон старого head, прогоны `main` не отменяются.
+прогон старого head, прогоны `main` не отменяются. На черновом PR задача `test` пропускается, полный
+прогон — при переводе из черновика (`ready_for_review`) и на каждый push в PR не черновиком.
+
+Точечный прогон тестов ревьюера — `.github/workflows/reviewer-tests.yml`: событие
+`pull_request_target` на метку `ci:reviewer-tests` (ставит оркестратор; файл workflow — из `main`),
+только тесты папки `tests/reviewer/` на head PR и на основе; отчёты — артефакты
+`test-report-reviewer-head` и `test-report-reviewer-base`. Обязательной проверкой не является.
+PR Dependabot сами не перестраиваются (`rebase-strategy: disabled`): догон — `@dependabot rebase`.
 
 ## Канон
 

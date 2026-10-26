@@ -6,6 +6,9 @@ updates:
     directory: /
     schedule:
       interval: daily
+    # PR не перестраиваются сами при каждом движении `main` (workflow#336): догон —
+    # `@dependabot rebase`, когда PR пора сливать.
+    rebase-strategy: disabled
     ignore:
       - dependency-name: requests
         update-types: ["version-update:semver-minor", "version-update:semver-major"]

@@ -1,0 +1,80 @@
+name: reviewer-tests
+# Точечный прогон тестов ревьюера (workflow#336, контракт CI шаблона профиля): метку
+# `ci:reviewer-tests` ставит оркестратор, событие `pull_request_target` берёт этот файл из `main` —
+# ветка его не подменит. Только тесты ревьюера, на head PR и на основе; итог — отчёт по каждому
+# тесту. По имени прогона оркестратор его находит; прогон чужой метки зовётся иначе.
+run-name: >-
+  ${{ github.event.label.name == 'ci:reviewer-tests'
+  && format('reviewer-tests #{0} {1}', github.event.pull_request.number, github.event.pull_request.head.sha)
+  || format('reviewer-tests: метка {0} — пропуск', github.event.label.name) }}
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+# Группа — с меткой: чужая метка не отменит идущий прогон.
+concurrency:
+  group: reviewer-tests-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+  cancel-in-progress: true
+
+# Код ветки идёт в контексте `main`: токен только на чтение, без секретов и кэша, только PR
+# своего репозитория, Actions — по SHA.
+permissions:
+  contents: read
+
+env:
+  REVIEWER_TESTS: tests/reviewer
+
+jobs:
+  reviewer:
+    if: >-
+      github.event.label.name == 'ci:reviewer-tests'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [head, base]
+    steps:
+      # Основа — `main` на момент метки (github.sha события), ветка — head PR.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side == 'head' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - if: matrix.side == 'base'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: .reviewer-head
+          persist-credentials: false
+      - if: matrix.side == 'base'
+        run: |
+          rm -rf "$REVIEWER_TESTS" && mkdir -p "$(dirname "$REVIEWER_TESTS")"
+          cp -R ".reviewer-head/$REVIEWER_TESTS" "$REVIEWER_TESTS" && rm -rf .reviewer-head
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      # Код ветки (сборка пакета и тесты) — от пользователя без sudo, в копии рабочего каталога:
+      # память раннера с токенами Actions ему не видна. Плагины pytest не грузятся сами,
+      # conftest и `addopts` ветки не действуют; упавший тест — итог в отчёте, а не красный прогон.
+      - run: |
+          sudo useradd --create-home reviewer
+          sudo cp -R . /tmp/reviewer-work && sudo chown -R reviewer /tmp/reviewer-work
+          cd /tmp/reviewer-work
+          sudo -u reviewer -H env PATH="$PATH" REVIEWER_TESTS="$REVIEWER_TESTS" \
+            PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 bash -c '
+              python -m venv .venv && . .venv/bin/activate && pip install -q -e ".[dev]" &&
+              { pytest -q --noconftest -o addopts= -p no:cacheprovider "$REVIEWER_TESTS" \
+                  --junitxml=test-report.xml || true; }'
+          cp test-report.xml "$GITHUB_WORKSPACE/"
+      # Тестов не было (упало раньше) — пустой отчёт: сбой среды виден по красному прогону.
+      - if: success() || failure()
+        run: test -f test-report.xml || echo '<testsuites/>' > test-report.xml
+      - if: success() || failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-report-reviewer-${{ matrix.side }}
+          path: test-report.xml
+          overwrite: true
+          retention-days: 7
