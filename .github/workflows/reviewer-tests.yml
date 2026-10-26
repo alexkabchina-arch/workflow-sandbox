@@ -1,0 +1,62 @@
+name: reviewer-tests
+# Точечный прогон тестов ревьюера (workflow#336, контракт CI шаблона профиля): метку
+# `ci:reviewer-tests` ставит оркестратор, событие `pull_request_target` берёт этот файл из `main` —
+# ветка его не подменит. Только тесты ревьюера, на head PR и на основе; итог — отчёт по каждому
+# тесту. По имени прогона оркестратор его находит.
+run-name: "reviewer-tests #${{ github.event.pull_request.number }} ${{ github.event.pull_request.head.sha }}"
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+concurrency:
+  group: reviewer-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# Код ветки идёт с токеном `main`: только чтение, без секретов и кэша, только PR своего репозитория.
+permissions:
+  contents: read
+
+env:
+  REVIEWER_TESTS: tests/reviewer
+
+jobs:
+  reviewer:
+    if: >-
+      github.event.label.name == 'ci:reviewer-tests'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [head, base]
+    steps:
+      # Основа — `main` на момент метки (github.sha события), ветка — head PR.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.side == 'head' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - if: matrix.side == 'base'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: .reviewer-head
+          persist-credentials: false
+      - if: matrix.side == 'base'
+        run: |
+          rm -rf "$REVIEWER_TESTS" && mkdir -p "$(dirname "$REVIEWER_TESTS")"
+          cp -R ".reviewer-head/$REVIEWER_TESTS" "$REVIEWER_TESTS" && rm -rf .reviewer-head
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # Упавший тест — итог в отчёте, а не красный прогон.
+      - continue-on-error: true
+        run: pytest -q "$REVIEWER_TESTS" --junitxml=test-report.xml
+      - run: test -f test-report.xml || echo '<testsuites/>' > test-report.xml
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-report-reviewer-${{ matrix.side }}
+          path: test-report.xml
+          retention-days: 7
