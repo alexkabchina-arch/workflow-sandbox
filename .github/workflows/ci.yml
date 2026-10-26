@@ -5,9 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+# Контракт CI оркестратора (workflow#335, «Ожидаемые job CI» шаблона профиля): новый push в PR
+# отменяет прогон старого head; прогоны `main` не отменяются — по последнему из них оркестратор
+# узнаёт «`main` красный».
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # gitleaks-action читает коммиты PR через API.
     permissions:
       contents: read
@@ -19,6 +27,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Быстрые проверки — первыми.
       - run: python scripts/canon/check_lock.py
       - run: python3 scripts/canon/claude_md_length.py
       # Секрет в коммитах PR роняет job (workflow#59); идёт и после упавших шагов до него.
@@ -32,4 +41,13 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
-      - run: pytest -q
+      # Отчёт по каждому тесту — файлом прогона: по нему оркестратор называет упавшие тесты.
+      - run: pytest -q --junitxml=test-report.xml
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-report-test
+          path: test-report.xml
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
