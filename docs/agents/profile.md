@@ -26,9 +26,12 @@ python3.12 -m venv .venv
 
 | Workflow | Job    | Что делает                            |
 | -------- | ------ | ------------------------------------- |
-| `CI`     | `test` | `check_lock` (`.canon.lock`), длина `CLAUDE.md` (предупреждение, не падает), gitleaks (секреты в коммитах), `ruff check`, `ruff format --check`, `pytest` на Python 3.12 |
+| `CI`     | `test` | `check_lock` (`.canon.lock`), длина `CLAUDE.md` (предупреждение, не падает), gitleaks (секреты в коммитах), `ruff check`, `ruff format --check`, `pytest` на Python 3.12 с отчётом JUnit — артефакт `test-report-test` |
 
-Запускается на `pull_request` и на push в `main`. Обязательная проверка для мёржа — `test`.
+Запускается на `pull_request`, на push в `main` и раз в сутки на `main`. Обязательная проверка для
+мёржа — `test`. Контракт CI оркестратора (шаблон профиля канона): отчёт по тестам артефактом
+`test-report-test` (на `main` хранится 90 дней), предел задачи 10 минут, новый push в PR отменяет
+прогон старого head, прогоны `main` не отменяются.
 
 ## Канон
 
