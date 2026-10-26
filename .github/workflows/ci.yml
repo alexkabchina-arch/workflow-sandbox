@@ -4,12 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Раз в сутки на `main`: красный `main` виден, даже если мёрж шёл мимо push-CI (авто-мёрж
+  # Dependabot токеном workflow push-CI не запускает).
+  schedule:
+    - cron: "0 3 * * *"
 
 # Контракт CI оркестратора (workflow#335, «Ожидаемые job CI» шаблона профиля): новый push в PR
-# отменяет прогон старого head; прогоны `main` не отменяются — по последнему из них оркестратор
-# узнаёт «`main` красный».
+# отменяет прогон старого head; прогоны `main` — каждый в своей группе (по коммиту) и не
+# отменяются: по последнему из них оркестратор узнаёт «`main` красный».
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -27,9 +31,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Быстрые проверки — первыми.
+      # Быстрые проверки — первыми: замок канона, длина `CLAUDE.md`, линтер и формат.
       - run: python scripts/canon/check_lock.py
       - run: python3 scripts/canon/claude_md_length.py
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
       # Секрет в коммитах PR роняет job (workflow#59); идёт и после упавших шагов до него.
       # Только на PR; находка — в логе job (комментарии в PR требуют права записи).
       - if: github.event_name == 'pull_request' && (success() || failure())
@@ -38,16 +45,16 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_VERSION: "8.30.1"
           GITLEAKS_ENABLE_COMMENTS: "false"
-      - run: pip install -e ".[dev]"
-      - run: ruff check .
-      - run: ruff format --check .
       # Отчёт по каждому тесту — файлом прогона: по нему оркестратор называет упавшие тесты.
       - run: pytest -q --junitxml=test-report.xml
-      - if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      # Тестов не было (упало раньше) — пустой отчёт: он заменит отчёт прошлой попытки.
+      - if: success() || failure()
+        run: test -f test-report.xml || echo '<testsuites/>' > test-report.xml
+      - if: success() || failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-report-test
           path: test-report.xml
-          if-no-files-found: ignore
           overwrite: true
-          retention-days: 7
+          # Отчёт `main` живёт дольше: по нему узнаётся «`main` красный».
+          retention-days: ${{ github.event_name == 'pull_request' && 7 || 90 }}
