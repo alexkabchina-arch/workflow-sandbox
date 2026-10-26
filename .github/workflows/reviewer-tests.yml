@@ -67,7 +67,8 @@ jobs:
               python -m venv .venv && . .venv/bin/activate && pip install -q -e ".[dev]" &&
               { pytest -q --noconftest -o addopts= -p no:cacheprovider "$REVIEWER_TESTS" \
                   --junitxml=test-report.xml || true; }'
-          cp test-report.xml "$GITHUB_WORKSPACE/"
+          # Отчёт читает reviewer: ссылка на файл раннера в ветке ему не откроется.
+          sudo -u reviewer cat test-report.xml > "$GITHUB_WORKSPACE/test-report.xml"
       # Тестов не было (упало раньше) — пустой отчёт: сбой среды виден по красному прогону.
       - if: success() || failure()
         run: test -f test-report.xml || echo '<testsuites/>' > test-report.xml
