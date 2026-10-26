@@ -49,6 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 LIMIT = 2
+GATES_RED = 3  # код `ship-finish`: красные местные ворота воркфлоу без CI (#328)
 STOP_WIDTH = 300  # символов в строке ошибки отчёта об остановке
 # Строка ошибки в выводе проверки: в отчёт об остановке на GitHub — только первая такая строка, не
 # хвост вывода: тест, печатающий окружение или DSN, выложил бы их в комментарий (#275). Слова —
@@ -1442,6 +1443,15 @@ class Route:
             args.insert(0, "--pr-only")  # отметку и авто-мёрж ставит оркестратор токеном App
         res = core.canon("ship-finish", *args)
         core.say(res.stdout.rstrip())
+        if res.returncode == GATES_RED:
+            # Местные ворота воркфлоу без CI (#328): красный тест или линтер чинит сессия, как
+            # красный шаг «тесты и линтеры», а не владелец.
+            attempt = st.attempt("gates")
+            if attempt > LIMIT:
+                return self.stop(f"местные ворота красные {attempt}-й раз: {tail(res.stderr, 5)}")
+            st.go("checks")
+            body = f"{tail(res.stderr, 30)}\n\n{CHECKS_TASK.format(attempt=attempt, limit=LIMIT)}"
+            return self.turn("Красные местные ворота", body, long="тесты — до 45 минут")
         if res.returncode != 0:
             return self.stop(f"ship-finish отказал (код {res.returncode}): {tail(res.stderr, 5)}")
         url = re.search(r"https://\S+/pull/\d+", res.stdout)

@@ -184,6 +184,19 @@ git на него ставятся внутри (`app-token shims`); `sbx` ид�
 тикетов `canon-ticket/`): очередь, места, тикеты (шаг, id сессии, номера процессов, логи, расход,
 вопросы владельцу, отчёты об остановке, из них по его команде), паузы с причинами, доля
 недельного лимита. Часы — `CANON_NOW` (ISO 8601, для тестов), иначе текущее время.
+**Путь v2** (#333, спека #329): переключатель по проекту — `git config canon.agentV2` (булево,
+по умолчанию выключен; читается, когда тикет встаёт в очередь: неверное значение — сбой взятия
+тикета, «статус» — строкой). Путь запоминается на тикете, когда он
+встаёт в очередь (`v2` в своём состоянии; `agent:retry` выбирает заново): выключенный
+переключатель не уводит начатые тикеты со своего пути. Общее — такт, очередь, места,
+метки-команды, обёртки `gh` и `sbx`, песочница — здесь и служит обоим путям; шаги, которые v2
+меняет, — в каталоге `v2/` рядом (`v2/steps.py`), модель и усилие его ролей — в `v2/roles.py`:
+сессия кода — `--model`/`--effort` в команду `claude`, ревью ошибок — признак `CANON_V2=1`
+скрипту `review` (модель и усилие он берёт из той же таблицы). У старого пути модель не
+задаётся, как раньше, и признак из окружения такта скрипту `review` не уходит. Каждый кончившийся
+запуск роли тикета v2 (сессия, ревью) — строкой в журнал `events.jsonl` рядом с состоянием
+(`v2/journal.py`): роль, модель, усилие, токены, USD, время, исход с кодом; у старого пути журнала
+нет.
 Код выхода 0 — такт прошёл; 1 — сбой (`gh`, git, App, состояние); 2 — ошибка запуска.
 Как устроено — `docs/orchestrator.md` канона.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
@@ -227,6 +240,13 @@ READY_FOR_AGENT, HUMAN = "ready-for-agent", "ready-for-human"
 ESCAPED = "escaped-defect"  # тикет ускользнувшего дефекта со ссылкой на слитый тикет или PR
 # Места — сессии, идущие параллельно (решение 16.10): число — настройка проекта.
 SLOTS_KEY, SLOTS = "canon.agentSlots", 2
+V2_KEY = "canon.agentV2"  # переключатель пути v2 по проекту (#333)
+# Учёт минут CI (#358): аккаунт, чьи приватные репозитории считаются; не задан — учёта нет.
+MINUTES_KEY = "canon.agentMinutes"
+MINUTES_DAYS = 1  # суток за такт (≈1 мин): первый счёт месяца догоняет по суткам за такт
+MINUTES_TIMEOUT = 120  # один вызов `gh` учёта минут
+MINUTES_LAG = 6 * 3600  # сутки считаются не раньше 06:00 UTC следующих: задачи доходят
+MINUTES_RETRY = 3600  # после сбоя счёта — следующая попытка не раньше
 # Возвраты той же сессии по красному CI на тикет; следующий красный — отчёт об остановке.
 RETURNS = 2
 # Комментарий в тикет без строк «Владения» и «Флаги» при взятии в очередь (#289) — без упоминания.
@@ -380,8 +400,9 @@ for sig in (signal.SIGTERM, signal.SIGKILL):
 sys.exit(3)
 """
 # Паузы: owner — «пауза» владельца, schedule — вне окна расписания, ceiling — суточный потолок,
-# limit — упор в лимит подписки, resources — диск и память. Любая — новые места не занимаются;
-# кроме resources — и запуски начатых тикетов (ревью, возобновления) ждут её конца.
+# limit — упор в лимит подписки, resources — диск и память, minutes — минуты CI на 95 % (#358).
+# Любая — новые места не занимаются (minutes — только новым тикетам, без сессии); кроме resources
+# и minutes — и запуски начатых тикетов (ревью, возобновления) ждут её конца.
 HOLDING = ("owner", "schedule", "ceiling", "limit")
 OWNER_PAUSE, OWNER_NOW = "pause.json", "now.json"  # команды владельца — файлами, без замка такта
 # Служба (#222): `launchd` пользователя зовёт такт раз в минуту (`StartInterval`), при входе и
@@ -454,6 +475,12 @@ asks = load("canon_ticket_ask_orchestrator", "ticket_ask.py")
 table = load("canon_ticket_status_orchestrator", "ticket_status.py")  # строки «статуса»
 ship = load("canon_ticket_ship_orchestrator", "ticket_ship.py")  # правила конфликта догона
 sandbox = load("canon_sandbox_orchestrator", "sandbox")  # песочница проекта (#223)
+# Путь v2 (#333): шаги, которые он меняет, и модели его ролей — отдельным каталогом.
+v2_steps = load("canon_v2_steps_orchestrator", "v2/steps.py")
+roles = load("canon_v2_roles_orchestrator", "v2/roles.py")
+journal = load("canon_v2_journal_orchestrator", "v2/journal.py")  # журнал запусков ролей (#334)
+minutes = load("canon_v2_minutes_orchestrator", "v2/minutes.py")  # учёт минут CI (#358)
+v2_ci = load("canon_v2_ci_orchestrator", "v2/ci.py")  # причины красного CI (#335)
 
 
 class Failure(Exception):
@@ -910,6 +937,7 @@ def stream_text(stream: str) -> dict:
         "rate_limit": limit,
         "limit": hit,
         "lost": lost,
+        "final": last or None,  # токены и время запуска — для журнала пути v2 (#334)
     }
 
 
@@ -929,6 +957,7 @@ class Orchestrator:
         self.slots = int(slots)
         self.windows = schedule(core.run("git", "config", "--get", SCHEDULE_KEY).stdout.strip())
         self.ceiling = ceiling(core.run("git", "config", "--get", CEILING_KEY).stdout.strip())
+        self.switch: bool | None = None  # переключатель пути v2 — при первом взятии тикета
         self.usage_checked = False  # доля лимита проверена перед новым местом в этом такте
         # Команда маршрута в заданиях сессии — путём скрипта в репозитории проекта (в самом
         # каноне — `project/scripts/canon`).
@@ -1800,6 +1829,7 @@ class Orchestrator:
                     except Exception as exc:  # noqa: BLE001 — любой сбой одного тикета (#275)
                         errors.append(self.fault(n, exc))
                 errors += self.fill()
+                errors += self.count_minutes()
             finally:
                 if awake := self.try_keep_awake():
                     errors.append(awake)
@@ -1885,6 +1915,9 @@ class Orchestrator:
         )
         if proc["session"]:
             t["session"] = proc["session"]
+        run_log = t["runs"][-1]["log"]
+        summary = stream_summary(Path(run_log)) if run_log else {"final": None}
+        self.log_session(t, t["runs"][-1], summary, killed=True, measured=False)
         if t["phase"] == "session":
             self.requeue(n, t)
 
@@ -1950,6 +1983,7 @@ class Orchestrator:
             self.clear_pause("schedule")
         self.check_ceiling()
         self.check_resources()
+        self.check_minutes()
 
     def owner_file(self, name: str) -> dict | None:
         """Команда владельца («пауза», «работай сейчас») — файл в своём каталоге; нет — None."""
@@ -2097,6 +2131,117 @@ class Orchestrator:
         else:
             self.clear_pause("resources")
 
+    # --- минуты CI (#358) ---
+
+    def check_minutes(self) -> None:
+        """Месячный итог минут CI ≥ `minutes.HOLD` — пауза новых тикетов до следующего месяца
+        (UTC, как счёт GitHub); новый месяц — счёт с нуля, пауза снята. Учёта нет — паузы нет."""
+        if not self.config(MINUTES_KEY):
+            self.data.pop("minutes", None)
+            return self.clear_pause("minutes")
+        current = now().astimezone(timezone.utc)
+        month = current.strftime("%Y-%m")
+        held = self.data.get("minutes")
+        if not isinstance(held, dict):
+            held = self.data["minutes"] = {"month": month, "days": {}, "told": []}
+        if held.get("month") != month:  # прошлый месяц — до сброса досчитывает `count_minutes`
+            return self.clear_pause("minutes")
+        spent = minutes.total(held["days"])
+        if sum(spent.values()) < minutes.HOLD * minutes.TOTAL:
+            return self.clear_pause("minutes")
+        until = datetime(
+            current.year + current.month // 12, current.month % 12 + 1, 1, tzinfo=timezone.utc
+        )
+        self.set_pause(
+            "minutes",
+            f"минуты CI на {round(minutes.HOLD * 100)} % месячного бюджета — "
+            f"{minutes.summary(spent)}: новые тикеты не берутся до {until:%d.%m} (UTC)",
+            until,
+        )
+
+    def owner_gh(self, *args: str) -> list[dict]:
+        """`gh` учёткой владельца (без токена оркестратора: App видит только свой репозиторий) —
+        объекты JSON вывода, по строке на объект (делит по `\\n`: `splitlines` — и по U+0085)."""
+        res = run("gh", *args, cwd=self.main, env=without_tokens(), timeout=MINUTES_TIMEOUT)
+        if res.returncode != 0:
+            raise Failure(f"`gh {' '.join(args[:2])}`: {tail(res.stderr)}")
+        return [json.loads(line) for line in res.stdout.split("\n") if line.strip()]
+
+    def count_minutes(self) -> list[str]:
+        """Сутки месяца своего состояния (UTC), ещё не посчитанные, — не больше `MINUTES_DAYS` за
+        такт и не раньше `MINUTES_LAG` после их конца (задачи доходят, сторож перезапускает);
+        месяц досчитан, а на дворе новый — счёт с нуля. Затем пороги. Сбой — строка такта и
+        следующая попытка не раньше `MINUTES_RETRY`: без неё каждый такт повторял бы сотни
+        вызовов `gh` учёткой владельца."""
+        account, held = self.config(MINUTES_KEY), self.data.get("minutes")
+        if not account or not isinstance(held, dict):
+            return []
+        retry = parse_time(held.get("retry"))
+        if retry is not None and now() < retry:
+            return []
+        current = now().astimezone(timezone.utc)
+        ready = (current - timedelta(seconds=MINUTES_LAG)).date()
+        day = datetime.strptime(f"{held['month']}-01", "%Y-%m-%d").date()
+        left = MINUTES_DAYS
+        while day < ready and day.strftime("%Y-%m") == held["month"] and left:
+            key = day.isoformat()
+            if key not in held["days"]:
+                try:
+                    held["days"][key] = minutes.day(self.owner_gh, account, key)
+                except Exception as exc:  # noqa: BLE001 — любой ответ не того вида (#275)
+                    held["retry"] = (now() + timedelta(seconds=MINUTES_RETRY)).isoformat()
+                    what = " ".join(f"{type(exc).__name__}: {exc}".split())
+                    say(f"минуты CI за {key} не посчитаны — {what}")
+                    return [f"минуты CI за {key}: {what}"]
+                left -= 1
+            day += timedelta(days=1)
+        held.pop("retry", None)
+        month = current.strftime("%Y-%m")
+        if held["month"] != month:
+            if day.strftime("%Y-%m") == held["month"]:
+                return []  # прошлый месяц ещё не досчитан
+            held = self.data["minutes"] = {"month": month, "days": {}, "told": []}
+        self.check_minutes()
+        try:
+            self.tell_minutes(account, held)
+        except (Failure, core.Failure, *COMMAND_ERRORS) as exc:
+            return [f"минуты CI: сообщение владельцу не отправлено — {exc}"]
+        return []
+
+    def tell_minutes(self, account: str, held: dict) -> None:
+        """Порог `WARN` или `HOLD` пройден — тикет владельцу с упоминанием, раз на порог в месяц
+        (оба сразу — одно сообщение о большем)."""
+        spent = minutes.total(held["days"])
+        used, told = sum(spent.values()), held.setdefault("told", [])
+        level = next((x for x in (minutes.HOLD, minutes.WARN) if used >= x * minutes.TOTAL), None)
+        if level is None or any(x >= level for x in told):
+            return
+        last = datetime.fromisoformat(max(held["days"]))
+        if level == minutes.HOLD:
+            then = (
+                "Новые тикеты не берутся до конца месяца (UTC): идут начатые тикеты и слияния; "
+                "`main` чинить — ручной сессией."
+            )
+        else:
+            then = (
+                f"На {round(minutes.HOLD * 100)} % оркестратор перестанет брать новые тикеты до "
+                "конца месяца."
+            )
+        body = (
+            f"@{self.repo.split('/')[0]}, минуты Actions за {held['month']} (по {last:%d.%m} "
+            f"включительно): {minutes.summary(spent)}.\n\n{then}\n\nСчёт — по прогонам всех "
+            f"приватных репозиториев `{account}` раз в сутки (docs/orchestrator.md, «Минуты CI»)."
+        )
+        title = f"Минуты CI: {round(level * 100)} % месячного бюджета ({held['month']})"
+        say(core.gh("issue", "create", "--title", title, "--body", body).strip())
+        told.append(level)
+
+    def places_held(self, n: int) -> dict:
+        """Паузы, которые держат новое место тикета `n`: минуты CI на 95 % держат только новые
+        тикеты — начатый (с сессией) доходит."""
+        session = self.ticket(n).get("session")
+        return {k: p for k, p in self.data["pauses"].items() if k != "minutes" or not session}
+
     def hold(self, n: int, what: str) -> bool:
         """Пауза держит и запуски начатых тикетов (кроме паузы по ресурсам): `what` ждёт её конца,
         шаг тикета повторится на следующем такте."""
@@ -2160,14 +2305,21 @@ class Orchestrator:
     def awake_needed(self) -> bool:
         """Mac нужен бодрым: занято место, или есть очередь либо вопрос владельцу (его ответ
         берёт такт) в рабочем окне — мест по расписанию больше нуля и каждая пауза кончится сама
-        не позже `AWAKE_HORIZON`. «Пауза» владельца и нехватка ресурсов — без срока: не держат."""
+        не позже `AWAKE_HORIZON`. «Пауза» владельца и нехватка ресурсов — без срока: не держат;
+        пауза минут CI при начатых тикетах не в счёт."""
         if self.data["slots"]:
             return True
         waiting = any(t.get("phase") == "question" for t in self.data["tickets"].values())
         if not (self.data["queue"] or waiting) or self.capacity() == 0:
             return False
+        # Пауза минут CI держит только новые тикеты: начатые (вопрос, очередь с сессией) идут.
+        started = waiting or any(
+            (self.data["tickets"].get(str(n)) or {}).get("session") for n in self.data["queue"]
+        )
         horizon = now() + timedelta(seconds=AWAKE_HORIZON)
-        for pause in self.data["pauses"].values():
+        for kind, pause in self.data["pauses"].items():
+            if kind == "minutes" and started:
+                continue
             until = parse_time(pause.get("until"))
             if until is None or until > horizon:
                 return False
@@ -2291,8 +2443,29 @@ class Orchestrator:
         for p in self.data["prds"]:
             print(f"Очередь PRD: #{p}")
         print("Пауза: " + ("; ".join(self.current_pauses().values()) or "нет"))
+        led = [
+            f"#{k}"
+            for k in sorted(self.data["tickets"], key=int)
+            if self.data["tickets"][k].get("v2")
+        ]
+        try:
+            on = self.v2()
+            switch = f"{'включён' if on else 'выключен'} для новых тикетов"
+        except Failure as exc:
+            on, switch = None, str(exc)
+        if on is not False or led:  # выключен и тикетов v2 нет — строки нет, как до v2
+            print(f"Путь v2: {switch}" + (f"; ведутся путём v2: {', '.join(led)}" if led else ""))
         if (until := self.override_until()) is not None:
             print(f"Работай сейчас: до {moment(until)}")
+        if self.config(MINUTES_KEY):  # учёт минут CI (#358) не включён — строки нет
+            held = self.data.get("minutes") or {}
+            days = held.get("days") or {}
+            if days:
+                last = datetime.fromisoformat(max(days))
+                spent = minutes.summary(minutes.total(days))
+                print(f"Минуты CI за {held['month']} (по {last:%d.%m}): {spent}")
+            else:
+                print("Минуты CI: ещё не посчитаны")
         usage, day = self.data.get("usage") or {}, self.data.get("day") or {}
         if isinstance(usage.get("week"), (int, float)):
             today = ""
@@ -2563,12 +2736,15 @@ class Orchestrator:
             return None
         last = t["runs"][-1]
         killed = self.end_group(last) if self.live(last) else None
-        self.finish_run(t, last)
+        first = "ended" not in last
+        summary = self.finish_run(t, last, log=False)  # в журнал — после оценки
         if killed is not None and not last.get("subtype"):  # итог есть — это факт, не оценка
             budget = float(last.get("budget") or RUN_LIMIT)
             last.update(cost=max(last.get("cost") or 0, budget), cost_estimated=True)
             if by_owner:
                 last["owner_stop"] = True
+        if first:
+            self.log_session(t, last, summary, killed=killed is not None)
         return killed
 
     def draft(self, st, on: bool) -> None:
@@ -2613,6 +2789,7 @@ class Orchestrator:
     def retry(self, n: int, t: dict) -> None:
         """`agent:retry`: с чистого листа. Каждый шаг повторим — сбой посреди оставляет метку, и
         следующий такт доделает."""
+        v2 = self.v2()  # до первого шага: опечатка в переключателе не начнёт повтор
         if self.end_run(t) is False:
             raise Failure(f"#{n}: процессы сессии не завершились и за SIGKILL — повтор не начат")
         st = self.route(n)
@@ -2637,7 +2814,7 @@ class Orchestrator:
             self.data["queue"].remove(n)
         self.data["queue"].append(n)
         before = t.get("before") or {}
-        renewed = fresh(prd=t.get("prd"))
+        renewed = fresh(prd=t.get("prd"), v2=v2)
         renewed["before"] = {
             **{k: before.get(k, 0) + t.get(k, 0) for k in COUNTS},
             "runs": before.get("runs", 0) + len(t["runs"]),
@@ -2845,9 +3022,10 @@ class Orchestrator:
                 f"`{READY_FOR_AGENT}` и снова `{GO}`.",
             )
             return say(f"#{n}: без {READY_FOR_AGENT} — не взят")
+        v2 = self.v2()  # до меток: опечатка в переключателе оставит `agent:go` на тикете
         self.labels(n, add=(QUEUED,), remove=(GO,))
         self.data["queue"].append(n)
-        self.data["tickets"][str(n)] = fresh()
+        self.data["tickets"][str(n)] = fresh(v2=v2)
         say(f"#{n}: в очереди")
         self.tell_alone(n)
 
@@ -2949,7 +3127,7 @@ class Orchestrator:
                 continue
             # Пауза (#221) держит места, где пойдёт `claude`; продолжение на CI или мёрже — нет.
             if self.ticket(n).get("resume") not in ("ci", "merge"):
-                if not self.usage_checked and not self.data["pauses"]:
+                if not self.usage_checked and not self.places_held(n):
                     self.usage_checked = True  # перед первым новым запуском такта — доля лимита
                     try:
                         self.fresh_usage()
@@ -2959,9 +3137,9 @@ class Orchestrator:
                         unchecked = True
                 if unchecked:
                     continue
-                if self.data["pauses"]:
+                if pauses := self.places_held(n):  # после доли лимита: она ставит потолок
                     if not told:
-                        reasons = "; ".join(p["reason"] for p in self.data["pauses"].values())
+                        reasons = "; ".join(p["reason"] for p in pauses.values())
                         say(f"очередь на паузе — {reasons}")
                         told = True
                     continue
@@ -3050,11 +3228,10 @@ class Orchestrator:
             self.occupy(n)
             if back == "settle":
                 t["phase"] = "session"
-                self.session_over(n, t)
             else:
                 t.pop("ci_since", None)
                 t["phase"] = "ci"
-                self.ci(n, t)
+            self.steps(t)[t["phase"]](n, t)
         elif back == "answer":
             self.after_answer(n, t)
         elif self.resumable(n, t):  # прерванное задание оркестратора (догон, CI) — то же снова
@@ -3119,7 +3296,8 @@ class Orchestrator:
         script = [str(HERE / "session-run"), str(n), "--run", tag, "--max-budget-usd", budget]
         script += ["--resume", session] if resume else []
         script += ["--prompt", task] if task else []
-        script += ["--", *([] if resume else ["--session-id", session]), *STREAM]
+        model = roles.args("session") if t.get("v2") else []  # старый путь — без модели
+        script += ["--", *model, *([] if resume else ["--session-id", session]), *STREAM]
         self.sandbox_entry()  # граница — до подготовки: шаблон в не ту песочницу не уйдёт
         self.prepare()  # образы проекта и база-шаблон — до первого запуска такта
         env = self.session_env()
@@ -3179,19 +3357,33 @@ class Orchestrator:
         # когда запуск кончился.
         if phase in ("ci", "merge") and (field := self.route(n).broken()):
             return self.stop(n, t, f"состояние маршрута повреждено: {field}")
-        if phase == "session":
-            self.session_over(n, t)
-        elif phase == "ci":
-            self.ci(n, t)
-        elif phase == "merge":
-            self.merge(n, t)
+        if step := self.steps(t).get(phase):
+            step(n, t)
         else:
             self.free(n)
 
+    def v2(self) -> bool:
+        """Переключатель пути v2 — раз за команду, когда он нужен: опечатка в нём не роняет
+        `pause`, `now`, `service` и `update` машины."""
+        if self.switch is None:
+            self.switch = v2_switch()
+        return self.switch
+
+    def steps(self, t: dict) -> dict:
+        """Шаги тикета по фазе: путь v2 — из `v2/steps.py`, старый — здесь (#333)."""
+        if t.get("v2"):
+            return v2_steps.steps(self)
+        return {"session": self.session_over, "ci": self.ci, "merge": self.merge}
+
+    def cause(self):
+        """Разбор причин красного CI пути v2 (`v2/ci.py`, #335) — хуки шага `ci`."""
+        return v2_ci.Cause(self, start, say, stamp)
+
     # --- сессия ---
 
-    def finish_run(self, t: dict, last: dict) -> dict:
-        """Итог кончившегося запуска по его потоку — в состояние (один раз)."""
+    def finish_run(self, t: dict, last: dict, log: bool = True) -> dict:
+        """Итог кончившегося запуска по его потоку — в состояние (один раз); `log` — и событием в
+        журнал пути v2 (`end_run` пишет его сам, после оценки расхода)."""
         summary = stream_summary(Path(last["log"]))
         if "ended" in last:
             return summary
@@ -3199,7 +3391,65 @@ class Orchestrator:
         if summary["rate_limit"] is not None:
             t["rate_limit"] = summary["rate_limit"]
             self.observe(summary["rate_limit"], since=last["started"])
+        if log:
+            self.log_session(t, last, summary)
         return summary
+
+    def log_role(
+        self, t: dict, role: str, result: dict | None, measured: float | None, **fields
+    ) -> None:
+        """Кончившийся запуск роли тикета пути v2 — событием в журнал рядом с состоянием
+        (`v2/journal.py`); у старого пути журнала нет. Журнал — данные для пределов, не шаг
+        маршрута: сбой записи — строкой, такт и состояние тикета идут дальше."""
+        if not t.get("v2"):
+            return
+        n = next((int(key) for key, value in self.data["tickets"].items() if value is t), None)
+        if n is None:
+            return say(
+                f"журнал v2: тикет запуска {role} не найден в состоянии — событие не записано"
+            )
+        try:
+            journal.write(
+                self.dir,
+                {"at": stamp(), **journal.event(roles, n, role, result, measured, **fields)},
+            )
+        except OSError as exc:
+            say(f"#{n}: журнал v2 не записан — {exc}")
+
+    def log_session(
+        self, t: dict, last: dict, summary: dict, killed: bool = False, measured: bool = True
+    ) -> None:
+        """Запуск сессии — в журнал: исход — по коду итога потока; `killed` — завершён
+        оркестратором (стоп, предел времени, повтор, осиротевшая сессия); `measured` — начало
+        запуска известно (у осиротевшей — нет). Итог возобновления накоплен с начала сессии —
+        в событие только часть запуска (`journal.part`); итога нет — оценка его бюджетом."""
+        code = last.get("subtype") or "no_result"
+        outcome = "killed" if killed else ("ok" if code == "success" else "error")
+        took = datetime.fromisoformat(last["ended"]) - datetime.fromisoformat(last["started"])
+        final = summary.get("final")
+        before = [r for r in t["runs"][: t["runs"].index(last)] if r.get("subtype")]
+        before = [r for r in before if r.get("session") == last.get("session") and r.get("log")]
+        previous = stream_summary(Path(before[-1]["log"]))["final"] if before else None
+        usd, used = journal.part(final, previous if last.get("resumed") else None)
+        estimated = bool(last.get("cost_estimated")) or usd is None
+        if estimated:  # итога нет или расход уже оценён — оценка худшим случаем
+            usd = max(last.get("cost") or 0, float(last.get("budget") or RUN_LIMIT))
+        self.log_role(
+            t,
+            "session",
+            final,
+            took.total_seconds() if measured else None,
+            run=last.get("run"),
+            resumed=bool(last.get("resumed")),
+            started=last["started"],
+            ended=last["ended"],
+            usd=usd,
+            estimated=estimated,
+            outcome=outcome,
+            code=code,
+            exit=None,
+            tokens=used,
+        )
 
     def session_over(self, n: int, t: dict) -> None:
         last = t["runs"][-1]
@@ -3244,7 +3494,7 @@ class Orchestrator:
             self.review(n, t, st)
         elif st.step == "ready":
             t["phase"] = "ci"
-            self.ci(n, t)
+            self.steps(t)["ci"](n, t)
         elif st["question"]:
             t.update(phase="question", asked=t.get("asked", 0) + 1)  # ответ — `answered`
             self.free(n)
@@ -3457,17 +3707,46 @@ class Orchestrator:
         report.parent.mkdir(parents=True, exist_ok=True)
         env = without_tokens()
         env["PATH"] = f"{self.claude_shim()}{os.pathsep}{os.environ.get('PATH', '')}"
+        env.pop(roles.V2_ENV, None)  # старый путь — без таблицы ролей, что бы ни было в такте
+        if t.get("v2"):  # модель и усилие ревью — роль пути v2 из таблицы (`claude_run.role`)
+            env[roles.V2_ENV] = "1"
         say(f"#{n}: ревью ошибок head {head[:7]}")
         budget = f"{min(REVIEW_LIMIT, TICKET_LIMIT - spent):.2f}"  # ревью тоже в пределе тикета
         review = [sys.executable, str(HERE / "review"), str(report), "--max-budget-usd", budget]
+        before = report.stat().st_mtime_ns if report.exists() else None
+        started, clock = stamp(), time.monotonic()
+
+        def logged(outcome: str, code: str, exit: int | None, data: dict | None = None) -> None:
+            """Запуск ревью — в журнал пути v2: расход — факт отчёта этого прогона, у
+            пропущенного — 0, как в состоянии; без отчёта — оценка бюджетом."""
+            usd = journal.usd(data)
+            if usd is None and outcome == "ok":
+                usd = 0  # пропуск (PR только из документов): `review` ничего не тратил
+            self.log_role(
+                t,
+                "review",
+                data,
+                time.monotonic() - clock,
+                started=started,
+                ended=stamp(),
+                usd=float(budget) if usd is None else usd,
+                estimated=usd is None,
+                outcome=outcome,
+                code=code,
+                exit=exit,
+            )
+
         try:
             res = run(*review, cwd=checkout, env=env, timeout=REVIEW_TIMEOUT)
         except subprocess.TimeoutExpired:
+            logged("timeout", "no_result", None)
             why = f"ревью ошибок не кончилось за {max(REVIEW_TIMEOUT // 60, 1)} мин"
             return self.review_failed(n, t, budget, why)
         finally:
             self.drop_checkout(checkout)
         if res.returncode != 0:
+            data = self.fresh_report(report, before)  # токены — только отчёта этого прогона
+            logged("error", (data or {}).get("subtype") or "no_result", res.returncode, data)
             log = self.output_log(n, "review", res.stdout + res.stderr)
             said = ship.failure(res.stderr or res.stdout, log, "на Mac")
             return self.review_failed(
@@ -3476,12 +3755,26 @@ class Orchestrator:
         try:
             data = json.loads(report.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
+            logged("error", "no_report", 0)
             return self.review_failed(n, t, budget, f"отчёт ревью не прочитан: {exc}")
+        skipped = isinstance(data.get("canon_review"), dict) and data["canon_review"].get("skipped")
+        logged("ok", "skipped" if skipped else data.get("subtype") or "no_result", 0, data)
         cost = data.get("total_cost_usd")
         t["cost"]["review"] = cost if isinstance(cost, (int, float)) else 0
         t["reviewed"] = True
         self.hand_over(n, st)
         self.launch(n, resume=t["session"])  # находки — той же сессии заданием маршрута
+
+    @staticmethod
+    def fresh_report(report: Path, before: int | None) -> dict | None:
+        """Отчёт ревью, записанный этим прогоном (время файла сменилось), иначе `None`."""
+        try:
+            if report.stat().st_mtime_ns == before:
+                return None
+            data = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
 
     def review_failed(self, n: int, t: dict, budget: str, reason: str) -> None:
         """Ревью без годного итога (таймаут, код ≠ 0, нечитаемый отчёт): расход неизвестен —
@@ -3596,9 +3889,10 @@ class Orchestrator:
             ):
                 unready[n] = True
                 continue
+            v2 = self.v2()  # до меток, как у `take`
             self.labels(n, add=(QUEUED,))
             self.data["queue"].append(n)
-            self.data["tickets"][str(n)] = fresh(prd=p)
+            self.data["tickets"][str(n)] = fresh(prd=p, v2=v2)
             prd["taken"].append(n)
             say(f"#{n}: тикет PRD #{p} — в очереди")
             self.tell_alone(n)
@@ -3743,7 +4037,10 @@ class Orchestrator:
             return {}
         return pr
 
-    def ci(self, n: int, t: dict) -> None:
+    def ci(self, n: int, t: dict, cause=None) -> None:
+        """Шаг CI: красный на head «код готов» — возврат; зелёный — отметка `review`. `cause` —
+        разбор причин красного пути v2 (`v2/ci.py`, #335): красный — его `red`, зелёный — сначала
+        его `green`; без него — как раньше."""
         st = self.route(n)
         if not st["pr"]:
             return self.stop(n, t, "«код готов» после разбора, а PR в состоянии тикета нет")
@@ -3761,12 +4058,16 @@ class Orchestrator:
                     why = f"head PR {pr['headRefOid'][:7]} — не «код готов» сессии"
                     return self.stop(n, t, f"{why} {duration(since)}")
                 return
+            if cause:
+                return cause.red(n, t, st, pr, red)
             return self.give_back(n, t, st, f"красный CI на {pr['headRefOid'][:7]}", red)
         if not ci_green(pr):
             since = t.setdefault("ci_since", stamp())
             if not checks(pr) and seconds_since(since) > CI_WAIT:
                 return self.stop(n, t, f"на PR нет проверок CI {duration(since)}")
             return  # CI идёт
+        if cause:
+            cause.green(n, t, pr)
         head = pr["headRefOid"]
         if problem := self.unmarkable(n, t, st, head):
             return self.stop(n, t, f"отметку review не ставлю: {problem}")
@@ -3968,10 +4269,24 @@ class Orchestrator:
         return gone, problems
 
 
-def fresh(prd: int | None = None) -> dict:
-    """Новый тикет в очереди: ни запусков, ни расхода; тикет PRD помнит его номер."""
+def fresh(prd: int | None = None, v2: bool = False) -> dict:
+    """Новый тикет в очереди: ни запусков, ни расхода; тикет PRD помнит его номер, тикет пути v2 —
+    свой путь (`v2`, #333)."""
     t = {"phase": "queued", "queued": stamp(), "runs": [], "cost": {}, **dict.fromkeys(COUNTS, 0)}
+    if v2:
+        t["v2"] = True
     return {**t, "prd": prd} if prd else t
+
+
+def v2_switch() -> bool:
+    """Переключатель пути v2 (`git config canon.agentV2`, булево): не задан — выключен; не
+    булево — сбой, а не молчаливый старый путь."""
+    res = core.run("git", "config", "--type=bool", "--get", V2_KEY)
+    if res.returncode == 1 and not res.stdout.strip():
+        return False
+    if res.returncode != 0:
+        raise Failure(f"`git config {V2_KEY}` — булево (true/false): {tail(res.stderr)}")
+    return res.stdout.strip() == "true"
 
 
 def cell(text) -> str:

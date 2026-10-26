@@ -18,6 +18,15 @@
    push, на каждом вызове с push (#258): работа без тикета шага маршрута не проходит. Красная —
    отказ (код 2) с файлом и строкой находки gitleaks, без значения секрета, ничего не
    отправлено; в профиле её нет — предупреждение, ветка уходит как раньше.
+   Затем местные ворота — только когда в профиле `origin/main` есть блок ```gates (сам воркфлоу
+   без CI, исключение 3б, #328; блок берётся не из ветки — ветка не снимет ворота сама себе): его
+   команды (`имя: команда`) и затронутые тесты — файлы `tests/test*.py`, упоминающие изменённый
+   файл ветки, а для изменённого модуля скриптов (`project/scripts/canon/*.py`) — и скрипты,
+   которые его упоминают; каждый — своей командой `python3 -m unittest` под `run-log`, во
+   временном worktree на проверяемом коммите (неотслеживаемые файлы не участвуют). Хоть одно
+   красное — отказ (код 3) со списком: имя, код выхода и лог; ничего не отправлено, отметки нет.
+   Зелёный коммит запоминается (`canon-gates-green` в каталоге git) — повтор ворот не гоняет.
+   Блока нет (проекты) — ворот нет. Те же ворота — и у `--mark` перед отметкой.
    Затем `git push -u origin <HEAD>:refs/heads/<ветка>` — ровно проверенный коммит (без force) и
    сверка: ветка на сервере — ровно локальный HEAD.
 2. PR ветки: нет открытого — `gh pr create`, есть — `gh pr edit` (тело и заголовок обновляются).
@@ -69,7 +78,7 @@ HEAD, открытый PR ветки уже есть (черновик — сн�
 — «уже слит». Слитый PR со старым head работе не мешает: новые коммиты ветки идут новым PR, но с
 новым ревью — отчёт слитого PR их не покрывает. Код выхода 0 — готово; 1 — сбой push, `gh` или
 сверки; 2 — ошибка аргументов или состояния ветки (main, незакоммиченные правки, нет или не
-сходится отчёт ревью), до любой записи.
+сходится отчёт ревью), до любой записи; 3 — красные местные ворота (чинит сессия).
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
 Только стандартная библиотека Python 3.
 """
@@ -79,6 +88,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -88,6 +98,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PROFILE = Path("docs/agents/profile.md")
 RUN_LOG_END = re.compile(r"^run-log: завершено с кодом \S+ · лог: (.+)$", re.M)
+GATES_BLOCK = re.compile(r"^```gates[ \t]*\n(.*?)^```", re.M | re.S)
+CANON_SCRIPTS = Path("project/scripts/canon")
+GATES_GREEN = "canon-gates-green"  # зелёные коммиты ворот, в каталоге git
 CONTEXT = "review"
 TARGET = "origin/main"
 LABEL = "ready-for-human"
@@ -108,6 +121,10 @@ class ShipError(Exception):
 
 class UsageError(Exception):
     """Ошибка аргументов или состояния ветки (код выхода 2)."""
+
+
+class GatesRed(Exception):
+    """Красные местные ворота (код выхода 3): чинит сессия коммитом, не владелец."""
 
 
 class AlreadyMerged(Exception):
@@ -194,6 +211,105 @@ def check_secrets() -> None:
         f"проверка `secrets` профиля не прошла (код {res.returncode}), находок в выводе нет — "
         "push и PR не сделаны" + where
     )
+
+
+def parse_gates(text: str | None) -> list[tuple[str, list[str]]] | None:
+    """Команды блока ```gates профиля — тем же разбором, что ```checks (`ticket_core`):
+    `имя: команда`, без оболочки; блока нет — None."""
+    block = GATES_BLOCK.search(text) if text else None
+    if not block:
+        return None
+    core = load_canon("ticket_core.py")
+    try:
+        return core.parse_checks(f"```checks\n{block.group(1)}```\n", f"{PROFILE} (блок gates)")
+    except core.Failure as exc:
+        raise UsageError(str(exc)) from None
+    except ValueError as exc:  # shlex: незакрытая кавычка
+        raise UsageError(f"{PROFILE} (блок gates): строка не разобрана — {exc}") from None
+
+
+def affected_tests(root: Path, sha: str) -> list[str]:
+    """Затронутые тесты по правилу `CLAUDE.md` воркфлоу: `tests/test*.py`, упоминающие изменённый
+    файл ветки (`.py` — по имени без расширения), сами изменённые тесты, а для изменённого модуля
+    скриптов — ещё файлы, упоминающие скрипты, которые его грузят."""
+    span = f"{TARGET}...{sha}"
+    changed = [
+        Path(p)
+        for p in run("git", "diff", "--name-only", "--no-renames", "-z", span).split("\0")
+        if p
+    ]
+    names = {p.stem if p.suffix == ".py" else p.name for p in changed}
+    scripts = root / CANON_SCRIPTS
+    # Модуль скриптов — по имени, вложенный (`v2/roles.py`, #333) — путём без расширения: так его
+    # грузит скрипт (`load(…, "v2/roles.py")`), а одно имя `roles` нашлось бы где угодно.
+    modules = [
+        p.relative_to(CANON_SCRIPTS).with_suffix("").as_posix()
+        for p in changed
+        if p.is_relative_to(CANON_SCRIPTS) and p.suffix == ".py"
+    ]
+    if modules and scripts.is_dir():
+        for script in sorted(scripts.iterdir()):
+            if not script.is_file():
+                continue
+            text = script.read_text(encoding="utf-8", errors="replace")
+            if any(m in text for m in modules):
+                names.add(script.stem if script.suffix == ".py" else script.name)
+    chosen = []
+    for test in sorted((root / "tests").glob("test*.py")):
+        rel = test.relative_to(root)
+        text = test.read_text(encoding="utf-8", errors="replace")
+        if rel in changed or any(name in text for name in names):
+            chosen.append(rel.as_posix())
+    return chosen
+
+
+def check_gates(sha: str) -> None:
+    """Местные ворота воркфлоу без CI (исключение 3б, #328) перед push и отметкой: команды блока
+    ```gates профиля `origin/main` и затронутые тесты, каждый под `run-log`, во временном worktree
+    на `sha`. Красное — `GatesRed` со списком; блока нет — ничего (проекты)."""
+    try:
+        text = run("git", "show", f"{TARGET}:{PROFILE}")
+    except ShipError:
+        return
+    gates = parse_gates(text)
+    if gates is None:
+        return
+    common = Path(run("git", "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    seen = common / GATES_GREEN
+    try:
+        green = seen.read_text(encoding="utf-8").split()
+    except OSError:
+        green = []
+    if sha in green:
+        print(f"ship-finish: местные ворота на {sha[:7]} уже зелёные", flush=True)
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="ship-finish-gates-"))
+    tree = tmp / "tree"
+    failed = []
+    try:
+        run("git", "worktree", "add", "-q", "--detach", str(tree), sha)
+        gates += [
+            (test, [sys.executable, "-m", "unittest", test]) for test in affected_tests(tree, sha)
+        ]
+        for name, argv in gates:
+            print(f"ship-finish: ворота — {name}", flush=True)
+            label = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "gate"
+            cmd = [sys.executable, str(HERE / "run-log"), "-n", "0", "-l", label, "--", *argv]
+            res = subprocess.run(cmd, cwd=tree, capture_output=True, text=True, check=False)
+            if res.returncode != 0:
+                log = next(reversed(RUN_LOG_END.findall(res.stdout)), None)
+                failed.append(f"{name} (код {res.returncode}" + (f", лог {log})" if log else ")"))
+    finally:
+        git_ok("worktree", "remove", "--force", str(tree))
+        shutil.rmtree(tmp, ignore_errors=True)
+    if failed:
+        raise GatesRed(
+            f"местные ворота не прошли: {'; '.join(failed)} — push и PR не сделаны, отметки нет; "
+            "починить коммитом и вызвать снова"
+        )
+    with seen.open("a", encoding="utf-8") as out:
+        out.write(sha + "\n")
+    print(f"ship-finish: местные ворота зелёные ({len(gates)})", flush=True)
 
 
 def load_review(path: str) -> dict:
@@ -581,6 +697,7 @@ def main(argv: list[str] | None = None) -> int:
         weakening = weakening_section(review, args.weakening, unreviewed, load_canon_review())
         if args.mark:
             check_pushed(branch, sha)
+            check_gates(sha)
             pr = find_pr(branch)
             if pr is None:
                 raise UsageError(f"у ветки {branch} нет открытого PR: сначала `--pr-only`")
@@ -588,6 +705,7 @@ def main(argv: list[str] | None = None) -> int:
                 run("gh", "pr", "ready", str(pr["number"]))
         else:
             check_secrets()
+            check_gates(sha)
             body_file = pr_body(args.body_file, review, unreviewed, weakening)
             try:
                 push(branch, sha)
@@ -620,6 +738,9 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as exc:
         print(f"ship-finish: {exc}", file=sys.stderr)
         return 2
+    except GatesRed as exc:
+        print(f"ship-finish: {exc}", file=sys.stderr)
+        return 3
     except ShipError as exc:
         print(f"ship-finish: {exc}", file=sys.stderr)
         return 1

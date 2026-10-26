@@ -4,7 +4,11 @@
 
 Дочерний процесс — без меток сессии тикета (иначе Stop-хук `stop-check` держал бы его) и с
 переменными вызывающего поверх окружения (`env`: у `review` — `CLAUDE_CODE_REPORT_FINDINGS=1`), на
-закреплённой модели, с аргументами списком (без оболочки) и пустым stdin. Итог — всегда по
+закреплённой модели, с аргументами списком (без оболочки) и пустым stdin. Путь v2 (#333,
+`CANON_V2=1` в окружении — его ставит оркестратор): модель и усилие роли вызывающего скрипта из
+таблицы `v2/roles.py`; иначе — `MODEL` и усилие по умолчанию, как у старого пути. Окружением
+выбирается только «таблица или нет»: ни модель, ни усилие им не задать, и признак дочернему
+`claude` не передаётся. Итог — всегда по
 схеме (`--json-schema`): ответ — в поле `structured_output`, `.md` пишет вызывающий (из него или,
 как `review`, из событий потока).
 Текст `result` — только последняя реплика: у `/review` это сводка без находок (#70), поэтому итогом
@@ -35,10 +39,24 @@ import math
 import os
 import re
 import subprocess
+import sys
+import types
 from pathlib import Path
 
+
+def load_roles():
+    """Таблица ролей пути v2 (`v2/roles.py` рядом) как модуль — без `sys.path` и `__pycache__`."""
+    path = Path(__file__).resolve().parent / "v2/roles.py"
+    module = types.ModuleType("canon_v2_roles")
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    return module
+
+
+roles = load_roles()
 MODEL = "claude-opus-5-5"
-SESSION_VARS = {"CANON_SESSION", "CANON_ENFORCE_STOP"}
+# Признак пути v2 — не дальше вызывающего скрипта: дочерний `claude` и его команды его не видят.
+SESSION_VARS = {"CANON_SESSION", "CANON_ENFORCE_STOP", roles.V2_ENV}
 DEFAULT_BASE = "origin/main"
 # Ревью Opus xhigh в разведке workflow#2 стоили 0,82–3,67 USD (в среднем 1,89); уточнить на пилоте.
 DEFAULT_BUDGET_USD = "10"
@@ -87,6 +105,18 @@ def parser(prog: str, description: str) -> argparse.ArgumentParser:
         help=f"предел объёма в USD по прайсу API (по умолчанию {DEFAULT_BUDGET_USD})",
     )
     return result
+
+
+def role(name: str | None = None) -> tuple[str, str | None]:
+    """Модель и усилие дочернего `claude -p`. Путь v2 (`CANON_V2=1`) — роль `name` (по умолчанию
+    имя вызывающего скрипта: `review`, `verify`) из таблицы `v2/roles.py`; роли нет —
+    `UsageError` до запуска. Иначе — `MODEL` без усилия."""
+    if os.environ.get(roles.V2_ENV) != "1":
+        return MODEL, None
+    name = name or Path(sys.argv[0]).name
+    if name not in roles.ROLES:
+        raise UsageError(f"путь v2: роли {name!r} нет в v2/roles.py")
+    return roles.ROLES[name]
 
 
 def child_env(extra: dict | None = None) -> dict:
@@ -145,8 +175,9 @@ def run_claude(
     events: list | None = None,
     env: dict | None = None,
 ) -> dict:
-    """Запускает `claude -p --model MODEL --max-budget-usd <budget> --output-format json
-    --json-schema <schema> --disallowedTools=Agent,Workflow,Monitor <args>`.
+    """Запускает `claude -p --model MODEL [--effort …] --max-budget-usd <budget> --output-format
+    json --json-schema <schema> --disallowedTools=Agent,Workflow,Monitor <args>` (модель и усилие —
+    `role()`).
 
     Сохраняет сырой результат в `report`; возвращает разобранный JSON с ответом в
     `structured_output` (объект), `.md` пишет вызывающий. Не состоялось — `ChildError`, непустой
@@ -160,11 +191,13 @@ def run_claude(
     метки сессии тикета (`SESSION_VARS`) не проходят и из него.
     """
     output = ["json"] if events is None else ["stream-json", "--verbose"]
+    model, effort = role()
     command = [
         "claude",
         "-p",
         "--model",
-        MODEL,
+        model,
+        *(["--effort", effort] if effort else []),
         "--max-budget-usd",
         budget,
         "--output-format",
@@ -206,7 +239,7 @@ def run_claude(
     report.parent.mkdir(parents=True, exist_ok=True)
     write_json(report, data)
     try:
-        return check_result(data, report, budget, proc.returncode)
+        return check_result(data, report, budget, proc.returncode, model)
     except ChildError as exc:
         text = data.get("result")
         if isinstance(text, str) and text.strip():
@@ -288,7 +321,7 @@ def trailing_warning(data: dict) -> str | None:
     return f"после ответа по схеме лишний ход модели {reason}: ответ принят"
 
 
-def check_result(data: dict, report: Path, budget: str, code: int) -> dict:
+def check_result(data: dict, report: Path, budget: str, code: int, model: str = MODEL) -> dict:
     """Прогон состоялся и дал ответ по схеме — `data`; иначе `ChildError`."""
     cost = data.get("total_cost_usd", "?")
     subtype = data.get("subtype")
@@ -313,9 +346,9 @@ def check_result(data: dict, report: Path, budget: str, code: int) -> dict:
             f"не дошло до модели (modelUsage пуст): {text.strip()[:500] or 'без текста'}; "
             f"сырой результат — {report}"
         )
-    if MODEL not in models:
+    if model not in models:
         raise ChildError(
-            f"шло не на {MODEL}: modelUsage — {', '.join(models)}; сырой результат — {report}"
+            f"шло не на {model}: modelUsage — {', '.join(models)}; сырой результат — {report}"
         )
     if data.get("local_command") and not data.get("num_turns"):
         # Так `/review` ведёт себя с `--output-format json` или без `CLAUDE_CODE_REPORT_FINDINGS=1`
