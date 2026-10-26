@@ -67,15 +67,17 @@ jobs:
               python -m venv .venv && . .venv/bin/activate && pip install -q -e ".[dev]" &&
               { pytest -q --noconftest -o addopts= -p no:cacheprovider "$REVIEWER_TESTS" \
                   --junitxml=test-report.xml || true; }'
-          # Отчёт читает reviewer: ссылка на файл раннера в ветке ему не откроется.
-          sudo -u reviewer cat test-report.xml > "$GITHUB_WORKSPACE/test-report.xml"
+          # Отчёт читает reviewer (ссылка на файл раннера ему не откроется), не больше 50 МБ и
+          # минуты; пишется вне checkout ветки — туда ссылку не подложить.
+          timeout 60 sudo -u reviewer head -c 52428800 test-report.xml > "$RUNNER_TEMP/report.part"
+          mv "$RUNNER_TEMP/report.part" "$RUNNER_TEMP/test-report.xml"
       # Тестов не было (упало раньше) — пустой отчёт: сбой среды виден по красному прогону.
       - if: success() || failure()
-        run: test -f test-report.xml || echo '<testsuites/>' > test-report.xml
+        run: test -s "$RUNNER_TEMP/test-report.xml" || echo '<testsuites/>' > "$RUNNER_TEMP/test-report.xml"
       - if: success() || failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-report-reviewer-${{ matrix.side }}
-          path: test-report.xml
+          path: ${{ runner.temp }}/test-report.xml
           overwrite: true
           retention-days: 7
