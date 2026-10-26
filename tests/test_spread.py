@@ -17,6 +17,8 @@ def test_range_of_single_amount_is_zero():
 def test_range_is_signed_not_by_abs():
     # Возврат −500 и продажа 100: разброс 600, не 400
     assert range_kop(-500, 100) == 600
+    # Все отрицательные: накопитель максимума с нуля дал бы 5
+    assert range_kop(-5, -3) == 2
 
 
 def test_range_exact_on_large_sum():
