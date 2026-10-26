@@ -13,7 +13,9 @@
 
 - `session` — токен сессии: contents, pull requests, issues — запись; checks, statuses, actions —
   чтение (статус PR и логи CI); без записи статусов, без administration и workflows;
-- `orchestrator` — токен оркестратора: то же плюс запись статусов (отметка `review`). Авто-мёрж
+- `orchestrator` — токен оркестратора: то же плюс запись статусов (отметка `review`) и Actions
+  (перезапуск упавших задач CI на пути v2, #335; файлы workflow это право не меняет); установка
+  App ещё без записи Actions (GitHub — 422) — токен с чтением Actions и строка в stderr. Авто-мёрж
   включают оба: отдельного права у GitHub нет, хватает contents и pull requests (проба #212);
   слияние без отметки `review` от владельца или App он всё равно не даст.
 
@@ -88,7 +90,9 @@ SESSION = {
     "statuses": "read",
     "actions": "read",
 }
-KINDS = {"session": SESSION, "orchestrator": {**SESSION, "statuses": "write"}}
+# Оркестратор: ещё запись статусов (отметка `review`) и Actions — перезапуск упавших задач CI
+# на пути v2 (`gh run rerun --failed`, #335).
+KINDS = {"session": SESSION, "orchestrator": {**SESSION, "statuses": "write", "actions": "write"}}
 # DigestInfo SHA-256 для EMSA-PKCS1-v1_5 (RFC 8017, 9.2, примечание 1).
 SHA256_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
 REMOTE = re.compile(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
@@ -242,15 +246,25 @@ def issue(kind: str, repo: str, app_id: str, now: float, pem=keychain_pem, call=
     token = jwt(app_id, private_key(pem(app_id)), now)
     installation = call("GET", f"/repos/{repo}/installation", token)
     name = repo.split("/", 1)[1]
-    body = {"repositories": [name], "permissions": KINDS[kind]}
+    wanted = KINDS[kind]
+    path = f"/app/installations/{installation['id']}/access_tokens"
     try:
-        reply = call("POST", f"/app/installations/{installation['id']}/access_tokens", token, body)
+        try:
+            reply = call("POST", path, token, {"repositories": [name], "permissions": wanted})
+        except Failure as error:
+            # Установка App ещё без записи Actions (422): прежний набор — такт идёт, перезапуск
+            # CI на пути v2 остановится с причиной (#335).
+            if wanted.get("actions") != "write" or "HTTP 422" not in str(error):
+                raise
+            print(f"app-token: {error} — токен без записи Actions", file=sys.stderr)
+            wanted = {**wanted, "actions": "read"}
+            reply = call("POST", path, token, {"repositories": [name], "permissions": wanted})
         granted = reply.get("permissions") or {}
         repos = [r.get("full_name") or r.get("name") for r in reply.get("repositories") or []]
         data = {"token": reply["token"], "expires_at": reply["expires_at"]}
     except (KeyError, TypeError, AttributeError):
         raise Failure("ответ GitHub без токена — не тот формат") from None
-    extra = wider(granted, KINDS[kind])
+    extra = wider(granted, wanted)
     if extra:  # токен шире набора сессии открыл бы ей слияние — не отдавать
         raise Failure(f"GitHub выдал права шире набора {kind}: {extra}")
     if reply.get("repository_selection") != "selected" or repos not in ([name], [repo]):
