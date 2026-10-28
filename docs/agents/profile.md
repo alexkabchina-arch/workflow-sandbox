@@ -6,10 +6,24 @@
 
 ## Окружение
 
+Вариант — по признаку: `python3.12` на `PATH` есть (Mac владельца) — первый блок; нет (песочница
+оркестратора, Docker Sandboxes: внутри Python 3.14 без `ensurepip` и `uv`) — второй. Python в
+окружении — 3.12, как в CI.
+
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
+
+```bash
+uv venv --clear --python 3.12 .venv
+uv pip install --python .venv/bin/python -e ".[dev]"
+```
+
+Во втором варианте pip в окружении нет: пакеты — только `uv pip install --python .venv/bin/python …`.
+`--clear` пересоздаёт `.venv`: окружение привязано к платформе, созданное на Mac внутри песочницы
+не запустится. Проверки ниже зовут `.venv/bin/…`: worktree без окружения оркестратор с
+«доктором» среды (воркфлоу #342) не проверит — остановка с кодом «среда».
 
 ## Команды
 
