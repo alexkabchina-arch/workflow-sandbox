@@ -6,10 +6,23 @@
 
 ## Окружение
 
+На Mac владельца (ручная сессия):
+
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
+
+В песочнице оркестратора (Docker Sandboxes; сессии тикетов под оркестратором): Python 3.12 и
+`ensurepip` там нет — внутри Python 3.14 и `uv`; `uv` сам ставит Python 3.12 для `.venv` (прогон
+воркфлоу #342 от 28.10):
+
+```bash
+uv venv .venv
+uv pip install --python .venv/bin/python -e ".[dev]"
+```
+
+Проверки ниже зовут `.venv/bin/…`: worktree без окружения оркестратор не проверит (код «среда»).
 
 ## Команды
 
