@@ -7,10 +7,8 @@ on:
   # переводе из черновика и на каждый push в PR не черновиком.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  # Раз в сутки на `main`: красный `main` виден, даже если мёрж шёл мимо push-CI (авто-мёрж
-  # Dependabot токеном workflow push-CI не запускает).
-  schedule:
-    - cron: "0 3 * * *"
+  # Полный прогон `main` — ночью и вручную — вызовом из `canon-mainline.yml` (workflow#430).
+  workflow_call:
 
 # Контракт CI оркестратора (workflow#335, «Ожидаемые job CI» шаблона профиля): новый push в PR
 # отменяет прогон старого head; прогоны `main` — каждый в своей группе (по коммиту) и не
