@@ -56,6 +56,7 @@ from pathlib import Path
 
 REVIEW = "review"
 GUARD = "review-guard"  # сторож отметки: при стоящей отметке его перезапускает старт (#176)
+SPOT_WORKFLOW = "reviewer-tests"  # точечный прогон тестов ревьюера (#336) — не CI PR
 WAITING = "ready-for-human"
 ENFORCE = "CANON_ENFORCE_STOP"
 RUN_STARTED = "CANON_RUN_STARTED"  # время запуска `session-run` (UTC, ISO)
@@ -136,12 +137,15 @@ def is_marked(pr: dict) -> bool:
 
 
 def red_checks(pr: dict) -> list[str]:
-    """Красные проверки, кроме сторожа: он красный от сбоя GitHub или поздней отметки, а не от
-    кода сессии — упавший прогон перезапускают `session-start` и `ticket wait` (#176)."""
+    """Красные проверки, кроме сторожа и точечного прогона тестов ревьюера (#336): сторож красный
+    от сбоя GitHub или поздней отметки, а не от кода сессии — упавший прогон перезапускают
+    `session-start` и `ticket wait` (#176)."""
     return [
         item.get("name") or item.get("context")
         for item in pr.get("statusCheckRollup") or []
-        if (item.get("conclusion") or item.get("state")) in RED and item.get("name") != GUARD
+        if (item.get("conclusion") or item.get("state")) in RED
+        and item.get("name") != GUARD
+        and item.get("workflowName") != SPOT_WORKFLOW
     ]
 
 

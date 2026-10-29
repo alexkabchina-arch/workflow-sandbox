@@ -60,6 +60,8 @@ STEP_NAMES = {
 # Пометка вопроса `ticket ask` в комментарии; по ней вопрос находит и Stop-хук.
 ASK_MARK = "<!-- canon-ticket-ask {stamp} -->"
 CHECKS_BLOCK = re.compile(r"^```checks[ \t]*\n(.*?)^```", re.M | re.S)
+# Быстрые проверки пути v2 (#338): хук на коммите в песочнице; `format` правит, прочие блокируют.
+FAST_CHECKS_BLOCK = re.compile(r"^```fast-checks[ \t]*\n(.*?)^```", re.M | re.S)
 # Профиль до блока `checks` (проекты на каноне до #154): строки таблицы «Команды».
 TABLE_CHECKS = {"Тесты": "tests", "Линтер": "lint", "Формат (проверка)": "format"}
 TABLE_ROW = re.compile(r"^\|\s*([^|]+?)\s*\|\s*`([^`]+)`\s*\|", re.M)
@@ -167,6 +169,23 @@ FRESH_ANSWER = "fresh.json"
 
 def orchestrated() -> bool:
     return os.environ.get(ORCHESTRATED) == "1"
+
+
+# Сессия кода пути v2 (#340): признак окружения от `session-run` — задание сессии v2
+# (`v2/task.py`) вместо `/implement` с самопроверкой `/code-review`.
+V2_TASK = "CANON_V2_TASK"
+
+
+def v2_task() -> bool:
+    return orchestrated() and os.environ.get(V2_TASK) == "1"
+
+
+def v2_rules(n: int) -> str:
+    """Правила задания сессии v2 из `v2/task.py` рядом (той же версии), с командами маршрута."""
+    path = HERE / "v2" / "task.py"
+    module: dict = {"__file__": str(path), "__name__": "canon_v2_task_core"}
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module)
+    return module["rules"](n, f"{scripts_dir()}/ticket")
 
 
 def prod_copy(st) -> str | None:
@@ -498,14 +517,26 @@ def parse_checks(text: str, profile) -> list[tuple[str, list[str]]]:
         if not rows:
             raise Failure(f"в профиле {profile} нет блока ```checks (раздел «Команды»)")
         return [(name, shlex.split(command)) for name, command in rows]
+    return block_lines(block.group(1), profile, "checks")
+
+
+def fast_checks(text: str, profile) -> list[tuple[str, list[str]]] | None:
+    """Быстрые проверки пути v2 из блока ```fast-checks профиля (#338): строки `имя: команда`, как
+    у ```checks; `format` — форматер, правит файлы сам. Блока нет — None."""
+    block = FAST_CHECKS_BLOCK.search(text)
+    return None if block is None else block_lines(block.group(1), profile, "fast-checks")
+
+
+def block_lines(body: str, profile, kind: str) -> list[tuple[str, list[str]]]:
+    """Строки `имя: команда` блока профиля `kind` по порядку; пустые и `#` — пропуск."""
     checks = []
-    for line in block.group(1).splitlines():
+    for line in body.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         name, sep, command = line.partition(":")
         if not sep or not name.strip() or not command.strip():
-            raise Failure(f"профиль {profile}: строка блока checks не «имя: команда»: {line}")
+            raise Failure(f"профиль {profile}: строка блока {kind} не «имя: команда»: {line}")
         checks.append((name.strip(), shlex.split(command)))
     return checks
 

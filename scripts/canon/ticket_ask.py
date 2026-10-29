@@ -127,6 +127,14 @@ class Ask:
             )
             return (core.TURN, "Вопрос владельцу", body, (self.cmd,))
         stamp = core.now()
+        if core.v2_task():
+            # #341: токен сессии v2 — только чтение; вопрос из файла публикует оркестратор
+            # (метка, упоминание владельца, комментарий с меткой вопроса), когда сессия кончится.
+            st["question"] = {"stamp": stamp, "url": "", "step": st.step, "text": text}
+            st["waiting"] = core.OWNER
+            core.keep(st, self.dir / "ask.md", f"ask-{stamp}.md")
+            core.keep(st, self.dir / "reply.md", f"reply-stale-{stamp}.md")
+            return self.waiting("Вопрос передан оркестратору: он опубликует его в тикете.")
         if core.orchestrated():
             # #214: чата нет — владелец получает уведомление по упоминанию и отвечает в тикете,
             # оркестратор возобновит сессию сам.
@@ -222,7 +230,8 @@ class Ask:
         answer = "\n\n".join(replies)
         note = ""
         try:
-            core.gh("issue", "edit", str(n), "--remove-label", LABEL)
+            if not core.v2_task():  # у сессии v2 токен на чтение: метку снял оркестратор (#341)
+                core.gh("issue", "edit", str(n), "--remove-label", LABEL)
         except core.Failure as exc:
             note = f"\n(Метку {LABEL} снять не удалось: {exc} — сними руками.)"
         st["question"], st["waiting"] = None, core.AGENT
@@ -238,6 +247,12 @@ class Ask:
 
     def next_step(self, answer: str) -> str:
         core, st = self.core, self.state
+        if st.step is None and core.v2_task():  # сессия пути v2 (#340)
+            return (
+                f"Продолжай по заданию сессии v2 с учётом ответа (правила — `/start {self.n}` "
+                f"или вход сессии); новый вопрос владельцу — снова через `ticket ask {self.n}`. "
+                f"Работа закоммичена — вызов ({core.LONG_CALL}; ревью ошибок идёт 5–8 минут):"
+            )
         if st.step is None:
             return (
                 f"Продолжай `/implement {self.n}` с учётом ответа; новый вопрос владельцу — снова "

@@ -19,7 +19,9 @@
    архив рядом с состоянием, задание — `/implement N`.
 
 Под оркестратором (`CANON_ORCHESTRATOR=1`, #214) `session-start` PR автора не берёт; задание —
-то же `/implement N` с самопроверкой `/code-review`, конец — «код готов» или вопрос; с копией
+то же `/implement N` с самопроверкой `/code-review`, конец — «код готов» или вопрос; у сессии пути
+v2 (`CANON_V2_TASK=1` от `session-run`, #340) — задание сессии v2 (`v2/task.py`) без `/implement`
+и `/code-review`, конец — «код готов», вопрос или «стоп» с причиной; с копией
 прода в песочнице (`CANON_PROD_COPY`, #307) — что «на проде» значит она, время её снимка и запрос
 свежей (`ticket fresh N`). Вопрос ждёт — задание забрать ответ (`ticket ask N`): сессию возобновил
 оркестратор после ответа. Маршрут остановлен — задание `ticket ship N --again`: оркестратор
@@ -64,6 +66,14 @@ ORCHESTRATED_TASK = """
   оркестратора; в теле — обе строки `**Владения:**` и `**Флаги:**` по образцу
   `.claude/canon/ticket-ownership.md` (без них тикет пойдёт один); свой тикет дальше — как
   обычно;"""
+# Сессия кода пути v2 (#340): задание `v2/task.py` вместо `/implement` и `/code-review`.
+V2_TASK = """Режим /start пути v2: владелец может быть не у экрана, ревью ошибок, отметку и
+ожидание мёржа ведёт оркестратор; сессия кончается на «код готов», вопросе или «стопе». Сделай
+тикет по заданию сессии v2 ниже.{extra}
+
+{rules}
+
+Вызов маршрута ({long}; ревью ошибок идёт 5–8 минут):"""
 # Копия прода под оркестратором (#307): живого прода и его API в песочнице нет.
 PROD_COPY_TASK = """
 - живого прода в песочнице нет: «на проде» в критериях тикета — обезличенная
@@ -219,11 +229,16 @@ def route(core, n: int, st, plan: dict) -> int:
         st["copy"] = copy  # базу сессии клонируют в начале работы — с этой копии (#307)
     st.save()
     extra = ORCHESTRATED_TASK.format(ask=core.ORCHESTRATED_ASK) if core.orchestrated() else ""
+    if core.v2_task():
+        extra = ""
     if copy := core.prod_copy(st):
         fresh = core.command("fresh", n)
         extra += PROD_COPY_TASK.format(copy=copy, fresh=fresh, long=core.LONG_CALL)
-    task = TASK.format(
-        n=n, ask=core.command("ask", n), long=core.LONG_CALL, extra=extra, until=core.until()
-    )
+    if core.v2_task():
+        task = V2_TASK.format(extra=extra, rules=core.v2_rules(n), long=core.LONG_CALL)
+    else:
+        task = TASK.format(
+            n=n, ask=core.command("ask", n), long=core.LONG_CALL, extra=extra, until=core.until()
+        )
     body = f"{enter(plan)}\n\n{previous}{task}"
     return core.emit(core.TURN, f"Тикет #{n}: режим /start", body, (core.command("ship", n),))

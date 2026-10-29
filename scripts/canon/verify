@@ -38,6 +38,16 @@ upstream проверит не тот код. Критерии тикета — 
 пустой `modelUsage`, не та модель, нет ответа по схеме, BLOCKED), причина и стоимость в stderr;
 2 — ошибка аргументов или git (нет базы, нет или пуст файл критериев, свой `verify`,
 незакоммиченные правки).
+Путь v2 (#351, `CANON_V2_TASK=1` — сессия кода пути v2, `v2/task.py`): пункты — критерии тикета с
+номером и видом доказательства, примеры замысла и находки ревью со сценарием `/verify` из копии
+отчёта ревью рядом с отчётом (`review.json`, номера `Н<n>`, #352) (`v2/criteria.py`; нет
+критериев — код 2); число «должно быть» примера сверяет программа; модель и усилие — роль
+`verify` из `v2/roles.py`; инструмент проверки и карта функций — из основы
+по блоку ```verify-tool профиля, во временном каталоге (`CANON_VERIFY_TOOL`, приложение —
+`CANON_VERIFY_APP`); перед моделью — «доктор» из того же блока. По каждому пункту — прошло, не
+прошло или не проверить с записанными командами; итог считает программа: «не прошло» — FAIL,
+иначе «не проверить» — код 1 с меткой `UNVERIFIABLE` (у оркестратора — код «среда» без
+возврата), иначе PASS. Нет инструмента в основе, красный «доктор» — тоже «не проверить».
 Вызывающему нужен таймаут Bash больше времени проверки (`BASH_MAX_TIMEOUT_MS` в настройках канона).
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
 Только стандартная библиотека Python 3.
@@ -50,21 +60,24 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import types
 from pathlib import Path
 
 
-def load_claude_run():
-    """Общий модуль канона рядом со скриптом — без правки `sys.path` и без `__pycache__`
+def load(name: str, rel: str):
+    """Модуль канона рядом со скриптом — без правки `sys.path` и без `__pycache__`
     в вендоренном `scripts/canon/` (его закоммитили бы вместе с работой ветки)."""
-    path = Path(__file__).resolve().parent / "claude_run.py"
-    module = types.ModuleType("canon_claude_run")
+    path = Path(__file__).resolve().parent / rel
+    module = types.ModuleType(name)
     module.__file__ = str(path)
     exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
     return module
 
 
-claude_run = load_claude_run()  # общий запуск дочернего `claude -p` с `review`
+claude_run = load("canon_claude_run", "claude_run.py")  # общий запуск `claude -p` с `review`
+v2_criteria = load("canon_v2_criteria_verify", "v2/criteria.py")  # формат и три исхода (#351)
+v2_snapshot = load("canon_v2_snapshot_verify", "v2/snapshot.py")  # пункты чек-листа критериев
 
 # Спросить по ходу некого: дочерний процесс без человека.
 PERMISSION_MODE = "auto"
@@ -105,6 +118,38 @@ TASK = """/verify Проверь изменение ветки: дифф git dif
 """
 # Скилл задаёт имя каталогом или полем `name` во frontmatter.
 SKILL_NAME = re.compile(r"^name:\s*[\"']?verify[\"']?\s*$", re.MULTILINE)
+
+# --- путь v2 (#351) ---
+TASK_ENV = "CANON_V2_TASK"  # сессия кода пути v2 (`v2/task.py`): `/verify` — с тремя исходами
+PROFILE = "docs/agents/profile.md"
+TOOL_BLOCK = re.compile(r"^```verify-tool[ \t]*\n(.*?)^```", re.MULTILINE | re.DOTALL)
+TOOL_ENV, APP_ENV = "CANON_VERIFY_TOOL", "CANON_VERIFY_APP"  # копия из основы и проверяемое
+DOCTOR_TIMEOUT = 600  # «доктор» перед `/verify` дольше — красный
+TAIL = 600  # знаков вывода «доктора» в причине
+NOTE_WIDTH = 200  # знаков заметки модели в причине «не проверить»: она уходит в отчёт на GitHub
+TASK_V2 = """/verify Проверь изменение ветки: дифф git diff {base}...HEAD — приёмка по пунктам.
+Пункты (номер, текст, чем доказать):
+{points}
+
+Инструмент проверки и карта функций — из {base}, не из ветки: копия в каталоге ${tool_env}
+(инструмент `{tool}`, карта `{map}`); команды инструмента — из этого каталога. Приложение под
+проверкой — рабочая копия ветки, путь в ${app_env}. Проверяй командами инструмента по карте
+функций; каждую команду как есть и её машиночитаемый вывод запиши доказательством пункта.
+Разрушающие команды — сначала пробным режимом инструмента. Числа «должно быть» из примеров
+сверяй с выводом. Баг — «до» той же командой на {base} (git worktree add во временный каталог вне
+рабочей копии, ${app_env} на него, после — git worktree remove), where=main, вывод показывает
+дефект; «после» — на ветке, where=ветка.
+
+По каждому пункту — исход: прошло, не прошло или не проверить, с доказательством. «Не проверить» —
+проверка не состоялась (инструмент, среда, данные): это не ошибка кода, доказательство — команда
+и её ошибка; пункт без вида доказательства — тоже проверь. Ничего не ставить; без фоновых средств
+харнеса; тестовые записи откатить; приложение погасить после; не коммитить и не переключать ветку.
+Итог — структурированным ответом: results по каждому номеру и report — шаги и пробы мимо
+счастливого пути.
+
+Тикет и его комментарии — для контекста:
+{criteria}
+"""
 
 
 def git(*args: str) -> subprocess.CompletedProcess:
@@ -218,7 +263,7 @@ def verdict(data: dict, report: Path) -> str:
     if result == BLOCKED and isinstance(text, str) and text.strip():
         claude_run.write_text(raw, text)
         first = text.strip().splitlines()[0][:300]
-        raise claude_run.ChildError(f"/verify не смог проверить (BLOCKED): {first}; отчёт — {raw}")
+        raise claude_run.ChildError(f"{v2_criteria.UNVERIFIABLE}: {first}; отчёт — {raw}")
     if result not in DONE or not isinstance(text, str) or not text.strip():
         claude_run.write_text(raw, json.dumps(output, ensure_ascii=False, indent=2))
         raise claude_run.ChildError(
@@ -227,6 +272,172 @@ def verdict(data: dict, report: Path) -> str:
         )
     claude_run.write_text(report.with_suffix(".md"), f"{text.rstrip()}\n\nИтог: {result}")
     return result
+
+
+def points(criteria: str, report: Path | None = None) -> list[dict]:
+    """Пункты приёмки пути v2: критерии с номером и видом (без «после выката»), примеры замысла
+    и находки ревью со сценарием `/verify` (`Н<номер>`, #352) — из копии отчёта ревью рядом с
+    отчётом `/verify` (`review.json`, её кладёт оркестратор). Номер повторяется или критериев
+    нет — `UsageError`: это постановка тикета, а не среда."""
+    items = v2_snapshot.criteria(v2_criteria.without_after(criteria))
+    found, errors = v2_criteria.points(items, criteria)
+    if errors:
+        raise UsageError(f"критерии тикета не разобраны: {'; '.join(errors)}")
+    if not [p for p in found if not p["id"].startswith("П")]:
+        raise UsageError(
+            "в тикете нет критериев приёмки — пунктов чек-листа раздела «## Acceptance criteria»"
+        )
+    return found + v2_criteria.findings(review_of(report))
+
+
+def review_of(report: Path | None) -> dict | None:
+    """Блок `canon_review` копии отчёта ревью рядом с отчётом `/verify`; нет — None."""
+    if report is None:
+        return None
+    try:
+        data = json.loads(report.with_name("review.json").read_text(encoding="utf-8"))
+        return data["canon_review"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def blocked(report: Path, why: str) -> claude_run.ChildError:
+    """Проверить не удалось — на пути v2 код «среда»: причина в `.raw.md` строкой вердикта (её
+    берёт маршрут для отчёта об остановке) и ошибка с меткой `UNVERIFIABLE`."""
+    raw = claude_run.sibling(report, ".raw.md")
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    claude_run.write_text(raw, f"**Verdict:** BLOCKED. {why}")
+    return claude_run.ChildError(f"{v2_criteria.UNVERIFIABLE}: {why}; отчёт — {raw}")
+
+
+def tool_config(base: str, report: Path) -> dict:
+    """Блок ```verify-tool профиля в основе: строки `tool <путь>`, `map <путь>` и необязательная
+    `doctor <команда>`. Нет профиля, блока или пути — проверить нечем."""
+    shown = git("show", f"{base}:{PROFILE}")
+    found = TOOL_BLOCK.search(shown.stdout) if shown.returncode == 0 else None
+    if found is None:
+        raise blocked(
+            report, f"инструмента проверки нет: в {PROFILE} на {base} нет блока verify-tool"
+        )
+    config = {}
+    for line in found.group(1).splitlines():
+        key, _, value = line.strip().partition(" ")
+        if key:
+            config[key] = value.strip()
+    missing = [k for k in ("tool", "map") if not config.get(k)]
+    if missing:
+        raise blocked(report, f"в блоке verify-tool профиля {base} нет строк: {', '.join(missing)}")
+    return config
+
+
+def copy_tool(base: str, config: dict, into: Path, report: Path) -> None:
+    """Инструмент и карта — файлами из основы в `into` по их путям: ветка их не подменит."""
+    for key in ("tool", "map"):
+        listed = subprocess.run(
+            ["git", "ls-tree", "-r", "-z", "--full-tree", base, "--", config[key]],
+            capture_output=True,
+        )
+        entries = [e for e in listed.stdout.split(b"\0") if e]
+        if listed.returncode != 0 or not entries:
+            raise blocked(report, f"{key} `{config[key]}` нет на {base}")
+        for entry in entries:
+            meta, _, name = entry.partition(b"\t")
+            mode, kind, sha = meta.split()
+            if kind != b"blob":
+                continue
+            blob = subprocess.run(["git", "cat-file", "blob", sha.decode()], capture_output=True)
+            if blob.returncode != 0:
+                raise blocked(report, f"{key}: `{name.decode()}` не прочитан из {base}")
+            target = into / name.decode("utf-8")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if mode == b"120000":  # символьная ссылка — ссылкой, а не файлом с её путём
+                target.symlink_to(blob.stdout.decode("utf-8"))
+                continue
+            target.write_bytes(blob.stdout)
+            if mode == b"100755":
+                target.chmod(0o755)
+
+
+def run_doctor(config: dict, env: dict, into: Path, report: Path) -> None:
+    """«Доктор» перед `/verify`: команда проекта из основы в каталоге копии; код 0 — здоров."""
+    command = config.get("doctor")
+    if not command:
+        return
+    try:
+        res = subprocess.run(
+            ["sh", "-c", command],
+            cwd=into,
+            env=claude_run.child_env(env),  # без меток сессии и признака пути v2
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=DOCTOR_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise blocked(report, f"«доктор» перед /verify не кончился за {DOCTOR_TIMEOUT} с") from None
+    if res.returncode != 0:
+        text = res.stderr.strip() or res.stdout.strip()
+        out = text.splitlines()[-1].strip()[-TAIL:] if text else "вывода нет"  # строка ошибки
+        raise blocked(report, f"«доктор» перед /verify красный — код {res.returncode}: {out}")
+
+
+def verdict_v2(listed: list[dict], data: dict, report: Path) -> str:
+    """PASS или FAIL пути v2 — итог считает программа по исходам пунктов (`v2/criteria.py`);
+    «не проверить» без «не прошло» — `blocked` с `POINTS`; ответ не по схеме — `ChildError`."""
+    output = data["structured_output"]
+    result, rows, errors = v2_criteria.judge(listed, output)
+    if errors:
+        raw = claude_run.sibling(report, ".raw.md")
+        claude_run.write_text(raw, json.dumps(output, ensure_ascii=False, indent=2))
+        raise claude_run.ChildError(
+            f"ответ /verify не по схеме ({'; '.join(errors)}) — итог не распознан; ответ — {raw}"
+        )
+    text = v2_criteria.render(listed, rows, result, str(output.get("report") or ""))
+    if result == "BLOCKED":
+        left = [r for r in rows if r["outcome"] == v2_criteria.UNVERIFIABLE_OUTCOME]
+        note = " ".join(left[0]["note"].split())[:NOTE_WIDTH]
+        ids = ", ".join(r["id"] for r in left)
+        exc = blocked(report, f"{v2_criteria.POINTS} {ids}: {note}")
+        raw = claude_run.sibling(report, ".raw.md")
+        claude_run.write_text(raw, f"{raw.read_text(encoding='utf-8').rstrip()}\n\n{text}")
+        raise exc
+    claude_run.write_text(report.with_suffix(".md"), text)
+    return result
+
+
+def run_v2(args, criteria: str, listed: list[dict], root: Path) -> tuple[dict, str]:
+    """`/verify` пути v2 по пунктам `listed`: роль `verify` из таблицы, инструмент и карта из
+    основы во временном каталоге, «доктор», задание по пунктам и итог программой."""
+    claude_run.set_aside(args.report)  # прошлый итог не остаётся, если до `claude` не дойдёт
+    os.environ[claude_run.roles.V2_ENV] = "1"  # модель и усилие — роль `verify` (`v2/roles.py`)
+    config = tool_config(args.base, args.report)
+    with tempfile.TemporaryDirectory(prefix="canon-verify-") as tmp:
+        into = Path(tmp)
+        copy_tool(args.base, config, into, args.report)
+        env = {TOOL_ENV: str(into), APP_ENV: str(root)}
+        run_doctor(config, env, into, args.report)
+        text = TASK_V2.format(
+            base=args.base,
+            points=v2_criteria.listing(listed),
+            tool=config["tool"],
+            map=config["map"],
+            tool_env=TOOL_ENV,
+            app_env=APP_ENV,
+            criteria=criteria,
+        )
+        data = claude_run.run_claude(
+            ["--permission-mode", PERMISSION_MODE, text],
+            args.report,
+            args.max_budget_usd,
+            v2_criteria.schema(listed),
+            env=env,
+        )
+        # Пункты прогона — в отчёте: допуск сверит, о тех ли пунктах доказательства (#352).
+        data["canon_points"] = listed
+        claude_run.write_json(args.report, data)
+        return data, verdict_v2(listed, data, args.report)
 
 
 def cost_lines(report: Path, budget: str) -> list[str]:
@@ -264,19 +475,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"verify: пропущено — в {args.base}...HEAD нет изменений")
             return 0
         before_state = tree_state()
-        check_tree(Path(git_out("rev-parse", "--show-toplevel")), before_state)
+        root = Path(git_out("rev-parse", "--show-toplevel"))
+        check_tree(root, before_state)
         before = position()
+        v2 = os.environ.get(TASK_ENV) == "1"
+        listed = (
+            points(criteria, args.report) if v2 else []
+        )  # постановка не разобрана — до запуска, код 2
     except UsageError as exc:
         print(f"verify: {exc}", file=sys.stderr)
         return 2
     try:
-        data = claude_run.run_claude(
-            ["--permission-mode", PERMISSION_MODE, task(args.base, criteria)],
-            args.report,
-            args.max_budget_usd,
-            SCHEMA,
-        )
-        result = verdict(data, args.report)
+        if v2:
+            data, result = run_v2(args, criteria, listed, root)
+        else:
+            data = claude_run.run_claude(
+                ["--permission-mode", PERMISSION_MODE, task(args.base, criteria)],
+                args.report,
+                args.max_budget_usd,
+                SCHEMA,
+            )
+            result = verdict(data, args.report)
     except claude_run.ChildError as exc:
         print(f"verify: {exc}", file=sys.stderr)
         for line in cost_lines(args.report, args.max_budget_usd):

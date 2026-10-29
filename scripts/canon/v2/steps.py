@@ -15,9 +15,23 @@ from __future__ import annotations
 
 def steps(orch) -> dict:
     """Шаг тикета пути v2 по фазе: `(номер, тикет) -> None`. CI — нынешний шаг с разбором причин
-    красного по отчёту о каждом тесте (`v2/ci.py`, #335)."""
+    красного по отчёту о каждом тесте (`v2/ci.py`, #335) и допуском к слиянию (`v2/gates.py`,
+    #346); тест ревьюера между ревью и разбором (`v2/rtest.py`, #344). CI и мёрж начинаются с
+    висящего догона на сервере и долга `/verify` после него (`v2/catchup.py`, #348)."""
+
+    def settled(n: int, t: dict) -> bool:
+        catchup = orch.catchup()
+        return catchup.settle(n, t, "ci") and catchup.verify_again(n, t)
 
     def ci(n: int, t: dict) -> None:
-        orch.ci(n, t, cause=orch.cause())
+        if settled(n, t):
+            orch.ci(n, t, cause=orch.cause(), gate=orch.gates())
 
-    return {"session": orch.session_over, "ci": ci, "merge": orch.merge}
+    def merge(n: int, t: dict) -> None:
+        if settled(n, t) and t["phase"] == "merge":  # догон на мёрже — снова шаг CI
+            orch.merge(n, t)
+
+    def rtest(n: int, t: dict) -> None:
+        orch.rtest().step(n, t)
+
+    return {"session": orch.session_over, "rtest": rtest, "ci": ci, "merge": merge}

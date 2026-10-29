@@ -5,6 +5,9 @@
   Руками не ставить: `<копия канона>/project/scripts/canon/orchestrator service install` из
   главного чекаута проекта подставит Label, ProgramArguments, WorkingDirectory, логи и PATH и
   положит plist в ~/Library/LaunchAgents. Как устроено — docs/orchestrator.md канона.
+  Интерпретатор службы — тот Python, что запустил `service install`: запускать его под
+  Python 3.12 Homebrew (`/opt/homebrew/bin/python3.12 <копия>/project/scripts/canon/orchestrator
+  service install`, #376), не системным 3.9; строку «служба: Python» проверяет `canon-release`.
   Файл вендорится из канона alexkabchina-arch/workflow: руками не править.
 -->
 <plist version="1.0">
@@ -13,7 +16,7 @@
 	<string>canon.orchestrator</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>python3</string>
+		<string>/opt/homebrew/bin/python3.12</string>
 		<string>orchestrator</string>
 		<string>tick</string>
 	</array>

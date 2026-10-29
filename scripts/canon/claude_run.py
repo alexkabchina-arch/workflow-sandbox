@@ -306,12 +306,16 @@ def last_result(stdout: str, events: list) -> dict:
     return final
 
 
+def failed(data: dict) -> bool:
+    """Итог `claude -p` — сбой: `subtype` не `success` или `is_error` (отказ соединения приходит
+    как `success` с `is_error`, живой прогон #349). Одно правило для всех, кто читает итог."""
+    return data.get("subtype") != "success" or bool(data.get("is_error"))
+
+
 def trailing_warning(data: dict) -> str | None:
     """Хвостовой ход после ответа по схеме кончился ошибкой — текст предупреждения, иначе None."""
     tail = data.get("trailing_result")
-    if not isinstance(tail, dict) or (
-        tail.get("subtype") == "success" and not tail.get("is_error")
-    ):
+    if not isinstance(tail, dict) or not failed(tail):
         return None
     reason = (
         "упёрся в предел --max-budget-usd"
@@ -332,7 +336,7 @@ def check_result(data: dict, report: Path, budget: str, code: int, model: str = 
             f"Сырой результат — {report}. "
             "Объём слишком велик для предела: разбить ветку или поднять предел решением владельца."
         )
-    if subtype != "success" or data.get("is_error"):
+    if failed(data):
         raise ChildError(
             f"завершилось ошибкой (subtype {subtype}, is_error {data.get('is_error')}, "
             f"код {code}); сырой результат — {report}"
