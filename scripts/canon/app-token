@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """app-token — часовые токены лица агента (GitHub App) для сессии тикета и оркестратора (#212).
 
-    scripts/canon/app-token issue   --kind session|orchestrator [--repo OWNER/NAME] [--app-id ID]
+    scripts/canon/app-token issue   --kind session|reader|orchestrator [--repo ВЛАДЕЛЕЦ/ИМЯ]
+                                    [--app-id ID]
     scripts/canon/app-token refresh --kind … --repo … --app-id … --file ФАЙЛ [--margin СЕК]
     scripts/canon/app-token keep    --kind … --repo … --app-id … --file ФАЙЛ [--every СЕК] […]
     scripts/canon/app-token shims   --file ФАЙЛ --dir КАТАЛОГ [--gh ПУТЬ]
@@ -13,11 +14,15 @@
 
 - `session` — токен сессии: contents, pull requests, issues — запись; checks, statuses, actions —
   чтение (статус PR и логи CI); без записи статусов, без administration и workflows;
-- `orchestrator` — токен оркестратора: то же плюс запись статусов (отметка `review`) и Actions
-  (перезапуск упавших задач CI на пути v2, #335; файлы workflow это право не меняет); установка
-  App ещё без записи Actions (GitHub — 422) — токен с чтением Actions и строка в stderr. Авто-мёрж
-  включают оба: отдельного права у GitHub нет, хватает contents и pull requests (проба #212);
-  слияние без отметки `review` от владельца или App он всё равно не даст.
+- `reader` — токен сессии пути v2 (#341): всё то же только на чтение — contents, pull requests,
+  issues, checks, statuses, actions. Отправить ветку, открыть PR и править тикет сессия v2 не
+  может: на GitHub действует только оркестратор, вопросы и отчёты сессии он публикует из её файлов;
+- `orchestrator` — токен оркестратора: набор `session` плюс запись статусов (отметка `review`),
+  Actions (перезапуск упавших задач CI на пути v2, #335) и `workflows` (отправка ветки, чьи
+  коммиты меняют файлы CI, — только с разрешения владельца, #341). Установка App ещё без такого
+  права (GitHub — 422) — токен без него и строка в stderr: сначала без `workflows`, затем и с
+  чтением Actions. Авто-мёрж включают оба: отдельного права у GitHub нет, хватает contents и pull
+  requests (проба #212); слияние без отметки `review` от владельца или App он всё равно не даст.
 
 Выданные права и репозиторий сверяются с ответом GitHub: токен шире набора (лишнее право, уровень
 выше запрошенного) или не на один репозиторий не отдаётся (код 1).
@@ -90,9 +95,15 @@ SESSION = {
     "statuses": "read",
     "actions": "read",
 }
-# Оркестратор: ещё запись статусов (отметка `review`) и Actions — перезапуск упавших задач CI
-# на пути v2 (`gh run rerun --failed`, #335).
-KINDS = {"session": SESSION, "orchestrator": {**SESSION, "statuses": "write", "actions": "write"}}
+# Сессия пути v2 (#341): тот же набор только на чтение.
+READER = {name: "read" for name in SESSION}
+# Оркестратор: ещё запись статусов (отметка `review`), Actions — перезапуск упавших задач CI на
+# пути v2 (`gh run rerun --failed`, #335) и `workflows` — отправка ветки с файлами CI по
+# разрешению владельца (#341).
+ORCHESTRATOR = {**SESSION, "statuses": "write", "actions": "write", "workflows": "write"}
+KINDS = {"session": SESSION, "reader": READER, "orchestrator": ORCHESTRATOR}
+# Установка App ещё без права (GitHub — 422): по шагу уже, пока не выдаст, — строка в stderr.
+NARROWER = (("workflows", None, "без права workflows"), ("actions", "read", "без записи Actions"))
 # DigestInfo SHA-256 для EMSA-PKCS1-v1_5 (RFC 8017, 9.2, примечание 1).
 SHA256_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
 REMOTE = re.compile(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
@@ -246,19 +257,26 @@ def issue(kind: str, repo: str, app_id: str, now: float, pem=keychain_pem, call=
     token = jwt(app_id, private_key(pem(app_id)), now)
     installation = call("GET", f"/repos/{repo}/installation", token)
     name = repo.split("/", 1)[1]
-    wanted = KINDS[kind]
+    full = KINDS[kind]
     path = f"/app/installations/{installation['id']}/access_tokens"
     try:
-        try:
-            reply = call("POST", path, token, {"repositories": [name], "permissions": wanted})
-        except Failure as error:
-            # Установка App ещё без записи Actions (422): прежний набор — такт идёт, перезапуск
-            # CI на пути v2 остановится с причиной (#335).
-            if wanted.get("actions") != "write" or "HTTP 422" not in str(error):
-                raise
-            print(f"app-token: {error} — токен без записи Actions", file=sys.stderr)
-            wanted = {**wanted, "actions": "read"}
-            reply = call("POST", path, token, {"repositories": [name], "permissions": wanted})
+        # Установка App ещё без записи Actions или `workflows` (422): набор уже — такт идёт,
+        # перезапуск CI на пути v2 (#335) или отправка с файлами CI (#341) остановится с
+        # причиной. Сужения — по одному, затем оба: недостающее одно право не уносит другое.
+        steps = [s for s in NARROWER if full.get(s[0]) == "write"]
+        tries = [(), *((s,) for s in steps), *([tuple(steps)] if len(steps) > 1 else [])]
+        for i, narrow in enumerate(tries):
+            wanted = dict(full)
+            for key, level, _ in narrow:
+                wanted = {k: v for k, v in {**wanted, key: level}.items() if v is not None}
+            try:
+                reply = call("POST", path, token, {"repositories": [name], "permissions": wanted})
+                break
+            except Failure as error:
+                if i == len(tries) - 1 or "HTTP 422" not in str(error):
+                    raise
+                said = " и ".join(s[2] for s in tries[i + 1])
+                print(f"app-token: {error} — пробую токен {said}", file=sys.stderr)
         granted = reply.get("permissions") or {}
         repos = [r.get("full_name") or r.get("name") for r in reply.get("repositories") or []]
         data = {"token": reply["token"], "expires_at": reply["expires_at"]}

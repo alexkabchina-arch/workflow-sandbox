@@ -5,6 +5,7 @@
         [--resume <id сессии>] [--prompt <текст>] [--run <метка>] [-- <аргументы claude>]
     scripts/canon/session-run <номер тикета> --retire <head>    # уборка после мёржа
     scripts/canon/session-run <номер тикета> --discard          # повтор с чистого листа
+    scripts/canon/session-run <номер тикета> --handover [--save]  # отчёт передачи v2
 
 Тонкая оболочка: вся стартовая логика — в `session-start` (его можно вызвать и сам, первым шагом
 уже открытой сессии). Здесь только способ запуска: `claude` прямо в каталоге worktree (иначе
@@ -38,8 +39,15 @@
   тикета нет или в нём уже идёт сессия — код 2. Только headless: оркестратор возобновляет
   `claude -p`. Время запуска — `CANON_RUN_STARTED`: Stop-хук не засчитает этому запуску отчёт
   об остановке прошлого.
+- Тикет пути v2 (`CANON_CHECKS_HOOK=1` от оркестратора, #338): в worktree сессии — хук быстрых
+  проверок на коммите (`v2/checks.py`), и при `--resume` тоже (повтор безопасен); в профиле нет
+  блока ```fast-checks — хук не ставится, предупреждение в stderr.
 - `--prompt` без `--resume` — только под оркестратором: новая сессия вместо потерянной (её
-  транскрипт удалён с песочницей, #262) получает то же задание оркестратора (догон, CI).
+  транскрипт удалён с песочницей, #262) получает то же задание оркестратора (догон, CI); на
+  пути v2 — каждый возврат (#339): новая сессия с тикетом, диффом и отчётом передачи в промпте.
+- Сессия тикета v2 (тот же признак `CANON_CHECKS_HOOK=1`) получает в окружение `claude` признак
+  задания v2 (`CANON_V2_TASK=1`, `v2/task.py`, #340): по нему `ticket start` и `ticket ask` дают
+  задание сессии v2 вместо `/implement` с `/code-review`.
 
 Под оркестратором `session-run` идёт **внутри песочницы проекта** (`sbx exec`, #241), в клоне
 оркестратора, — и всё, что трогает git клона, тоже идёт здесь, внутри: оркестратор на Mac git в
@@ -56,6 +64,12 @@
   ресурсами проекта (`cleanup`) и записью реестра, локальная ветка и состояние маршрута
   `canon-ticket/N`. В worktree идёт сессия, ресурсы не убраны или git отказал — код 1 и причина;
   повтор безопасен.
+- `--handover [--save]` — факты ветки для отчёта передачи пути v2, когда запуск кончился
+  (#339): с `--save` (запуск оборван или не на «код готов») отслеживаемые правки — коммитом в
+  ветку только локально (без `push`; хук быстрых проверок — как у сессии; новые файлы — только
+  списком, слияние с конфликтом не коммитится); коммиты и дифф от `origin/main`,
+  незакоммиченное, отчёт сессии `.ticket/handover.md` (его убирает оркестратор, сохранив у себя).
+  Итог — JSON последней строкой; в worktree идёт сессия или git отказал — код 1.
 
 Код выхода — код `session-start`, если он не 0 (2 — и неверные аргументы, и в worktree уже идёт
 сессия); иначе — код `claude`.
@@ -105,6 +119,9 @@ def load(name: str, filename: str):
 claude_run = load("canon_claude_run", "claude_run.py")  # предел — как у `review` и `verify`
 session_start = load("canon_session_start", "session-start")
 core = session_start.core
+checks = load("canon_v2_checks_session_run", "v2/checks.py")  # хук быстрых проверок (#338)
+handover_note = load("canon_v2_handover_session_run", "v2/handover.py")  # отчёт передачи
+v2_task = load("canon_v2_task_session_run", "v2/task.py")  # задание сессии v2 (#340)
 
 
 def route_rules(worktree: Path, number: int) -> list[str]:
@@ -199,6 +216,67 @@ def discard(number: int) -> int:
     return 0
 
 
+def handover(number: int, save: bool) -> int:
+    """Факты ветки для отчёта передачи пути v2 (#339). `save` — запуск оборван или кончился не
+    на «код готов» (решает оркестратор): отслеживаемые правки — коммитом в ветку только локально
+    (`push` нет), хук быстрых проверок — как у коммита сессии. Новые файлы не коммитятся (в
+    worktree могут лежать выгрузки копии прода, `.env` — чего нет в `.gitignore`): они остаются
+    в worktree, где работает и следующая сессия, и идут списком. Слияние с конфликтом не
+    закончено или хук отказал — коммита нет, причина — в итоге. Затем коммиты и дифф ветки от
+    `origin/main`, незакоммиченное и отчёт сессии (`NOTE` из `v2/handover.py`: его убирает
+    оркестратор, когда сохранил у себя). Итог — JSON последней строкой; worktree нет —
+    `{"worktree": false}`. В worktree идёт сессия или git отказал — код 1."""
+    worktree = core.worktree_of(number)
+    if worktree is None:
+        print(json.dumps({"worktree": False}))
+        return 0
+    lock = session_start.take_lock(worktree)
+    if lock is None:
+        session_start.note(f"в {worktree} ещё идёт сессия — отчёт передачи не собран")
+        return 1
+    with lock:
+
+        def git(*args: str) -> str:
+            return core.git(*args, cwd=worktree)
+
+        note = worktree / handover_note.NOTE
+        text = note.read_text(encoding="utf-8", errors="replace") if note.is_file() else None
+        saved = unsaved = None
+        if save and git("status", "--porcelain", "--untracked-files=no"):
+            merging = core.run("git", "rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=worktree)
+            if merging.returncode == 0 or git("diff", "--name-only", "--diff-filter=U"):
+                unsaved = "слияние не закончено (конфликт) — правки в worktree, не коммитом"
+            else:
+                git("add", "-u")
+                message = f"#{number}: незавершённая работа прошлого запуска (оркестратор)"
+                res = core.run("git", "commit", "-q", "-m", message, cwd=worktree)
+                if res.returncode == 0:
+                    saved = git("rev-parse", "HEAD")
+                else:
+                    git("reset", "-q")
+                    why = (res.stderr or res.stdout).strip().splitlines()
+                    unsaved = f"коммит сохранения не прошёл: {why[-1] if why else 'git commit'}"
+        data = {
+            "worktree": True,
+            "head": git("rev-parse", "HEAD"),
+            "saved": saved,
+            "unsaved": unsaved,
+            "changed": git("status", "--porcelain", "--untracked-files=no").splitlines(),
+            "untracked": [
+                f
+                for f in git("ls-files", "--others", "--exclude-standard").splitlines()
+                if not f.startswith(f"{core.ANSWERS}/")
+            ],
+            "commits": git("log", "--format=%h %s", "origin/main..HEAD").splitlines(),
+            "stat": git("diff", "--stat", "origin/main...HEAD"),
+            "diff": git("diff", "origin/main...HEAD"),
+            "note": text,
+        }
+    # ASCII: U+2028 и NEL из диффа иначе разрезали бы строку при разборе по строкам.
+    print(json.dumps(data))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     extra = []
@@ -224,10 +302,18 @@ def main(argv: list[str] | None = None) -> int:
     cleanup.add_argument(
         "--discard", action="store_true", help="worktree, ветка и состояние — с чистого листа"
     )
+    cleanup.add_argument(
+        "--handover", action="store_true", help="факты ветки для отчёта передачи пути v2"
+    )
+    parser.add_argument(
+        "--save", action="store_true", help="с --handover: правки — коммитом только локально"
+    )
     args = parser.parse_args(argv)
-    if args.retire or args.discard:
+    if args.retire or args.discard or args.handover:
         try:
             number = ticket_number(args.ticket)
+            if args.handover:
+                return handover(number, args.save)
             return retire(number, args.retire) if args.retire else discard(number)
         except session_start.UsageError as exc:
             session_start.note(str(exc))
@@ -268,6 +354,10 @@ def main(argv: list[str] | None = None) -> int:
     if code != 0:
         return code
     (lock,) = held
+    v2 = os.environ.get(checks.HOOK_ENV) == "1"  # тикет пути v2 (признак от оркестратора)
+    if v2:  # хук быстрых проверок (#338)
+        installed, line = checks.install(Path(plan["worktree"]))
+        print(f"session-run: {line}", file=sys.stdout if installed else sys.stderr)
     start = f"/start {args.ticket.lstrip('#')}"
     prompt = (args.prompt or start) if args.resume or orchestrated else plan["prompt"]
 
@@ -289,6 +379,10 @@ def main(argv: list[str] | None = None) -> int:
     # остановке прошлого запуска иначе засчитался бы этому.
     env["CANON_RUN_STARTED"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     env.pop("CANON_ENFORCE_STOP", None)
+    env.pop(checks.HOOK_ENV, None)  # признак — только для установки хука
+    env.pop(v2_task.ENV, None)
+    if v2:  # маршрут даст задание сессии v2 вместо `/implement` (#340)
+        env[v2_task.ENV] = "1"
     if args.headless:
         # Stop-хук (`stop-check`) держит только headless-сессию: в интерактивной владелец рядом.
         env["CANON_ENFORCE_STOP"] = "1"

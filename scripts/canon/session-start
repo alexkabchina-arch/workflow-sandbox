@@ -128,6 +128,9 @@ CLEANUP = "scripts/session/cleanup"
 REVIEW = "review"
 GUARD = "review-guard"  # сторож отметки (#163): без отметки он красный — это не красный CI
 GUARD_ATTEMPTS = 3  # прогон сторожа и два перезапуска (#176)
+# Точечный прогон тестов ревьюера (#336, `v2/spot.py`): `pull_request_target` по метке, его задачи
+# видны в проверках PR, но это не CI PR — итог читает свой шаг; отменённый или упавший — не красный.
+SPOT_WORKFLOW = "reviewer-tests"
 GUARD_RUN = re.compile(r"https://[^/]+/([^/]+/[^/]+)/actions/runs/(\d+)(?:/.*)?")
 IN_PROGRESS = "in-progress"
 QUEUED = "agent:queued"  # тикет в очереди оркестратора (#221)
@@ -516,6 +519,12 @@ def sweep_branch(
     return failed, left
 
 
+def v2_session() -> bool:
+    """Сессия тикета пути v2 под оркестратором (#341) — у неё токен на чтение: признак задания
+    v2 (`claude` и его команды) или признак тикета v2 от оркестратора (сам `session-run`)."""
+    return core.orchestrated() and (core.v2_task() or os.environ.get("CANON_CHECKS_HOOK") == "1")
+
+
 def unmark_merged(branch: str) -> None:
     """Метка `in-progress` тикета ветки снимается: PR слит, сессия кончилась (решение владельца
     13.10, #156). Есть другая ветка того же тикета (локально или на сервере) — не снимается: там
@@ -534,6 +543,8 @@ def unmark_merged(branch: str) -> None:
         names = {r.removeprefix("origin/") for r in refs.split()} - {branch}
         if any(re.match(rf"^ticket-{number}(-.+)?$", name) for name in names):
             note(f"тикет #{number}: метка {IN_PROGRESS} оставлена — у тикета есть другая ветка")
+            return
+        if v2_session():  # токен сессии v2 — только чтение: метку снимает оркестратор (#341)
             return
         issue = json.loads(run("gh", "issue", "view", number, "--json", "labels"))
         if IN_PROGRESS in {lb["name"] for lb in issue.get("labels") or []}:
@@ -593,14 +604,15 @@ def is_red(item: dict) -> bool:
 
 
 def failed_checks(pr: dict) -> list[str]:
-    """Красные проверки, кроме сторожа: без отметки он — «нет отметки» (её ставит финиш), при
-    отметке — перезапуск его прогона (`failed_guard`, `rerun_guard`)."""
+    """Красные проверки, кроме сторожа и точечного прогона тестов ревьюера: сторож без отметки —
+    «нет отметки» (её ставит финиш), при отметке — перезапуск его прогона (`failed_guard`,
+    `rerun_guard`)."""
     return [
         f"{item.get('name') or item.get('context')}="
         f"{item.get('conclusion') or item.get('state')}"
         + (f" ({url})" if (url := item.get("detailsUrl") or item.get("targetUrl")) else "")
         for item in pr.get("statusCheckRollup") or []
-        if is_red(item) and item.get("name") != GUARD
+        if is_red(item) and item.get("name") != GUARD and item.get("workflowName") != SPOT_WORKFLOW
     ]
 
 
@@ -911,6 +923,8 @@ def check_ticket(number: int) -> bool:
 def mark_ticket(number: int) -> None:
     """Метка и исполнитель — после повторной проверки: за время `setup` тикет мог занять другой."""
     if not check_ticket(number):
+        return
+    if v2_session():  # токен сессии v2 — только чтение: метку ставит оркестратор (#341)
         return
     if core.orchestrated():
         run("gh", "issue", "edit", str(number), "--add-label", IN_PROGRESS)

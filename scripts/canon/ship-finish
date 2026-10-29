@@ -5,7 +5,7 @@
         --review-report <отчёт.json> [--ready-for-human <строка>] [--weakening <решение>]
     scripts/canon/ship-finish --pr-only --title … --body-file … --review-report … [флаги выше]
     scripts/canon/ship-finish --mark --review-report <отчёт.json> [--ready-for-human …]
-        [--weakening …]
+        [--weakening …] [--hold]
     scripts/canon/ship-finish --unconfirmed <отчёт>
 
 Из корня проекта, на ветке с закоммиченной работой. По порядку:
@@ -22,9 +22,17 @@
    без CI, исключение 3б, #328; блок берётся не из ветки — ветка не снимет ворота сама себе): его
    команды (`имя: команда`) и затронутые тесты — файлы `tests/test*.py`, упоминающие изменённый
    файл ветки, а для изменённого модуля скриптов (`project/scripts/canon/*.py`) — и скрипты,
-   которые его упоминают; каждый — своей командой `python3 -m unittest` под `run-log`, во
-   временном worktree на проверяемом коммите (неотслеживаемые файлы не участвуют). Хоть одно
-   красное — отказ (код 3) со списком: имя, код выхода и лог; ничего не отправлено, отметки нет.
+   которые его упоминают; `test_session_start`, `test_ticket_start`, `test_stop_check` и
+   `test_review_guard` (старый путь) — только когда ветка меняет свой скрипт или сам тест (#376).
+   Каждая команда — под `run-log`, во временном worktree на проверяемом коммите
+   (неотслеживаемые файлы не участвуют); затронутые тесты — одним прогоном в машине Docker
+   Sandboxes, `scripts/vm-test run --commit <коммит> -- <файлы>` (#376), а где запускателя нет —
+   каждый своей командой `python3 -m unittest`. Хоть одно красное — отказ (код 3) со списком:
+   имя, код выхода и лог (у прогона в машине — и итог `run.py` с упавшими файлами); ничего не
+   отправлено, отметки нет. Машина занята другим прогоном — ворота ждут её до 30 минут. Набора в
+   машине не было (нет `sbx` или образа, занята дольше, сбой машины) и остальное зелёное — отказ
+   с кодом 1 и выходом: повторить или прогон на Mac, `CANON_TESTS_ON_MAC=1` перед той же
+   командой.
    Зелёный коммит запоминается (`canon-gates-green` в каталоге git) — повтор ворот не гоняет.
    Блока нет (проекты) — ворот нет. Те же ворота — и у `--mark` перед отметкой.
    Затем `git push -u origin <HEAD>:refs/heads/<ветка>` — ровно проверенный коммит (без force) и
@@ -63,7 +71,9 @@
 PR, признак `--ready-for-human`): без авто-мёржа и отметки, этих прав у сессии нет. `--mark` —
 шаги 3–4 для оркестратора токеном App: без push, ветка на сервере должна быть ровно локальным
 HEAD, открытый PR ветки уже есть (черновик — снова готов к ревью); отчёт ревью и решение
-`--weakening` сверяются так же. Запуск — из worktree тикета (любого чекаута на ветке). Без флагов
+`--weakening` сверяются так же. `--mark --hold` — отметка без авто-мёржа (включённый — выключается):
+допуск пути v2 у тикета с флагом «миграция» ждёт «да» владельца (#346), затем `--mark` без него.
+Запуск — из worktree тикета (любого чекаута на ветке). Без флагов
 — все шаги, как в ручной сессии.
 `--unconfirmed <причина>` — отчёт об остановке: комментарий с первой строкой «Отчёт об остановке»
 (его ищет Stop-хук) и метка `ready-for-human`, без push и без отметки; пустая причина — отказ
@@ -87,11 +97,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -101,6 +113,24 @@ RUN_LOG_END = re.compile(r"^run-log: завершено с кодом \S+ · л�
 GATES_BLOCK = re.compile(r"^```gates[ \t]*\n(.*?)^```", re.M | re.S)
 CANON_SCRIPTS = Path("project/scripts/canon")
 GATES_GREEN = "canon-gates-green"  # зелёные коммиты ворот, в каталоге git
+# Тесты старого пути (#376): в воротах — только когда ветка меняет свой скрипт (или сам тест);
+# перед тегом полный набор гоняет и их. Ослабление — по слову владельца 27.10.
+OLD_PATH = {
+    "tests/test_session_start.py": f"{CANON_SCRIPTS}/session-start",
+    "tests/test_ticket_start.py": f"{CANON_SCRIPTS}/ticket_start.py",
+    "tests/test_stop_check.py": f"{CANON_SCRIPTS}/stop-check",
+    "tests/test_review_guard.py": f"{CANON_SCRIPTS}/review-guard",
+}
+VM_TEST = Path("scripts/vm-test")  # запускатель машины тестов воркфлоу (#376)
+# Коды `vm-test`, при которых набора не было: ошибка запуска, занято, сбой машины.
+VM_NO_RUN = {
+    2: "машины нет (`sbx` или образ) — `scripts/vm-test image` или прогон на Mac: "
+    "`CANON_TESTS_ON_MAC=1` перед той же командой",
+    3: "машина тестов занята другим прогоном дольше 30 минут — повторить позже",
+    4: "сбой машины тестов — повторить; не проходит — прогон на Mac: `CANON_TESTS_ON_MAC=1`",
+    130: "прогон в машине прерван — повторить",
+}
+VM_BUSY, VM_BUSY_POLL, VM_BUSY_WAIT = 3, 30, 1800  # код «занято», опрос и предел ожидания, с
 CONTEXT = "review"
 TARGET = "origin/main"
 LABEL = "ready-for-human"
@@ -257,10 +287,29 @@ def affected_tests(root: Path, sha: str) -> list[str]:
     chosen = []
     for test in sorted((root / "tests").glob("test*.py")):
         rel = test.relative_to(root)
+        if (own := OLD_PATH.get(rel.as_posix())) and not {rel, Path(own)} & set(changed):
+            continue  # старый путь — только при правке своего скрипта (#376)
         text = test.read_text(encoding="utf-8", errors="replace")
         if rel in changed or any(name in text for name in names):
             chosen.append(rel.as_posix())
     return chosen
+
+
+def vm_busy_wait() -> float:
+    """Сколько ждать занятую машину тестов: `CANON_VM_BUSY_WAIT` секунд (тесты), иначе 30 мин."""
+    try:
+        return float(os.environ.get("CANON_VM_BUSY_WAIT", VM_BUSY_WAIT))
+    except ValueError:
+        return VM_BUSY_WAIT
+
+
+def suite_summary(log: Path) -> str | None:
+    """Итог `run.py` («… УПАЛИ: файлы») из лога прогона в машине."""
+    try:
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    return next((x for x in reversed(lines) if x.startswith("run.py: тестов: ")), None)
 
 
 def check_gates(sha: str) -> None:
@@ -285,24 +334,49 @@ def check_gates(sha: str) -> None:
         return
     tmp = Path(tempfile.mkdtemp(prefix="ship-finish-gates-"))
     tree = tmp / "tree"
-    failed = []
+    failed, no_run = [], None
     try:
         run("git", "worktree", "add", "-q", "--detach", str(tree), sha)
-        gates += [
-            (test, [sys.executable, "-m", "unittest", test]) for test in affected_tests(tree, sha)
-        ]
+        tests = affected_tests(tree, sha)
+        vm = None
+        if tests and (tree / VM_TEST).is_file():
+            # Затронутые тесты — одним прогоном в машине (#376), а не по файлу на Mac.
+            vm = f"тесты в машине ({len(tests)})"
+            gates.append((vm, [sys.executable, str(VM_TEST), "run", "--commit", sha, "--", *tests]))
+        else:
+            gates += [(test, [sys.executable, "-m", "unittest", test]) for test in tests]
         for name, argv in gates:
             print(f"ship-finish: ворота — {name}", flush=True)
             label = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "gate"
+            label = "vm-test" if name == vm else label
             cmd = [sys.executable, str(HERE / "run-log"), "-n", "0", "-l", label, "--", *argv]
-            res = subprocess.run(cmd, cwd=tree, capture_output=True, text=True, check=False)
+            waited, limit = 0.0, vm_busy_wait()
+            while True:
+                res = subprocess.run(cmd, cwd=tree, capture_output=True, text=True, check=False)
+                # Машина занята другим прогоном (сессия, суточный, выпуск) — ждём, а не стоп.
+                if name != vm or res.returncode != VM_BUSY or waited >= limit:
+                    break
+                print("ship-finish: машина тестов занята — жду", flush=True)
+                time.sleep(min(VM_BUSY_POLL, limit))
+                waited += min(VM_BUSY_POLL, limit)
             if res.returncode != 0:
                 log = next(reversed(RUN_LOG_END.findall(res.stdout)), None)
                 failed.append(f"{name} (код {res.returncode}" + (f", лог {log})" if log else ")"))
+                if name == vm and res.returncode in VM_NO_RUN:
+                    no_run = f"{failed[-1]}: {VM_NO_RUN[res.returncode]}"
+                elif name == vm and log and (fell := suite_summary(Path(log))):
+                    failed[-1] += f": {fell}"  # какие файлы упали — сразу в задании сессии
     finally:
         git_ok("worktree", "remove", "--force", str(tree))
         shutil.rmtree(tmp, ignore_errors=True)
+    # Набора не было — это не красные тесты; но красные соседи (ruff, формат) — чинит сессия.
+    if no_run and len(failed) == 1:
+        raise ShipError(
+            f"местные ворота не прошли: {'; '.join([*failed[:-1], no_run])} — push и PR не "
+            "сделаны, отметки нет"
+        )
     if failed:
+        failed = [no_run if no_run and x == failed[-1] else x for x in failed]
         raise GatesRed(
             f"местные ворота не прошли: {'; '.join(failed)} — push и PR не сделаны, отметки нет; "
             "починить коммитом и вызвать снова"
@@ -532,6 +606,21 @@ def find_pr(branch: str) -> dict | None:
     return found[0] if found else None
 
 
+def undraft(branch: str) -> None:
+    """Черновик PR ветки (отчёт об остановке, догон основы) — снять до push: CI проекта
+    пропускает задачи на черновике (контракт CI, #336), а пропущенная задача для GitHub — успех;
+    снятый после push черновик оставил бы на новом head пропущенную обязательную проверку, и
+    отметка сразу за ним слила бы PR раньше полного прогона. Push в PR не черновиком идёт полным.
+    Авто-мёрж черновика (догон: старый head с отметкой) выключается до снятия: иначе старый
+    head слился бы до push; включает его снова финиш (или `--mark` оркестратора)."""
+    pr = find_pr(branch)
+    if pr is not None and pr["isDraft"]:
+        number = str(pr["number"])
+        if pr.get("autoMergeRequest"):
+            run("gh", "pr", "merge", number, "--disable-auto")
+        run("gh", "pr", "ready", number)
+
+
 def upsert_pr(branch: str, sha: str, title: str, body_file: str) -> dict:
     pr = find_pr(branch)
     if pr is None:
@@ -679,9 +768,14 @@ def main(argv: list[str] | None = None) -> int:
     split.add_argument(
         "--mark", action="store_true", help="авто-мёрж и отметка без push (оркестратор)"
     )
+    parser.add_argument(
+        "--hold", action="store_true", help="с --mark: отметка без авто-мёржа (ждёт «да»)"
+    )
     args = parser.parse_args(argv)
     if args.unconfirmed is not None and (args.pr_only or args.mark):
         parser.error("--unconfirmed не сочетается с --pr-only и --mark")
+    if args.hold and not args.mark:
+        parser.error("--hold — только с --mark")
     try:
         branch = check_branch(dirty_ok=args.unconfirmed is not None or args.mark)
         if args.unconfirmed is not None:  # и после мёржа: правки в дереве — тоже остановка
@@ -708,6 +802,7 @@ def main(argv: list[str] | None = None) -> int:
             check_gates(sha)
             body_file = pr_body(args.body_file, review, unreviewed, weakening)
             try:
+                undraft(branch)
                 push(branch, sha)
                 pr = upsert_pr(branch, sha, args.title, body_file)
             finally:
@@ -722,7 +817,10 @@ def main(argv: list[str] | None = None) -> int:
                 "ставит оркестратор (--mark)"
             )
             return 0
-        if not pr.get("autoMergeRequest"):
+        if args.hold:  # «миграция» (#346): авто-мёрж — только после «да» владельца
+            if pr.get("autoMergeRequest"):
+                run("gh", "pr", "merge", number, "--disable-auto")
+        elif not pr.get("autoMergeRequest"):
             run("gh", "pr", "merge", number, "--auto", "--squash")
         description = DESCRIPTION
         if review.get("skipped") is True:
@@ -745,7 +843,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ship-finish: {exc}", file=sys.stderr)
         return 1
     mark = "поставлена" if marked else "уже стояла"
-    print(f"ship-finish: {pr['url']} — отметка ревью на {sha[:7]} {mark}, авто-мёрж включён")
+    auto = "авто-мёрж выключен — ждёт «да» владельца" if args.hold else "авто-мёрж включён"
+    print(f"ship-finish: {pr['url']} — отметка ревью на {sha[:7]} {mark}, {auto}")
     return 0
 
 

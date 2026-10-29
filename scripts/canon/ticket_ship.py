@@ -652,6 +652,8 @@ class Route:
         (участник или App, `trusted`) и не скрытый, как фильтры #196: посторонний «ready-for-human:
         …» метку не удержит (#204, п. 7). Сбой `gh` — не стоп: строкой в выводе."""
         core, n = self.core, str(self.n)
+        if core.v2_task():  # токен сессии v2 — только чтение: метки снимает оркестратор (#341)
+            return
 
         def labelled(item: dict) -> bool:
             return any(label.get("name") == LABEL for label in item.get("labels") or [])
@@ -919,6 +921,14 @@ class Route:
             lines.append(f"{n}. {items.get(n, '(текст находки — в отчёте ревью)')}")
             lines.append(f"   Решение сессии: {decisions[n][1]}")
         body = "\n".join(lines)
+        if core.v2_task():
+            # #341: токен сессии v2 — только чтение: находки без блокировки не тикетом, а
+            # строками карточки PR — их пишет оркестратор из состояния (`held`).
+            record["held"] = [*(record.get("held") or []), body]
+            record["numbers"] = record["numbers"] + new
+            st[key] = record
+            st.save()
+            return
         # Строки владений (#289): по ним оркестратор пустит тикет параллельно; флаг — в триаже.
         # Тикет «канон» — в трекере канона: управляемые файлы там лежат под `project/`.
         paths = self.finding_paths(items, new, "project/" if repo else "")
@@ -1396,7 +1406,9 @@ class Route:
             lines.append(f"- Красное по пути: {note}")
         lines.append(f"- {self.verify_line()}")
         verify_md = st.dir / "verify.md"
-        if (st["verify"] or {}).get("verdict") == "PASS" and verify_md.exists():
+        # Путь v2 (#352): доказательства хранит оркестратор, в тело — его сводка без данных.
+        v2 = core.v2_task()
+        if not v2 and (st["verify"] or {}).get("verdict") == "PASS" and verify_md.exists():
             report = verify_md.read_text(encoding="utf-8").strip()
             lines += ["", "<details><summary>Что проверил /verify</summary>", "", report]
             lines += ["", "</details>", ""]
@@ -1439,6 +1451,13 @@ class Route:
             args += ["--weakening", st["weakening"]]
         if st["ready_for_human"]:
             args += ["--ready-for-human", st["ready_for_human"]]
+        if core.v2_task():
+            # #341: токен сессии v2 — только чтение: ветку отправляет, PR и его тело ведёт
+            # оркестратор (тело — `pr-body.md` рядом с состоянием).
+            st["finish_line"] = "ветку и PR ведёт оркестратор"
+            st["finished_head"] = core.head()
+            st["attempts"] = {}
+            return self.ready(reviewed=True)
         if core.orchestrated():
             args.insert(0, "--pr-only")  # отметку и авто-мёрж ставит оркестратор токеном App
         res = core.canon("ship-finish", *args)
@@ -1634,6 +1653,10 @@ class Route:
         PR в черновик (черновик не сливается и с включённым авто-мёржем), метка, комментарий; с
         упоминанием владельца и ссылкой в тикете, как у `ship-finish` (#295)."""
         core = self.core
+        if core.v2_task():
+            # #341: токен сессии v2 — только чтение: отчёт (`stop-report.md` рядом с состоянием)
+            # публикует оркестратор, когда сессия кончится, — с меткой и упоминанием владельца.
+            return "у оркестратора: он опубликует его в тикете"
         res = core.canon("ship-finish", "--unconfirmed", text)
         if res.returncode == 0:
             m = re.search(r"отчёт об остановке — (.*?), ждёт", res.stdout)

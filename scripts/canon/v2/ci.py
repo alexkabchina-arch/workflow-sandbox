@@ -7,8 +7,8 @@ JUnit XML (контракт — раздел «Ожидаемые job CI» ша�
 
 - упали только тесты, которые падают и на последнем законченном прогоне `main` того же
   workflow, — «`main` красный»: остановка (ожидание придёт с #357);
-- упало вне диффа ветки, а ветка отстала от `main`, — нынешний догон основы (догон на сервере —
-  #348);
+- упало вне диффа ветки, а ветка отстала от `main`, — догон основы на сервере (`v2/catchup.py`,
+  #348), затем полный CI на новом head;
 - иначе — один перезапуск упавших задач на том же коммите (`gh run rerun --failed`), не возврат:
   так отмена, превышение времени и сбой раннера не тратят возвраты;
 - красный и после перезапуска — возврат той же сессии с именами упавших тестов.
@@ -64,6 +64,16 @@ def failed_tests(folder: Path) -> dict[str, str]:
     return found
 
 
+def fetch(core, repo: str, run_id: str, folder: str) -> None:
+    """Отчёт по тестам прогона — в `folder` (`gh run download`, артефакт `REPORT`); его разбор —
+    у вызывающего: упавшие (`failed_tests`) здесь, итог каждого (`spot.outcomes`) у допуска
+    (`v2/gates.py`). Сбой — `core.Failure`."""
+    core.gh(
+        "run", "download", run_id, "--pattern", REPORT, "--dir", folder, "-R", repo,
+        timeout=GH_TIMEOUT,
+    )  # fmt: skip
+
+
 def touches(place: str, changed: list[str]) -> bool:
     """Тест из файла диффа. Место — путь через точки (`tests.test_calc`, pytest): любой его
     префикс совпал с файлом диффа без расширения; или путь файла (`tests/calc.test.js`,
@@ -102,7 +112,7 @@ class Cause:
         """Упавшие тесты прогона по его отчёту; отчёта нет или сбой скачивания — пусто."""
         with tempfile.TemporaryDirectory(prefix="canon-report-") as tmp:
             try:
-                self.gh("run", "download", run_id, "--pattern", REPORT, "--dir", tmp)
+                fetch(self.core, self.orch.repo, run_id, tmp)
             except self.core.Failure as exc:
                 self.say(f"отчёт по тестам прогона {run_id} не скачан: {exc}")
                 return {}
@@ -217,4 +227,11 @@ class Cause:
                 "— только тикетом со сроком и «да» владельца; оркестратор тест не отключает.",
             )
             self.say(f"#{n}: нестабильные тесты — {listed(flaky)}")
+            send = self.orch.sender()  # список карантина — в карточке PR (#347)
+            line = (
+                f"{listed([f'`{x}`' for x in t['flaky']])} — нестабильные (позеленели при "
+                "перезапуске): не блокируют, остаются в списке на починку; карантин — тикетом со "
+                "сроком и «да» владельца"
+            )
+            send.mark(n, t, send.t.card.QUARANTINE, line, key="flaky")
         t.pop("rerun", None)

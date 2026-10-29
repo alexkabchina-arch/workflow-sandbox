@@ -94,7 +94,9 @@
      (один раз), без второго прогона;
    - **CI** — отметка `review` и авто-мёрж (`ship-finish --mark` токеном оркестратора) только
      когда все проверки PR, кроме сторожа, зелёные, тесты маршрута пройдены ровно на head PR, head
-     worktree тот же, а head отчёта ревью этого круга — он сам или его предок. Красный CI —
+     worktree тот же, а head отчёта ревью этого круга — он сам или его предок. На пути v2 (тикета
+     или переключателя проекта) успешная отметка на head не от App (`canon.agentApp`) — не
+     отметка: поверх неё `pending` от App, затем своя (#415). Красный CI —
      **возврат**: та же сессия с заданием по CI (`session-run --resume --prompt`), в пределах
      тикета, без второго ревью; возвратов не больше `RETURNS`, следующий красный — отчёт об
      остановке. Закрытый PR, черновик или проверок нет дольше `CI_WAIT` — отчёт об остановке;
@@ -112,7 +114,9 @@
      остановке.
    Отчёт об остановке оркестратора — «Причина / Сделано / Доступно» с упоминанием владельца
    (уведомление; стоп по `agent:stop` владельца — без упоминания: это его команда), метки
-   `agent:stopped` и `ready-for-human` — до комментария: сбой меток не повторит комментарий.
+   `agent:stopped` и `ready-for-human` — до комментария: сбой меток не повторит комментарий. На
+   пути v2 (#347) — четвёртый раздел «Рекомендация и риск» и только `agent:stopped`:
+   `ready-for-human` — тикеты для ручной сессии, их оркестратор не берёт.
 3. Места свободны, очередь не пуста — тикеты очереди по порядку. Тикет занимает место, только
    если его владения и флаги (строки `**Владения:**` и `**Флаги:**` брифа по образцу
    `.claude/canon/ticket-ownership.md`, на момент старта) не пересекаются с владениями занятых
@@ -196,7 +200,35 @@ git на него ставятся внутри (`app-token shims`); `sbx` ид�
 задаётся, как раньше, и признак из окружения такта скрипту `review` не уходит. Каждый кончившийся
 запуск роли тикета v2 (сессия, ревью) — строкой в журнал `events.jsonl` рядом с состоянием
 (`v2/journal.py`): роль, модель, усилие, токены, USD, время, исход с кодом; у старого пути журнала
-нет.
+нет. Сессии тикета v2 — признак `CANON_CHECKS_HOOK=1`: `session-run` ставит в её worktree хук
+быстрых проверок на коммите (`v2/checks.py`, #338). Сессия кода v2 работает своим заданием
+(`v2/task.py`, #340) вместо `/implement`: его выдаёт маршрут (`ticket start` по признаку
+окружения от `session-run`), возврату — вход; без `/code-review` и поиска в интернете (WebSearch
+и WebFetch закрыты), баг — сначала падающим тестом; кончает «код готов», вопросом или «стопом» с
+причиной (отчёт об остановке в тикете — маршрутом), их разбирает нынешний шаг сессии.
+Продолжений бесед у тикета v2 нет (#339):
+каждый возврат — новая сессия на той же ветке без `--resume`, во входе тикет, дифф и отчёт
+передачи; отчёт (`handovers/ticket-N.md` рядом с состоянием) собирается после любого запуска,
+оборванного тоже, — факты ветки даёт `session-run --handover` изнутри, незавершённую работу он
+коммитит только локально (`v2/handover.py`).
+Ревью ошибок тикета v2 (#343) идёт только на зелёной проверке в песочнице, тикет целиком
+(заголовок, тело, комментарии участников — `reviews/ticket-N.issue.md`) — его обязательный вход
+`--ticket`; блокирует только находка с доказательством (тест или сценарий `/verify`). Итог — в
+карточку PR: отказ от теста при блокирующей находке и серьёзная находка без доказательства у
+тикета с флагом «миграция» — в «Требует внимания»; на второй из них после разбора, до отправки,
+— вопрос владельцу до слияния (`v2/send.py`).
+Тест ревьюера пути v2 (#344) — шаг `rtest` между ревью и разбором: тест к блокирующей находке
+пишет ревьюер, оркестратор кладёт его коммитом «только тест» и подтверждает точечным прогоном на
+ветке и на основе; неподтверждённая снимается, старая — отдельным тикетом; прогон намеренно
+красный и возвратов не тратит (`v2/rtest.py`).
+Слияние тикета v2 решает допуск (#346, `v2/gates.py`): условия 2, 3, 5, 7 — до перевода PR из
+черновика, условие 1 — на зелёном полном CI, затем отметка `review` и авто-мёрж; у каждого
+отказа свой код и своё действие `agent:go`; красный полный CI — PR снова черновик; флаг
+«миграция» — отметка без авто-мёржа до «да» владельца.
+Пределы кругов тикета v2 по виду (#349, `v2/limits.py`): третий круг починки — проверка посылки
+(роль `parcel`), затем остановка с рекомендацией; `agent:go` после неё — ещё один круг этого
+вида; сбой роли сессии — повтор по виду (предел, сеть, инструмент, неизвестное), после двух —
+остановка с кодом.
 Код выхода 0 — такт прошёл; 1 — сбой (`gh`, git, App, состояние); 2 — ошибка запуска.
 Как устроено — `docs/orchestrator.md` канона.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
@@ -254,7 +286,36 @@ ALONE = (
     "Оркестратор: строк «Владения» и «Флаги» по образцу (`.claude/canon/ticket-ownership.md`) "
     "нет — тикет пойдёт один. Добавьте строки в тело или своим комментарием, пока он в очереди."
 )
+# Четвёртый раздел отчёта об остановке пути v2 (#347), когда у причины нет своего совета.
+ADVICE = (
+    "прочитайте причину. Её снимет продолжение или вы её уже сняли — `agent:go`; работа пошла "
+    "не туда — `agent:retry`. **Риск:** `agent:go` с неснятой причиной, скорее всего, остановится "
+    "снова на том же шаге; `agent:retry` теряет сделанное в ветке."
+)
+ADVICE_OWNER = (
+    "тикет остановили вы: продолжить — `agent:go`. **Риск:** шаг повторится с того места, где "
+    "встал; прерванный запуск сессии — заново."
+)
+# Хвост отчёта «стоп» сессии v2 (её «Причина» и «Сделано» — выше): действия и риск (#347).
+SESSION_STOP_TAIL = (
+    "**Доступно** (оркестратор):\n"
+    f"- `{GO}` — свежая сессия на той же ветке — с тикетом, диффом и отчётом передачи;\n"
+    f"- `{RETRY}` — с чистого листа: PR закрыт с комментарием, ветка, worktree и состояние "
+    "удалены, тикет снова в очереди;\n"
+    "- ничего не ставить — тикет ждёт, место оркестратора свободно.\n\n"
+    "**Рекомендация и риск:** решите по вариантам сессии выше. Поправили тикет или ответили на "
+    f"её сомнение в комментарии — `{GO}`; тикет надо ставить иначе — `{RETRY}` после правки. "
+    f"**Риск `{GO}` без изменений:** сессия, скорее всего, остановится по той же причине."
+)
+# Путь v2 (#347): тикет с `ready-for-human` — для ручной сессии; ждущее владельца — `agent:stopped`.
+HUMAN_NOTE = (
+    f"Оркестратор: тикет не взят — метка `{HUMAN}`: он для ручной сессии (разведка или авария), "
+    f"оркестратор такие не ведёт. Метка `{GO}` снята; для агента — снять `{HUMAN}`, поставить "
+    f"`{READY_FOR_AGENT}` и снова `{GO}`."
+)
 PULL = re.compile(r"/pull/(\d+)")
+# Путь v2 (#415): отметка `review` не от App на head — снята `pending` от App перед своей.
+FOREIGN_MARK = "отметка от {who} не от App — не засчитана на пути v2"
 APP_ID = "canon.agentAppId"
 # Окружение сессии — без токенов GitHub такта: у сессии только свой токен через обёртки.
 TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
@@ -271,6 +332,12 @@ REVIEW_TIMEOUT = int(os.environ.get("CANON_REVIEW_TIMEOUT") or 3600)
 AWAKE_FOR = REVIEW_TIMEOUT + 600  # срок `caffeinate`: такт с ревью ошибок его не переживёт
 # PR открыт, а проверок CI на нём так и нет — workflow не запустился; ждать дальше незачем.
 CI_WAIT = 1800
+# Последний перевод PR из черновика (#336, `ready_time`): время — по часам GitHub, как у проверок.
+READY_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
+    "{pullRequest(number:$number){timelineItems(itemTypes:[READY_FOR_REVIEW_EVENT],last:1)"
+    "{nodes{...on ReadyForReviewEvent{createdAt}}}}}}"
+)
 # Пределы (решение 16.10, п. 10): USD в ценах API на запуск и на тикет, время запуска в секундах.
 RUN_LIMIT, TICKET_LIMIT, RUN_TIME = 30, 60, 2 * 3600
 REVIEW_LIMIT = 10  # предел скрипта `review` по умолчанию; меньше — когда остаток тикета меньше
@@ -400,9 +467,12 @@ for sig in (signal.SIGTERM, signal.SIGKILL):
 sys.exit(3)
 """
 # Паузы: owner — «пауза» владельца, schedule — вне окна расписания, ceiling — суточный потолок,
-# limit — упор в лимит подписки, resources — диск и память, minutes — минуты CI на 95 % (#358).
-# Любая — новые места не занимаются (minutes — только новым тикетам, без сессии); кроме resources
-# и minutes — и запуски начатых тикетов (ревью, возобновления) ждут её конца.
+# limit — упор в лимит подписки, resources — диск и память, minutes — минуты CI на 95 % (#358),
+# environment — остановка «среда» пути v2 (#342; снимает `agent:go` или `agent:retry` любого
+# тикета, остановленного «средой»).
+# Любая — новые места не занимаются (minutes — только новым тикетам, без сессии); кроме resources,
+# minutes и environment — и запуски начатых тикетов (ревью, возобновления) ждут её конца: у
+# начатых свой «доктор».
 HOLDING = ("owner", "schedule", "ceiling", "limit")
 OWNER_PAUSE, OWNER_NOW = "pause.json", "now.json"  # команды владельца — файлами, без замка такта
 # Служба (#222): `launchd` пользователя зовёт такт раз в минуту (`StartInterval`), при входе и
@@ -436,6 +506,7 @@ PHASES = {
     "answer": "ответ на вопрос",
     "ci": "CI",
     "merge": "мёрж",
+    "rtest": "тест ревьюера",
 }
 # Сбой одной команды владельца не роняет такт: остальные тикеты идут дальше.
 COMMAND_ERRORS = (OSError, subprocess.SubprocessError, ValueError, KeyError)
@@ -481,6 +552,26 @@ roles = load("canon_v2_roles_orchestrator", "v2/roles.py")
 journal = load("canon_v2_journal_orchestrator", "v2/journal.py")  # журнал запусков ролей (#334)
 minutes = load("canon_v2_minutes_orchestrator", "v2/minutes.py")  # учёт минут CI (#358)
 v2_ci = load("canon_v2_ci_orchestrator", "v2/ci.py")  # причины красного CI (#335)
+v2_spot = load("canon_v2_spot_orchestrator", "v2/spot.py")  # точечный прогон (#336)
+v2_checks = load("canon_v2_checks_orchestrator", "v2/checks.py")  # хук быстрых проверок (#338)
+v2_handover = load("canon_v2_handover_orchestrator", "v2/handover.py")  # отчёт передачи (#339)
+v2_task = load("canon_v2_task_orchestrator", "v2/task.py")  # задание сессии кода (#340)
+v2_card = load("canon_v2_card_orchestrator", "v2/card.py")  # карточка PR (#341)
+v2_send = load("canon_v2_send_orchestrator", "v2/send.py")  # отправка ветки (#341)
+v2_doctor = load("canon_v2_doctor_orchestrator", "v2/doctor.py")  # «доктор» и проверка (#342)
+v2_rtest = load("canon_v2_rtest_orchestrator", "v2/rtest.py")  # тест ревьюера (#344)
+v2_fixes = load("canon_v2_fixes_orchestrator", "v2/fixes.py")  # спор, судья, короткое ревью (#345)
+v2_gates = load("canon_v2_gates_orchestrator", "v2/gates.py")  # допуск к слиянию (#346)
+v2_snapshot = load("canon_v2_snapshot_orchestrator", "v2/snapshot.py")  # снимок тикета (#347)
+v2_accept = load("canon_v2_accept_orchestrator", "v2/accept.py")  # «принято» до выката (#347)
+v2_catchup = load("canon_v2_catchup_orchestrator", "v2/catchup.py")  # догон на сервере (#348)
+v2_limits = load("canon_v2_limits_orchestrator", "v2/limits.py")  # пределы кругов, сбой роли (#349)
+v2_dependabot = load("canon_v2_dependabot_orchestrator", "v2/dependabot.py")  # Dependabot (#350)
+v2_criteria = load("canon_v2_criteria_orchestrator", "v2/criteria.py")  # исходы /verify (#351)
+v2_evidence = load("canon_v2_evidence_orchestrator", "v2/evidence.py")  # доказательства (#352)
+v2_upkeep = load("canon_v2_upkeep_orchestrator", "v2/upkeep.py")  # обслуживание инструмента (#353)
+is_docs = ship.load_review().is_docs  # строки короткого ревью — без документов, правилом `review`
+claude_run = load("canon_claude_run_orchestrator", "claude_run.py")  # проверка итога `claude -p`
 
 
 class Failure(Exception):
@@ -847,17 +938,47 @@ def ended(killed: bool | None) -> str:
     }[killed]
 
 
+def ticket_started(t: dict) -> bool:
+    """Тикет начат: у старого пути — есть сессия, у пути v2 (id сессий нет, #339) — был запуск."""
+    return bool(t.get("session") or (t.get("v2") and t.get("runs")))
+
+
+def ending(summary: dict, killed: bool = False) -> str:
+    """Чем кончился запуск сессии — для отчёта передачи пути v2 (#339)."""
+    if killed:
+        return "оборван — завершён оркестратором (`agent:stop`, предел времени или повтор)"
+    if summary.get("limit"):
+        return "оборван — упор в лимит подписки"
+    if summary.get("subtype") == BUDGET_OUT:
+        return "оборван — кончился предел `--max-budget-usd`"
+    said = summary.get("result") or "в потоке нет итога"
+    if summary.get("subtype") == "success" and not summary.get("failed"):
+        return "кончился с итогом `success`"
+    if summary.get("subtype") == "success":  # `is_error`: отказ соединения и т. п. (#349)
+        return f"оборван — итог `success` с ошибкой: {said}"
+    if code := summary.get("subtype"):
+        return f"оборван — итог `{code}`: {said}"
+    return f"оборван без итога (сон Mac, сбой): {said}"
+
+
+def ticket_limited(run_: dict) -> bool:
+    """`--max-budget-usd` запуска — остаток предела тикета (меньше предела запуска)."""
+    try:
+        return float(run_.get("budget") or RUN_LIMIT) < RUN_LIMIT
+    except ValueError:
+        return False
+
+
 def limit_name(run_: dict) -> str:
     """Какой предел дал запуску его `--max-budget-usd`: запуска или остаток тикета."""
-    try:
-        budget = float(run_.get("budget") or RUN_LIMIT)
-    except ValueError:
-        budget = RUN_LIMIT
-    return (
-        f"предел тикета {TICKET_LIMIT} USD"
-        if budget < RUN_LIMIT
-        else f"предел запуска {RUN_LIMIT} USD"
-    )
+    if ticket_limited(run_):
+        return f"предел тикета {TICKET_LIMIT} USD"
+    return f"предел запуска {RUN_LIMIT} USD"
+
+
+def route_print(st) -> str:
+    """Отпечаток состояния маршрута: запуск, не тронувший маршрут, оставляет его тем же (#349)."""
+    return hashlib.sha256(json.dumps(st.data, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def stream_summary(log: Path, last_bytes: int | None = None) -> dict:
@@ -909,6 +1030,8 @@ def stream_text(stream: str) -> dict:
     ]
     last = results[-1] if results else {}
     text = str(last.get("result") or "").strip() if last else (said or "\n".join(noise))
+    if last and not text and isinstance(last.get("errors"), list):  # причина ошибки итога (#349)
+        text = "; ".join(map(str, last["errors"])).strip()
     if last.get("subtype") and last.get("subtype") != "success":
         text = f"subtype {last['subtype']}" + (f": {text}" if text else "")
     # Упор в лимит (#211), по надёжности: `rate_limit_event` `rejected`; итог с ошибкой 429;
@@ -926,7 +1049,8 @@ def stream_text(stream: str) -> dict:
     # итога. Та же фраза в успешном итоге или у агента — не потеря; сбой API до первого хода без
     # неё — тоже.
     found = [x for x in [*noise, *map(str, last.get("errors") or [])] if LOST_SESSION in x]
-    lost = bool(found) and last.get("subtype") != "success" and not last.get("num_turns")
+    failed = claude_run.failed(last)  # не `success` или `is_error` — одно правило (#349)
+    lost = bool(found) and failed and not last.get("num_turns")
     lost = lost and not said
     if lost and LOST_SESSION not in text:
         text = f"{text}: {found[0]}"
@@ -937,6 +1061,7 @@ def stream_text(stream: str) -> dict:
         "rate_limit": limit,
         "limit": hit,
         "lost": lost,
+        "failed": failed,
         "final": last or None,  # токены и время запуска — для журнала пути v2 (#334)
     }
 
@@ -968,7 +1093,10 @@ class Orchestrator:
         # Метки-команды на тикетах за такт (`guard`); не прочитаны — своё снятие помнится любое.
         self.present: set[tuple[int, str]] = set()
         self.guarded = False
-        self.env: dict | None = None  # окружение сессий такта — токен обновляется раз за такт
+        # Окружение сессий такта по виду токена (`session`, у пути v2 — `reader`, #341) — токен
+        # обновляется раз за такт.
+        self.env: dict[str, dict] = {}
+        self.leaks: list[str] | None = None  # находки последней проверки `secrets` (v2, #341)
         try:
             self.box = sandbox.Sandbox()  # песочница проекта: имя, клон, монтирования
         except sandbox.Failure as exc:
@@ -978,16 +1106,112 @@ class Orchestrator:
 
     def reset(self) -> None:
         """Кэш такта: песочница (`sbx ls`), процессы внутри, свой клон, подготовка песочницы,
-        копия прода по запросам сессий (`fresh_copy`)."""
+        копия прода по запросам сессий (`fresh_copy`), вердикт «доктора» среды."""
         self.entry: dict | None = None
         self.procs: list[dict] | None = None
         self.fetched = False
         self.prepared = False
         self.fresh_answer: dict | None = None
+        self.health: bool | str | None = None  # вердикт «доктора» пути v2 за такт (#342)
 
     def route(self, n: int) -> Route:
-        """Состояние маршрута тикета — в клоне песочницы."""
-        return Route(n, self.clone)
+        """Состояние маршрута тикета — в клоне песочницы. PR тикета пути v2 открывает оркестратор
+        (#341): его ссылка — из своего состояния, а не из файла сессии; «эта версия» после догона
+        на сервере (#348) — head догона вместо head «код готов» (`v2/catchup.py`, `overlay`)."""
+        st = Route(n, self.clone)
+        t = self.data["tickets"].get(str(n)) or {}
+        if t.get("v2") and t.get("pr"):
+            st.data["pr"] = t["pr"]
+        v2_catchup.overlay(st.data, t)
+        return st
+
+    def sender(self, source: str | None = None):
+        """Ворота отправки пути v2 (`v2/send.py`, #341): ветка, черновой PR, карточка, вопросы;
+        `source` — кто отправляет (`rtest` — тест ревьюера, #344)."""
+        tools = types.SimpleNamespace(
+            core=core, asks=asks, card=v2_card, run=run, say=say, stamp=stamp, tail=tail,
+            without_tokens=without_tokens, read_inside=read_inside, SHA=SHA, HUMAN=HUMAN,
+            STOPPED=STOPPED,
+        )  # fmt: skip
+        return v2_send.Send(self, tools, source)
+
+    def environment(self):
+        """«Доктор» среды и проверка в песочнице пути v2 (`v2/doctor.py`, #342)."""
+        tools = types.SimpleNamespace(
+            core=core, say=say, tail=tail, now=now, local_now=local_now, Failure=Failure,
+            snapshot_time=snapshot_time, group_alive=group_alive, TOKENS=TOKENS,
+            COPY_STALE=COPY_STALE, SEED_FROM_KEY=SEED_FROM_KEY, SEED_INTO_KEY=SEED_INTO_KEY,
+        )  # fmt: skip
+        return v2_doctor.Environment(self, tools)
+
+    def rtest(self):
+        """Тест ревьюера пути v2 (`v2/rtest.py`, #344): тест к блокирующей находке, коммит
+        «только тест», точечный прогон и исход каждой находки."""
+        tools = types.SimpleNamespace(
+            core=core, card=v2_card, roles=roles, run=run, say=say, stamp=stamp, tail=tail,
+            without_tokens=without_tokens, write_inside=write_inside, Failure=Failure,
+            TICKET_LIMIT=TICKET_LIMIT, exhausted=exhausted, WORKTREES=start.SESSION_WORKTREES,
+            claude_run=claude_run, seconds_since=seconds_since,
+        )  # fmt: skip
+        return v2_rtest.ReviewerTest(self, tools)
+
+    def fixes(self):
+        """Исправления после ревью пути v2 (`v2/fixes.py`, #345): тесты ревьюера не тронуты,
+        подтверждённая находка не отклонена без спора, спор и судья, короткое ревью."""
+        tools = types.SimpleNamespace(
+            core=core, card=v2_card, rtest=v2_rtest, roles=roles, run=run, say=say, stamp=stamp,
+            tail=tail, without_tokens=without_tokens, read_inside=read_inside,
+            write_inside=write_inside, Failure=Failure, TICKET_LIMIT=TICKET_LIMIT,
+            exhausted=exhausted, WORKTREES=start.SESSION_WORKTREES, REVIEW_TIMEOUT=REVIEW_TIMEOUT,
+            is_docs=is_docs, limits=v2_limits,
+        )  # fmt: skip
+        return v2_fixes.Fixes(self, tools)
+
+    def gates(self):
+        """Допуск к слиянию пути v2 (`v2/gates.py`, #346): условия с кодами отказа до перевода PR
+        из черновика и после зелёного полного CI, отметка без авто-мёржа у «миграции»."""
+        tools = types.SimpleNamespace(
+            core=core, card=v2_card, ci=v2_ci, rtest=v2_rtest, spot=v2_spot, start=start,
+            send=v2_send, say=say, stamp=stamp, seconds_since=seconds_since, CI_WAIT=CI_WAIT,
+        )  # fmt: skip
+        return v2_gates.Gates(self, tools)
+
+    def evidence(self):
+        """Доказательства `/verify` у оркестратора и условие допуска 4 (`v2/evidence.py`, #352)."""
+        tools = types.SimpleNamespace(
+            core=core, card=v2_card, criteria=v2_criteria, snapshot=v2_snapshot,
+            read_inside=read_inside, say=say, stamp=stamp, is_docs=is_docs,
+        )  # fmt: skip
+        return v2_evidence.Evidence(self, tools)
+
+    def catchup(self):
+        """Догон основы на сервере и слияние по одному пути v2 (`v2/catchup.py`, #348)."""
+        tools = types.SimpleNamespace(
+            core=core, card=v2_card, send=v2_send, limits=v2_limits, say=say, stamp=stamp,
+            seconds_since=seconds_since,
+        )  # fmt: skip
+        return v2_catchup.Catchup(self, tools)
+
+    def dependabot(self):
+        """Своя дорожка PR Dependabot в воротах пути v2 (`v2/dependabot.py`, #350)."""
+        tools = types.SimpleNamespace(
+            core=core, asks=asks, send=v2_send, start=start, journal=journal, roles=roles,
+            ci_green=ci_green, run=run, without_tokens=without_tokens, say=say, stamp=stamp,
+            seconds_since=seconds_since, tail=tail, HERE=HERE, REVIEW_LIMIT=REVIEW_LIMIT,
+            REVIEW_TIMEOUT=REVIEW_TIMEOUT,
+        )  # fmt: skip
+        return v2_dependabot.Dependabot(self, tools)
+
+    def upkeep(self):
+        """Обслуживание инструмента проверки раз в сутки (`v2/upkeep.py`, #353)."""
+        tools = types.SimpleNamespace(
+            core=core, asks=asks, send=v2_send, start=start, journal=journal, roles=roles,
+            ci_green=ci_green, run=run, alive=alive, started_at=started_at, kill_group=kill_group,
+            without_tokens=without_tokens, read_inside=read_inside, local_now=local_now, say=say,
+            stamp=stamp, seconds_since=seconds_since, tail=tail, HERE=HERE,
+            BROWSER_ENV=BROWSER_ENV, REVIEW_LIMIT=REVIEW_LIMIT, REVIEW_TIMEOUT=REVIEW_TIMEOUT,
+        )  # fmt: skip
+        return v2_upkeep.Upkeep(self, tools)
 
     # --- состояние ---
 
@@ -1084,21 +1308,25 @@ class Orchestrator:
             raise Failure("app-token issue: ответ не по формату") from None
         os.environ["GH_TOKEN"] = token
 
-    def session_env(self) -> dict:
-        """Окружение сессии внутри песочницы — раз за такт (файл и обёртки у мест общие): свежий
-        токен сессии App выдаёт Mac (`app-token refresh` в свой каталог), копия — в
-        `.git/canon-session/token` клона (`write_inside`), обёртки `gh` и git на неё ставит
-        `app-token shims` копии канона внутри. Итог — только переменные для `sbx exec -e`:
-        окружения Mac и токена оркестратора в нём нет."""
-        if self.env is not None:
-            return dict(self.env)
-        file = self.dir / "session-token"
-        common = ["--kind", "session", "--repo", self.repo, "--app-id", self.app_id]
+    def session_env(self, reader: bool = False) -> dict:
+        """Окружение сессии внутри песочницы — раз за такт на вид токена (файл и обёртки у мест
+        общие): свежий токен сессии App выдаёт Mac (`app-token refresh` в свой каталог), копия —
+        в `.git/canon-session/token` клона (`write_inside`), обёртки `gh` и git на неё ставит
+        `app-token shims` копии канона внутри. `reader` — сессии пути v2 (#341): токен на
+        чтение (`reader-token`, обёртки — `bin-reader`), ветку, PR и тикет за неё ведёт
+        оркестратор. Итог — только переменные для `sbx exec -e`: окружения Mac и токена
+        оркестратора в нём нет."""
+        kind = "reader" if reader else "session"
+        if kind in self.env:
+            return dict(self.env[kind])
+        file = self.dir / f"{kind}-token"
+        common = ["--kind", kind, "--repo", self.repo, "--app-id", self.app_id]
         self.dir.mkdir(parents=True, exist_ok=True)
         self.app_token("refresh", *common, "--file", str(file))
-        write_inside(self.clone, INSIDE / "token", file.read_bytes())
+        name, folder = ("reader-token", "bin-reader") if reader else ("token", "bin")
+        write_inside(self.clone, INSIDE / name, file.read_bytes())
         inside = self.clone / INSIDE
-        shims = ["--file", str(inside / "token"), "--dir", str(inside / "bin")]
+        shims = ["--file", str(inside / name), "--dir", str(inside / folder)]
         res = self.inside("python3", str(HERE / "app-token"), "shims", *shims)
         if res.returncode != 0:
             raise Failure(f"app-token shims в песочнице: {tail(res.stderr or res.stdout)}")
@@ -1119,8 +1347,12 @@ class Orchestrator:
         if count:
             env["GIT_CONFIG_COUNT"] = str(count)
         env[core.ORCHESTRATED] = "1"
-        self.env = env
+        self.env[kind] = env
         return dict(env)
+
+    def ticket_env(self, n: int) -> dict:
+        """Окружение сессии тикета: путь v2 — токен на чтение (#341), старый — прежний."""
+        return self.session_env(reader=bool(self.data["tickets"].get(str(n), {}).get("v2")))
 
     # --- песочница (#241) ---
 
@@ -1332,7 +1564,9 @@ class Orchestrator:
             return f"ветка {branch} на сервере — {tip[:7] or 'нет'}, а не head {head[:7]}"
         return None
 
-    def check_secrets(self, n: int, st: Route, head: str, worktree: Path) -> str | None:
+    def check_secrets(
+        self, n: int, st: Route, head: str, worktree: Path, keep: str | None = None
+    ) -> str | None:
         """Проверка `secrets` профиля до push head (#258) — на Mac, его gitleaks. Git клона сессий
         Mac не выполняет, поэтому коммиты ветки после `origin/main` собирает в бандл git внутри
         песочницы; Mac забирает файл (`take_inside`) в свой клон и гоняет проверку в своём
@@ -1340,8 +1574,10 @@ class Orchestrator:
         профиля не уберёт; помощник канона `secrets` в команде — копия рядом, конфиг gitleaks в
         нём — из `origin/main` (#283). В профиле её нет — пропуск с записью в вывод такта; своих
         коммитов у ветки нет — проверять нечего, если head есть в `origin/main` своего клона:
-        `origin/main` клона песочницы правит сессия. Итог — причина остановки (без значения
-        секрета) или None."""
+        `origin/main` клона песочницы правит сессия. `keep` — путь v2 (#341): коммиты ветки
+        остаются в своём клоне под этой ссылкой (отправку делает оркестратор), бандл — и без
+        проверки в профиле; находки gitleaks — в `self.leaks`. Итог — причина остановки (без
+        значения секрета) или None."""
         self.own_repo()
         shown = self.git("show", f"origin/main:{PROFILE}")
         try:
@@ -1351,10 +1587,12 @@ class Orchestrator:
             return f"{exc} — проверку `secrets` не разобрать, head не опубликован"
         if argv is None:
             say(f"#{n}: в профиле нет проверки `secrets` — head {head[:7]} уходит без gitleaks")
-            return None
-        argv, problem = mac_command(core.canon_secrets(argv, HERE))
-        if problem:
-            return problem
+            if keep is None:
+                return None
+        else:
+            argv, problem = mac_command(core.canon_secrets(argv, HERE))
+            if problem:
+                return problem
         rel = st.rel / "secrets.bundle"
         res = self.inside(
             "sh", "-c", PACK, "sh", SECRETS_REF, head, str(self.clone / rel), workdir=worktree
@@ -1362,6 +1600,8 @@ class Orchestrator:
         if res.returncode == NOTHING_TO_PACK:  # решила песочница — сверка по своему клону
             self.own_repo(refetch=True)
             if self.git("merge-base", "--is-ancestor", head, "origin/main").returncode == 0:
+                if keep:
+                    self.git("update-ref", keep, head)
                 return None
             return (
                 f"head {head[:7]} не на основе `origin/main`: песочница не нашла у него своих "
@@ -1369,7 +1609,8 @@ class Orchestrator:
             )
         if res.returncode != 0:
             return f"коммиты ветки для проверки `secrets` не собраны: {tail(res.stderr)}"
-        bundle, ref = self.dir / "bundles" / f"ticket-{n}.bundle", f"{SECRETS_REF}/ticket-{n}"
+        bundle = self.dir / "bundles" / f"ticket-{n}.bundle"
+        ref = keep or f"{SECRETS_REF}/ticket-{n}"
         bundle.parent.mkdir(parents=True, exist_ok=True)
         try:
             take_inside(self.clone, rel, bundle, BUNDLE_LIMIT)
@@ -1383,6 +1624,8 @@ class Orchestrator:
             got = self.git("rev-parse", "--verify", "-q", ref).stdout.strip()
             if got != head:
                 return f"в бандле коммитов ветки {got[:7] or 'ничего'}, а не head {head[:7]}"
+            if argv is None:
+                return None
             checkout = self.checkout("secrets", n, head)
             try:
                 res = run(*argv, cwd=checkout, env=without_tokens(), timeout=SECRETS_TIMEOUT)
@@ -1396,12 +1639,14 @@ class Orchestrator:
             return f"проверка `secrets` не начата: {exc}"
         finally:
             bundle.unlink(missing_ok=True)
-            self.git("update-ref", "-d", ref)
+            if keep is None:
+                self.git("update-ref", "-d", ref)
         if res.returncode == 0:
             return None
         output = res.stdout + res.stderr
         log = self.output_log(n, "secrets", output)
         if found := core.secret_findings(output):
+            self.leaks = found
             return (
                 f"{core.leaks_line(found)} — head не опубликован; не чинить коммитом и не "
                 f"глушить, ключ отзывает владелец; вывод — лог `{log}` на Mac"
@@ -1413,7 +1658,7 @@ class Orchestrator:
         """Уборка тикета изнутри песочницы — `session-run N --retire <head>` или `--discard`
         копии канона: git клона, worktree и ресурсы проекта трогает только песочница."""
         cmd = ["python3", str(HERE / "session-run"), str(n), *args]
-        return self.inside(*cmd, workdir=self.clone, env=self.session_env())
+        return self.inside(*cmd, workdir=self.clone, env=self.ticket_env(n))
 
     def prepare(self) -> None:
         """Перед первым запуском такта: образы проекта и база-шаблон в песочнице (`images`,
@@ -1689,7 +1934,7 @@ class Orchestrator:
         else:
             self.try_keep_awake()  # такт с ревью соседа и снимком прода переживёт срок прошлого
             outcome = self.seed(force=True)
-            self.env = None  # токен, выданный до снимка, к концу такта мог устареть
+            self.env = {}  # токен, выданный до снимка, к концу такта мог устареть
         copy = self.snapshot()
         have = core.copy_phrase(copy)
         notes = {
@@ -1796,7 +2041,7 @@ class Orchestrator:
                 say("идёт прошлый такт — этот пропущен")
                 return
             self.data = self.read()
-            self.opened = self.env = None
+            self.opened, self.env = None, {}
             self.present, self.guarded = set(), False
             self.usage_checked = False
             self.reset()
@@ -1817,6 +2062,7 @@ class Orchestrator:
                 errors += self.closed_stopped()
                 errors += self.intake()
                 errors += self.answered()
+                errors += v2_accept.poll(self, self.accept_tools())  # «принято?» (#347)
                 errors += self.prd_queue()
                 for n in list(self.data["slots"]):
                     if n not in self.data["slots"]:
@@ -1828,6 +2074,11 @@ class Orchestrator:
                         say(f"#{n}: шаг на месте не выполнен — {exc}")
                     except Exception as exc:  # noqa: BLE001 — любой сбой одного тикета (#275)
                         errors.append(self.fault(n, exc))
+                # PR Dependabot — своя дорожка в воротах (#350): после мест — освободившееся
+                # место слияния первыми берут тикеты.
+                if self.v2():
+                    errors += self.dependabot().poll()
+                    errors += self.upkeep().poll()  # обслуживание инструмента проверки (#353)
                 errors += self.fill()
                 errors += self.count_minutes()
             finally:
@@ -1896,14 +2147,15 @@ class Orchestrator:
         except ValueError:
             given = float("nan")
         budget = proc["budget"] if 0 < given <= RUN_LIMIT else str(RUN_LIMIT)
-        pattern = f"ticket-{n}-{(proc['session'] or '')[:8]}-*"
+        key = proc["run"] if t.get("v2") else proc["session"]  # у v2 лог — по метке запуска
+        pattern = f"ticket-{n}-{(key or '')[:8]}-*"
         logs = sorted((self.dir / "logs").glob(pattern), key=lambda p: p.stat().st_mtime)
         t["runs"].append(
             {
                 "run": proc["run"],
                 "session": proc["session"],
                 "pid": None,  # номер внутри песочницы — не процесс Mac
-                "log": str(logs[-1]) if logs and proc["session"] else "",
+                "log": str(logs[-1]) if logs and key else "",
                 "started": stamp(),
                 "ended": stamp(),
                 "budget": budget,
@@ -1918,6 +2170,7 @@ class Orchestrator:
         run_log = t["runs"][-1]["log"]
         summary = stream_summary(Path(run_log)) if run_log else {"final": None}
         self.log_session(t, t["runs"][-1], summary, killed=True, measured=False)
+        self.hand_off(t, "оборван — осиротевший запуск завершён оркестратором")
         if t["phase"] == "session":
             self.requeue(n, t)
 
@@ -2239,7 +2492,7 @@ class Orchestrator:
     def places_held(self, n: int) -> dict:
         """Паузы, которые держат новое место тикета `n`: минуты CI на 95 % держат только новые
         тикеты — начатый (с сессией) доходит."""
-        session = self.ticket(n).get("session")
+        session = ticket_started(self.ticket(n))
         return {k: p for k, p in self.data["pauses"].items() if k != "minutes" or not session}
 
     def hold(self, n: int, what: str) -> bool:
@@ -2275,20 +2528,29 @@ class Orchestrator:
         )
 
     def at_risk(self) -> list[str]:
-        """Тикеты, которым ещё понадобится их сессия: номер и шаг у оркестратора."""
-        return [
+        """Тикеты, которым ещё понадобится их сессия: номер и шаг у оркестратора; идущее
+        обслуживание инструмента проверки (#353) — тоже."""
+        found = [
             f"#{key} ({self.where(int(key), t)})"
             for key, t in sorted(self.data["tickets"].items(), key=lambda kv: int(kv[0]))
             if t.get("session")
         ]
+        return found + self.upkeep_run()
 
     def running_runs(self) -> list[str]:
-        """Тикеты с живым запуском сессии (`live`) — их обновление копии канона ждёт."""
-        return [
+        """Тикеты с живым запуском сессии (`live`) и сессия обслуживания инструмента проверки
+        (#353) — их обновление копии канона ждёт."""
+        found = [
             f"#{key}"
             for key, t in sorted(self.data["tickets"].items(), key=lambda kv: int(kv[0]))
             if (t.get("runs") or []) and self.live(t["runs"][-1])
         ]
+        return found + self.upkeep_run()
+
+    def upkeep_run(self) -> list[str]:
+        """Идущая сессия обслуживания инструмента проверки (`v2/upkeep.py`) — строкой."""
+        run_ = (self.data.get("upkeep") or {}).get("run")
+        return ["обслуживание инструмента проверки"] if run_ and alive(run_) else []
 
     def owner_now(self) -> None:
         """«Работай сейчас»: «пауза» снята, расписание переопределено до ближайшей границы окна
@@ -2314,7 +2576,7 @@ class Orchestrator:
             return False
         # Пауза минут CI держит только новые тикеты: начатые (вопрос, очередь с сессией) идут.
         started = waiting or any(
-            (self.data["tickets"].get(str(n)) or {}).get("session") for n in self.data["queue"]
+            ticket_started(self.data["tickets"].get(str(n)) or {}) for n in self.data["queue"]
         )
         horizon = now() + timedelta(seconds=AWAKE_HORIZON)
         for kind, pause in self.data["pauses"].items():
@@ -2745,6 +3007,7 @@ class Orchestrator:
                 last["owner_stop"] = True
         if first:
             self.log_session(t, last, summary, killed=killed is not None)
+            self.hand_off(t, ending(summary, killed is not None))
         return killed
 
     def draft(self, st, on: bool) -> None:
@@ -2773,6 +3036,7 @@ class Orchestrator:
             # второго; иначе стоп с шагом `settle` — `agent:go` разберёт итог без нового запуска.
             self.finish_run(t, last)
             if st.step == "stopped":
+                self.post_stop(n, t, st)  # путь v2: отчёт сессии публикует оркестратор (#341)
                 self.labels(n, add=(STOPPED,), remove=(STOP,))
                 # Отчёт — сессии, не по команде владельца.
                 t.update(phase="stopped", resume="session", reports=t.get("reports", 0) + 1)
@@ -2790,6 +3054,8 @@ class Orchestrator:
         """`agent:retry`: с чистого листа. Каждый шаг повторим — сбой посреди оставляет метку, и
         следующий такт доделает."""
         v2 = self.v2()  # до первого шага: опечатка в переключателе не начнёт повтор
+        # Тикет остановлен «средой» (#342) — пауза снята, хоть её ставил и другой такой тикет.
+        v2_doctor.release(self, n, t)
         if self.end_run(t) is False:
             raise Failure(f"#{n}: процессы сессии не завершились и за SIGKILL — повтор не начат")
         st = self.route(n)
@@ -2809,6 +3075,7 @@ class Orchestrator:
             raise Failure(f"#{n}: уборка в песочнице: {tail(res.stderr or res.stdout)}")
         for suffix in (".json", ".md"):
             self.own_report(n).with_suffix(suffix).unlink(missing_ok=True)
+        v2_handover.drop(self.dir, n)  # отчёт передачи прошлой попытки чистому листу не годится
         self.labels(n, add=(QUEUED,), remove=(RETRY, STOPPED, HUMAN, start.IN_PROGRESS))
         if n in self.data["queue"]:
             self.data["queue"].remove(n)
@@ -2822,19 +3089,31 @@ class Orchestrator:
             "estimate": round(before.get("estimate", 0) + spent["estimate"], 4),
         }
         self.data["tickets"][str(n)] = renewed
+        self.catchup().release(n)  # место слияния прошлой попытки (#348)
         self.free(n)
         say(f"#{n}: повтор — с чистого листа, в очереди")
 
     def resume_stopped(self, n: int, t: dict) -> None:
         """`agent:go` на остановленном: черновик PR снят, метки остановки — тоже, тикет в очередь;
         шаг, на котором он встал, помнит `resume`. Остановлен, ожидая ответа на вопрос, — снова
-        ждёт ответа (метка `ready-for-human` остаётся): запуск без ответа был бы впустую."""
+        ждёт ответа (метка ожидания остаётся: `ready-for-human`, на пути v2 — `agent:stopped`,
+        #347): запуск без ответа был бы впустую. Тикет остановлен «средой» (#342) — пауза очереди
+        снимается, хоть её ставил и другой такой тикет: владелец посмотрел среду. Остановка по
+        пределу кругов пути v2 — ещё один круг этого вида (`v2/limits.py`, #349)."""
+        v2_doctor.release(self, n, t)
+        if t.get("v2") and (kind := v2_limits.grant(t)):
+            say(f"#{n}: `{GO}` после предела — ещё один круг вида «{kind}»")
+        if t.pop("edited", None):  # «тикет изменён» (#347): снимок — заново при занятии места
+            t.pop("snapshot", None)
+            self.sender().mark(n, t, v2_card.ATTENTION, None, key="stop", publish=False)
         if t.get("resume") == "question":
-            self.labels(n, remove=(GO, STOPPED))
+            self.labels(n, remove=(GO,) if t.get("v2") else (GO, STOPPED))
             t["phase"] = "question"
             t.pop("resume", None)
             return say(f"#{n}: продолжение после остановки — снова ждёт ответа на вопрос")
-        if t.get("behind"):  # основа ушла: черновик держит старый head до догона (`catch_up`)
+        if t.get("behind") or t.get("v2"):
+            # Основа ушла: черновик держит старый head до догона (`catch_up`); путь v2 (#341):
+            # PR — черновик до шага CI, перевод из него — там (`own_draft`).
             t["undraft"] = True
         else:
             self.draft(self.route(n), False)
@@ -3013,6 +3292,11 @@ class Orchestrator:
                 self.labels(n, remove=(GO,))
                 say(f"#{n}: {GO} — тикет уже ведётся, метка снята")
             return
+        if HUMAN in names and self.v2():
+            # Путь v2 (#347): `ready-for-human` — только ручные сессии (разведка, авария).
+            self.labels(n, remove=(GO,))
+            self.comment(n, HUMAN_NOTE)
+            return say(f"#{n}: {HUMAN} — тикет для ручной сессии, не взят")
         if READY_FOR_AGENT not in names:
             self.labels(n, remove=(GO,))  # до комментария: сбой меток его не повторит
             self.comment(
@@ -3062,18 +3346,32 @@ class Orchestrator:
                 if field := st.broken():
                     self.stop(n, t, f"состояние маршрута повреждено: {field}")
                     continue
-                if question:  # вопроса в маршруте нет — ответ взят (ручная сессия): продолжение
+                resume, done = "answer", ()
+                if t.get("gate"):  # вопрос ворот отправки пути v2 (#341) — свой, не сессии
+                    try:
+                        said = self.sender().reply(n, t, found.get("comments") or [])
+                    except asks.NoQuestion:
+                        self.stop(n, t, "вопрос ворот оркестратора не найден в тикете")
+                        continue
+                    if said is None:
+                        continue
+                    t["gate"]["answer"] = said  # все ответы после вопроса, по порядку
+                    resume, done = "gate", (STOPPED, HUMAN)  # `HUMAN` — вопросы до #347
+                elif question:  # вопроса в маршруте нет — ответ взят (ручная сессия): дальше
                     comments = found.get("comments") or []
                     try:
                         replies, _ = asks.answers(
                             core, question, comments, strict=True, strangers=False
                         )
                     except asks.NoQuestion:
-                        self.stop(n, t, f"вопрос сессии {question['url']} не найден в тикете")
+                        what = question["url"] or "из файла сессии"
+                        self.stop(n, t, f"вопрос сессии {what} не найден в тикете")
                         continue
                     if not replies:
                         continue
-                self.labels(n, add=(QUEUED,))
+                    if t.get("v2"):  # токен сессии v2 на чтение: метку снимает оркестратор
+                        done = (STOPPED, HUMAN)  # `HUMAN` — вопросы до #347
+                self.labels(n, add=(QUEUED,), remove=done)
             except (core.Failure, *COMMAND_ERRORS) as exc:
                 errors.append(f"#{n} ответ на вопрос: {exc}")
                 say(f"#{n}: ответ на вопрос не проверен — {exc}")
@@ -3081,7 +3379,7 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 errors.append(self.fault(n, exc))
                 continue
-            t.update(phase="queued", resume="answer", requeued=stamp())
+            t.update(phase="queued", resume=resume, requeued=stamp())
             queue = self.data["queue"]
             ahead = 0  # за тикетами с ответом, но раньше новых
             while ahead < len(queue) and self.waits_answer(queue[ahead]):
@@ -3093,7 +3391,7 @@ class Orchestrator:
     def waits_answer(self, n: int) -> bool:
         """Тикет в очереди после ответа владельца — его место раньше новых."""
         t = self.data["tickets"].get(str(n)) or {}
-        return t.get("phase") == "queued" and t.get("resume") == "answer"
+        return t.get("phase") == "queued" and t.get("resume") in ("answer", "gate")
 
     def fill(self) -> list[str]:
         """Свободные места — тикетам очереди по порядку (`blockers`). Тикет, которому сейчас
@@ -3222,24 +3520,44 @@ class Orchestrator:
         очереди."""
         t = self.ticket(n)
         self.labels(n, remove=(QUEUED,))
+        new = t.get("v2") and "snapshot" not in t
+        if t.get("v2") and not self.snap(n, t):
+            return  # тело тикета правили, пока он ждал: остановка «тикет изменён» (#347)
+        try:
+            self.occupied(n, t)
+        except BaseException:
+            if new:  # место не занято: снимок — при следующем занятии, правка в очереди — не стоп
+                t.pop("snapshot", None)
+            raise
+        if t["phase"] != "stopped":
+            t.pop("resume", None)
+
+    def occupied(self, n: int, t: dict) -> None:
+        """Шаг тикета, занявшего место (`begin`)."""
         back = t.get("resume")
-        if back in ("ci", "merge", "settle"):
+        if back in ("ci", "merge", "settle", "rtest"):
             self.data["queue"].remove(n)
             self.occupy(n)
             if back == "settle":
                 t["phase"] = "session"
+            elif back == "rtest":  # тест ревьюера пути v2 (#344) — с той стадии, где стоял
+                t["phase"] = "rtest"
             else:
                 t.pop("ci_since", None)
                 t["phase"] = "ci"
             self.steps(t)[t["phase"]](n, t)
         elif back == "answer":
             self.after_answer(n, t)
+        elif back == "gate":  # ответ на вопрос ворот отправки пути v2 (#341)
+            self.data["queue"].remove(n)
+            self.occupy(n)
+            t["phase"] = "session"  # сбой посреди — повтор разбора итога, а не новый запуск
+            self.sender().answer(n, t)
         elif self.resumable(n, t):  # прерванное задание оркестратора (догон, CI) — то же снова
-            self.launch(n, resume=t["session"], task=t.get("task"))
+            self.launch(n, resume=t.get("session"), task=t.get("task"), **v2_limits.relaunch(t))
         else:
+            v2_limits.forget(t)  # назначенного запуска не будет: новая сессия без задания
             self.launch(n)
-        if t["phase"] != "stopped":
-            t.pop("resume", None)
 
     def after_answer(self, n: int, t: dict, why: str | None = None) -> None:
         """Ответ владельца получен: та же сессия (`--resume`, маршрут сам находит ответ); её нет
@@ -3248,7 +3566,7 @@ class Orchestrator:
         question = self.route(n)["question"]
         if why is None and not self.resumable(n, t):
             why = "сессии для возобновления нет (нет её id или worktree тикета)"
-        self.launch(n, resume=None if why else t["session"])
+        self.launch(n, resume=None if why else t.get("session"))
         if t["phase"] != "session":
             return  # предел тикета: отчёт об остановке уже в тикете
         if question:
@@ -3267,13 +3585,24 @@ class Orchestrator:
 
     def resumable(self, n: int, t: dict) -> bool:
         """Сессию можно возобновить: id есть и worktree тикета в клоне песочницы есть (старт мог
-        не дойти до `claude`)."""
-        return bool(t.get("session")) and self.worktree(n) is not None
+        не дойти до `claude`). Путь v2 (#339) id не помнит: возврат — новая сессия на той же
+        ветке, нужен только worktree."""
+        return (t.get("v2") or bool(t.get("session"))) and self.worktree(n) is not None
 
-    def launch(self, n: int, resume: str | None = None, task: str | None = None) -> None:
+    def launch(
+        self,
+        n: int,
+        resume: str | None = None,
+        task: str | None = None,
+        role: str = "session",
+        other: bool = False,
+    ) -> None:
         """Сессия тикета через `session-run`: новая или возобновление той же (`--resume`);
-        задание оркестратора — `--prompt` (и новой сессии вместо потерянной), иначе `/start N`;
-        `--max-budget-usd` — наименьший из предела запуска и остатка предела тикета."""
+        задание оркестратора — `--prompt` (и новой сессии вместо потерянной), иначе `/start N`
+        (сессии пути v2 маршрут даёт по `/start N` её задание, #340; возврату v2 — вход с ним);
+        `--max-budget-usd` — наименьший из предела запуска и остатка предела тикета. Путь v2:
+        `role` — роль из `v2/roles.py` (проверка посылки — `parcel`), `other` — повтор после
+        сбоя инструмента на другой модели (#349)."""
         t = self.ticket(n)
         st = self.route(n)
         spent = self.costs(t, st)["limit"]
@@ -3287,20 +3616,49 @@ class Orchestrator:
                 "сессии не начат",
             )
         budget = f"{min(RUN_LIMIT, TICKET_LIMIT - spent):.2f}"
+        prompt = task
+        if t.get("v2"):
+            # Путь v2 (#341): рабочая копия в песочнице — к ветке на сервере до новой сессии;
+            # метку `in-progress` ставит оркестратор (токен сессии на чтение). Граница
+            # песочницы — до первой команды внутри, «доктор» среды (#342) — тоже.
+            self.sandbox_entry()
+            if not self.environment().doctor(n, t):
+                if task:  # остановка «среда»: `agent:go` вернёт то же задание
+                    t["task"] = task
+                return
+            if not self.catchup().before_session(n, t):  # после ревью — на свежей основе (#348)
+                if task:
+                    t["task"] = task
+                return
+            if problem := self.sender().align(n, t):
+                return self.stop(n, t, problem)
+            if not t["runs"]:
+                self.labels(n, add=(start.IN_PROGRESS,))
+            # Путь v2 (#339): продолжений бесед нет — возврат (любой запуск после первого) —
+            # новая сессия на той же ветке с тикетом, диффом и отчётом передачи во входе.
+            resume = None
+            if t["runs"]:
+                prompt = self.return_input(n, t, st, task)
         session = resume or str(uuid.uuid4())
+        tag = uuid.uuid4().hex[:16]  # метка запуска: по ней такт находит его процессы внутри
         logs = self.dir / "logs"
         logs.mkdir(parents=True, exist_ok=True)
-        # id сессии в имени: после `agent:retry` запуски считаются с нуля, лог прошлой попытки цел.
-        log = logs / f"ticket-{n}-{session[:8]}-{len(t['runs']) + 1}.jsonl"
-        tag = uuid.uuid4().hex[:16]  # метка запуска: по ней такт находит его процессы внутри
+        # id сессии в имени (у v2 id нет — метка запуска: по ней лог найдёт `adopt`): после
+        # `agent:retry` запуски считаются с нуля, лог прошлой попытки цел.
+        key = tag if t.get("v2") else session
+        log = logs / f"ticket-{n}-{key[:8]}-{len(t['runs']) + 1}.jsonl"
         script = [str(HERE / "session-run"), str(n), "--run", tag, "--max-budget-usd", budget]
         script += ["--resume", session] if resume else []
-        script += ["--prompt", task] if task else []
-        model = roles.args("session") if t.get("v2") else []  # старый путь — без модели
-        script += ["--", *model, *([] if resume else ["--session-id", session]), *STREAM]
+        script += ["--prompt", prompt] if prompt else []
+        # Старый путь — без модели; у v2 ещё закрыт поиск в интернете (#340).
+        model = [*roles.args(role, other), *v2_task.DENIED] if t.get("v2") else []
+        named = [] if resume or t.get("v2") else ["--session-id", session]  # у v2 id нет
+        script += ["--", *model, *named, *STREAM]
         self.sandbox_entry()  # граница — до подготовки: шаблон в не ту песочницу не уйдёт
         self.prepare()  # образы проекта и база-шаблон — до первого запуска такта
-        env = self.session_env()
+        env = self.ticket_env(n)  # путь v2 — токен на чтение (#341)
+        if t.get("v2"):  # хук быстрых проверок на коммите — `session-run` (#338)
+            env[v2_checks.HOOK_ENV] = "1"
         if browser := self.data.get("sandbox", {}).get("browser"):
             env[BROWSER_ENV] = browser["image"]  # рецепт `/verify` запускает драйвер в нём
         if snapshot := self.snapshot():
@@ -3327,16 +3685,24 @@ class Orchestrator:
         t["runs"].append(
             {
                 "run": tag,
-                "session": session,
+                "session": None if t.get("v2") else session,
                 "pid": proc.pid,
                 "pid_started": started_at(proc.pid),
                 "log": str(log),
                 "started": stamp(),
                 "budget": budget,
                 "resumed": bool(resume),
+                **({"role": role} if role != "session" else {}),
+                **({"model": roles.OTHER} if other and t.get("v2") else {}),
+                **({"route": route_print(self.route(n))} if t.get("v2") else {}),  # #349
             }
         )
-        t.update(phase="session", session=session)
+        t["phase"] = "session"
+        if t.get("v2"):
+            self.catchup().started(t)  # долг `/verify` после догона — у начатой сессии (#348)
+            v2_limits.started(t)  # проверка посылки или повтор по сбою — засчитаны (#349)
+        else:
+            t["session"] = session
         t.pop("ci_since", None)
         if task:  # задание оркестратора — до «код готов»: стоп посреди его не потеряет
             t["task"] = task
@@ -3348,10 +3714,81 @@ class Orchestrator:
         # Запуск — в состояние сразу: такт, упавший дальше, не потеряет его (осиротевшую сессию
         # без записи найдёт `reconcile`).
         self.save()
-        say(f"#{n}: сессия {'возобновлена' if resume else 'запущена'} (pid {proc.pid})")
+        how = "возобновлена" if resume else "запущена"
+        if t.get("v2") and len(t["runs"]) > 1:
+            how = "запущена новой на возврат"
+        say(f"#{n}: сессия {how} (pid {proc.pid})")
+
+    def return_input(self, n: int, t: dict, st, task: str | None) -> str:
+        """Вход новой сессии на возврате пути v2 (#339): задание, тикет, дифф ветки и отчёт
+        передачи прошлого запуска (`v2/handover.py`). Отчёта нет (сбор после запуска не удался) —
+        собирается сейчас."""
+        if v2_handover.load(self.dir, n) is None:
+            self.hand_off(t, "отчёт после запуска не собран — собран перед возвратом", done=True)
+        report, diff = v2_handover.load(self.dir, n) or (None, None)  # не вышло — так и сказано
+        issue = core.gh_json("issue", "view", str(n), "--json", "title,body") or {}
+        rules = v2_task.rules(n, self.ticket_cmd)  # задание сессии v2 (#340) — и возврату
+        return v2_handover.prompt(n, st.branch(), task, issue, report, diff, rules=rules)
+
+    def hand_off(self, t: dict, why: str, done: bool = False) -> None:
+        """Запуск сессии тикета пути v2 кончился (и оборван): отчёт передачи — у оркестратора
+        (`v2/handover.py`). Факты ветки — изнутри песочницы (`session-run --handover`); с
+        `--save` он коммитит отслеживаемые правки только локально — кроме запуска, кончившегося
+        сам (`done`) на «код готов»: там head уже отдан ревью и CI. Шаг, проверки и вопрос — из
+        состояния маршрута. Worktree нет — прошлый отчёт остаётся. Отчёт сессии в песочнице
+        убирается только после сохранения. Сбой — строкой, а прошлый отчёт удаляется: этому
+        запуску он не годится, и отчёт соберёт следующий возврат (`return_input`)."""
+        n = self.number_of(t)
+        if not t.get("v2") or n is None:
+            return
+        try:
+            st = self.route(n)
+            save = ["--save"] if not done or st.step != "ready" else []
+            res = self.cleanup_inside(n, "--handover", *save)
+            if res.returncode != 0:
+                raise Failure(tail(res.stderr or res.stdout))
+            facts = json.loads(res.stdout.strip().split("\n")[-1])
+            if not facts.get("worktree") and v2_handover.load(self.dir, n) is not None:
+                return say(f"#{n}: worktree тикета нет — отчёт передачи прошлого запуска остаётся")
+            report = v2_handover.compose(n, facts, st.data, why)
+            v2_handover.save(self.dir, n, report, facts.get("diff") if facts["worktree"] else None)
+        except (Failure, core.Failure, *COMMAND_ERRORS, IndexError) as exc:
+            v2_handover.drop(self.dir, n)
+            return say(f"#{n}: отчёт передачи не собран — {exc}")
+        self.drop_note(n)
+
+    def drop_note(self, n: int) -> None:
+        """Отчёт сессии (`.ticket/handover.md` worktree) — из песочницы, когда он сохранён у
+        оркестратора: без перехода по ссылкам (`open_inside`), git в клоне Mac не выполняет."""
+        worktree = self.worktree(n)
+        if worktree is None:
+            return
+        rel = worktree.relative_to(self.clone) / v2_handover.NOTE
+        try:
+            fd = open_inside(self.clone, rel.parent.parts)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            return say(f"#{n}: отчёт сессии в песочнице не убран — {exc}")
+        try:
+            os.unlink(rel.name, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            say(f"#{n}: отчёт сессии в песочнице не убран — {exc}")
+        finally:
+            os.close(fd)
+
+    def number_of(self, t: dict) -> int | None:
+        """Номер тикета по его записи в состоянии."""
+        return next((int(key) for key, value in self.data["tickets"].items() if value is t), None)
 
     def advance(self, n: int) -> None:
         t = self.ticket(n)
+        # Правка тела после старта (#347) — до шага; на мёрже — после: слитый в это окно PR —
+        # не остановка с ложным отчётом, а уборка шага.
+        if t.get("v2") and t["phase"] != "merge" and not self.snap(n, t):
+            return
         phase = t["phase"]
         # Состояние маршрута пишет сессия (#275); на шаге «сессия» — проверка в `session_over`,
         # когда запуск кончился.
@@ -3361,6 +3798,45 @@ class Orchestrator:
             step(n, t)
         else:
             self.free(n)
+        if phase == "merge" and t.get("v2") and self.data["tickets"].get(str(n)) is t:
+            if t["phase"] == "merge":
+                self.snap(n, t)
+
+    def snap(self, n: int, t: dict) -> bool:
+        """Снимок тикета пути v2 (`v2/snapshot.py`, #347): нет — снимается (тикет занимает место:
+        «Владения» и флаги только что прочитаны `blockers`); есть — сверка с телом тикета, правка
+        после снимка — остановка «тикет изменён». Итог — тикет идёт дальше."""
+        body = (core.gh_json("issue", "view", str(n), "--json", "body") or {}).get("body")
+        if "snapshot" not in t:
+            claims = self.claims_of(n)
+            flags = claims["flags"] if claims else v2_gates.text_flags(body or "")
+            points = self.evidence().ticket_points(body)  # пункты условия 4 (#352)
+            t["snapshot"] = v2_snapshot.take(body, claims, flags, stamp(), points)
+            return True
+        if not v2_snapshot.edited(t["snapshot"], body):
+            return True
+        self.edited(n, t)
+        return False
+
+    def edited(self, n: int, t: dict) -> None:
+        """Остановка «тикет изменён»: живая сессия завершается (кончившаяся, но не разобранная —
+        разбор после `agent:go`), PR — черновик (с авто-мёржем не сольётся), отчёт с кодом;
+        `agent:go` — новый снимок (`resume_stopped`)."""
+        why = f"тело тикета правили после снимка {t['snapshot']['at']} — проверки по старой версии"
+        why += " не идут"
+        last = t["runs"][-1] if t["runs"] else None
+        if t["phase"] == "session" and last and "ended" not in last and not self.live(last):
+            self.finish_run(t, last)
+            t["phase"] = "settle"
+        elif t["phase"] == "session":
+            why += f"; {ended(self.end_run(t))}"
+        self.draft(self.route(n), True)
+        t["undraft"] = True
+        reason = f"код `{v2_snapshot.CODE}`: {why}"
+        t["edited"] = reason
+        line = "Остановка — тикет изменён после старта; отчёт в тикете"
+        self.sender().mark(n, t, v2_card.ATTENTION, line, key="stop")
+        self.stop(n, t, reason)
 
     def v2(self) -> bool:
         """Переключатель пути v2 — раз за команду, когда он нужен: опечатка в нём не роняет
@@ -3379,6 +3855,12 @@ class Orchestrator:
         """Разбор причин красного CI пути v2 (`v2/ci.py`, #335) — хуки шага `ci`."""
         return v2_ci.Cause(self, start, say, stamp)
 
+    def spot(self):
+        """Точечный прогон тестов ревьюера пути v2 меткой (`v2/spot.py`, #336) — для шага теста
+        ревьюера (#344)."""
+        gh = lambda *args: core.gh(*args, "-R", self.repo, timeout=v2_ci.GH_TIMEOUT)  # noqa: E731
+        return v2_spot.Spot(gh, core.Failure, say, stamp, seconds_since)
+
     # --- сессия ---
 
     def finish_run(self, t: dict, last: dict, log: bool = True) -> dict:
@@ -3393,6 +3875,8 @@ class Orchestrator:
             self.observe(summary["rate_limit"], since=last["started"])
         if log:
             self.log_session(t, last, summary)
+            done = not summary["failed"] and not summary["limit"]
+            self.hand_off(t, ending(summary), done=done)
         return summary
 
     def log_role(
@@ -3403,7 +3887,7 @@ class Orchestrator:
         маршрута: сбой записи — строкой, такт и состояние тикета идут дальше."""
         if not t.get("v2"):
             return
-        n = next((int(key) for key, value in self.data["tickets"].items() if value is t), None)
+        n = self.number_of(t)
         if n is None:
             return say(
                 f"журнал v2: тикет запуска {role} не найден в состоянии — событие не записано"
@@ -3424,7 +3908,8 @@ class Orchestrator:
         запуска известно (у осиротевшей — нет). Итог возобновления накоплен с начала сессии —
         в событие только часть запуска (`journal.part`); итога нет — оценка его бюджетом."""
         code = last.get("subtype") or "no_result"
-        outcome = "killed" if killed else ("ok" if code == "success" else "error")
+        failed = summary.get("failed", code != "success")  # `success` с `is_error` — ошибка (#349)
+        outcome = "killed" if killed else ("error" if failed else "ok")
         took = datetime.fromisoformat(last["ended"]) - datetime.fromisoformat(last["started"])
         final = summary.get("final")
         before = [r for r in t["runs"][: t["runs"].index(last)] if r.get("subtype")]
@@ -3434,9 +3919,10 @@ class Orchestrator:
         estimated = bool(last.get("cost_estimated")) or usd is None
         if estimated:  # итога нет или расход уже оценён — оценка худшим случаем
             usd = max(last.get("cost") or 0, float(last.get("budget") or RUN_LIMIT))
+        model = {"model": last["model"]} if last.get("model") else {}  # повтор на другой (#349)
         self.log_role(
             t,
-            "session",
+            last.get("role") or "session",
             final,
             took.total_seconds() if measured else None,
             run=last.get("run"),
@@ -3449,6 +3935,7 @@ class Orchestrator:
             code=code,
             exit=None,
             tokens=used,
+            **model,
         )
 
     def session_over(self, n: int, t: dict) -> None:
@@ -3465,7 +3952,7 @@ class Orchestrator:
                 rejected=False,
                 since=last["started"],
             )
-            self.session_env()  # токен сессии свежим: запуск дольше часа не падает на push
+            self.ticket_env(n)  # токен сессии свежим: запуск дольше часа не падает на push
             self.serve_fresh(n, t)  # сессия ждёт свежую копию прода (#307)
             return
         summary = self.finish_run(t, last)
@@ -3474,7 +3961,9 @@ class Orchestrator:
             return self.stop(n, t, f"состояние маршрута повреждено: {field}")
         asked = last.get("answer")
         unanswered = bool(asked) and (st["question"] or {}).get("stamp") == asked
-        if summary["limit"] and st.step not in ("ready", "stopped"):
+        # Запуск пути v2 не тронул маршрут (#349): его шаг — от прошлого запуска, не итог этого.
+        stale = bool(t.get("v2")) and last.get("route") == route_print(st)
+        if summary["limit"] and (st.step not in ("ready", "stopped") or stale):
             if unanswered or not st["question"]:  # запуск не кончился вопросом
                 # Упор в лимит подписки — не сбой: пауза до сброса, та же сессия продолжит потом
                 # (после ответа владельца — снова с ответом).
@@ -3483,39 +3972,171 @@ class Orchestrator:
                 if unanswered:
                     t["resume"] = "answer"
                 return say(f"#{n}: упор в лимит подписки — тикет первым ждёт сброса")
-        ready = st["ready"] or {}
         if unanswered:
             return self.answer_lost(n, t, last, summary)
         if last.get("resumed") and summary["lost"]:
             return self.session_lost(n, t, summary)
+        if t.get("v2") and summary["failed"] and stale:
+            # Запуск упал, не тронув маршрут (#349): его шаг, «стоп» и head — от прошлого запуска,
+            # итог этого — сбой роли, а не «проверка посылки не помогла» или новый возврат.
+            return self.session_failed(n, t, last, summary, st)
+        if st.step == "ready" or st["question"] or st.step == "stopped":
+            v2_limits.succeeded(t)  # запуск кончился делом — сбои роли подряд с нуля (#349)
         if st.step == "ready":
             t.pop("task", None)  # задание оркестратора выполнено
-        if st.step == "ready" and not ready.get("reviewed"):
-            self.review(n, t, st)
-        elif st.step == "ready":
-            t["phase"] = "ci"
-            self.steps(t)["ci"](n, t)
+            self.ready_step(n, t, st)
         elif st["question"]:
+            self.post_question(n, t, st)  # путь v2: вопрос из файла сессии (#341)
             t.update(phase="question", asked=t.get("asked", 0) + 1)  # ответ — `answered`
             self.free(n)
             say(f"#{n}: вопрос владельцу — место свободно до ответа")
+        elif st.step == "stopped" and t.get("v2") and self.fixes().dispute(n, t, st):
+            return  # «стоп» со спором по находке — решает судья, не владелец (#345)
+        elif st.step == "stopped" and t.get("v2") and v2_limits.verify_over(st["stop"]):
+            self.verify_over(n, t, st)  # FAIL `/verify` сверх предела маршрута (#349)
+        elif st.step == "stopped" and t.get("v2") and v2_criteria.unverifiable(st["stop"]):
+            # «Не проверить» `/verify` (#351) — не ошибка кода: код «среда» без возврата; пауза
+            # очереди — только у сбоя среды, пункт тикета держит лишь его. `agent:go` — сессия
+            # маршрута (он продолжит с `/verify`), а не прерванное задание оркестратора.
+            reason = st["stop"]["reason"]
+            t.pop("task", None)
+            pause = v2_criteria.kind(reason) == "environment"
+            self.environment().down(n, t, reason, [], pause=pause)
         elif st.step == "stopped":
-            # Отчёт опубликовала сама сессия (`ready-for-human` — его); на шаге `stop` маршрут
-            # ещё ждал отчёт от агента — это сессия без результата, ниже.
+            # Отчёт опубликовала сама сессия (`ready-for-human` — его), у пути v2 — оркестратор
+            # из её файла; на шаге `stop` маршрут ещё ждал отчёт от агента — это сессия без
+            # результата, ниже.
+            self.post_stop(n, t, st)
             self.labels(n, add=(STOPPED,))
             t.update(phase="stopped", resume="session", reports=t.get("reports", 0) + 1)
             self.free(n)
             say(f"#{n}: сессия остановилась с отчётом")
-        elif summary["subtype"] == BUDGET_OUT:
-            self.stop(
-                n,
-                t,
-                f"{limit_name(last)}: запуск остановлен по `--max-budget-usd {last.get('budget')}` "
-                f"(шаг маршрута «{st.step}»): {summary['result']}",
-            )
         else:
-            why = summary["result"] or "в потоке нет итога"
-            self.stop(n, t, f"сессия кончилась без результата (шаг маршрута «{st.step}»): {why}")
+            self.session_failed(n, t, last, summary, st)
+
+    def session_failed(self, n: int, t: dict, last: dict, summary: dict, st) -> None:
+        """Запуск сессии кончился без «код готов», вопроса и «стопа»: упор в `--max-budget-usd` или
+        без результата. Путь v2 (#349) — сбой роли по виду (`role_failed`); упор в остаток
+        предела тикета — остановка, как у старого пути."""
+        if summary["subtype"] == BUDGET_OUT:
+            why = (
+                f"{limit_name(last)}: запуск остановлен по `--max-budget-usd {last.get('budget')}` "
+                f"(шаг маршрута «{st.step}»): {summary['result']}"
+            )
+            if t.get("v2") and not ticket_limited(last):
+                return self.role_failed(n, t, "limit", why)
+            return self.stop(n, t, why)
+        why = summary["result"] or "в потоке нет итога"
+        why = f"сессия кончилась без результата (шаг маршрута «{st.step}»): {why}"
+        if t.get("v2"):
+            kind = v2_limits.failure(summary["subtype"], summary["result"] or "")
+            return self.role_failed(n, t, kind, why)
+        self.stop(n, t, why)
+
+    def verify_over(self, n: int, t: dict, st) -> None:
+        """Маршрут сессии пути v2 остановился по своему пределу FAIL `/verify` (#349): третий
+        круг — проверка посылки (роль `parcel`, маршрут продолжает `ship --again`), а после неё —
+        остановка по пределу с рекомендацией вместо отчёта сессии."""
+        what = f"FAIL `/verify` (маршрут: «{st['stop']['reason']}»)"
+        if not v2_limits.parcel_due(t, "verify"):
+            reason = v2_limits.reason(t, "verify", what)
+            v2_limits.hit(t, "verify", reason)
+            t.pop("task", None)  # `agent:go` — сессия маршрута, не вторая проверка посылки
+            return self.stop(n, t, reason)
+        words = self.task_words(n)
+        then = (
+            f"Маршрут остановлен на `/verify`: продолжи его вызовом `{words['ship']} --again` "
+            f"({words['long']}) и заданиями — до {words['until']}. Вопрос владельцу — только "
+            f"`{words['ask']}`."
+        )
+        task = v2_limits.parcel_task(n, what, then)
+        self.relaunch(n, t, task, {"role": "parcel", "count": ["parcel", "verify"]})
+
+    def role_failed(self, n: int, t: dict, kind: str, why: str) -> None:
+        """Сбой роли сессии пути v2 (#349) по виду `kind` (`v2/limits.py`): предел — повтор с
+        меньшим объёмом, сеть — как есть, инструмент — на другой модели, неизвестное — один
+        повтор; повторов больше нет — остановка с кодом. Возвратом не считается; повтор делает то
+        же, что прерванный запуск: задание оркестратора или продолжение маршрута."""
+        base = v2_limits.state(t).setdefault("task", t.get("task"))
+        if not v2_limits.retry(t, kind):
+            if base:  # `agent:go` — то же задание, без слов повтора
+                t["task"] = v2_limits.state(t).pop("task")
+            else:
+                t.pop("task", None)
+            return self.stop(n, t, v2_limits.failure_reason(t, kind, why))
+        task = v2_limits.retry_task(n, kind, why, base or v2_handover.DEFAULT_TASK.format(n=n))
+        last = t["runs"][-1] if t["runs"] else {}
+        run = {"role": last.get("role") or "session", "other": kind == "tool"}
+        self.relaunch(n, t, task, {**run, "count": ["failure", kind]})
+
+    def relaunch(self, n: int, t: dict, task: str, how: dict) -> None:
+        """Новый запуск пути v2 после кончившегося (#349): `how` — роль, другая модель и что
+        засчитать, когда запуск начат (`v2_limits.started`). Пауза держит — тикет первым в
+        очереди с тем же заданием: заняв место, запустит его так же."""
+        t["task"] = task
+        v2_limits.state(t)["next"] = how
+        if self.hold(n, "новый запуск"):
+            return self.requeue(n, t)
+        self.launch(n, task=task, **v2_limits.relaunch(t))
+
+    def ready_step(self, n: int, t: dict, st) -> None:
+        """«Код готов»: до ревью — ревью ошибок; после разбора — шаг CI. Путь v2 перед CI
+        отправляет ветку воротами оркестратора (#341): вопрос или остановка — шаг такта сделан;
+        а до всего — проверка в песочнице на новом head (#342): на красной ревью не начинается.
+        Перед отправкой после разбора — вопрос владельцу до слияния, если ревью его требует
+        (#343)."""
+        if t.get("v2") and not self.environment().verify(n, t, st):
+            return  # проверка в песочнице (#342): возврат или остановка «среда»
+        if not (st["ready"] or {}).get("reviewed"):
+            return self.review(n, t, st)
+        if t.get("v2") and not self.sender().before_merge(n, t, st):
+            return  # серьёзная находка без доказательства и флаг «миграция» — вопрос (#343)
+        if t.get("v2") and not self.sender().ready(n, t, st):
+            return
+        if t.get("v2") and not self.fixes().check(n, t, st):
+            return  # починка отвергнута, находка без спора или короткое ревью (#345)
+        t["phase"] = "ci"
+        self.steps(t)["ci"](n, t)
+
+    def post_question(self, n: int, t: dict, st) -> None:
+        """Вопрос сессии пути v2 — в тикет от оркестратора (#341): токен сессии на чтение, вопрос
+        она оставила в состоянии маршрута без ссылки. Метка и упоминание — как у `ticket ask`
+        под оркестратором; уже опубликованный (тот же штамп) — не повторяется."""
+        question = st["question"]
+        if not t.get("v2") or question.get("url") or t.get("posted_ask") == question["stamp"]:
+            return
+        owner = self.repo.split("/")[0]
+        body = (
+            f"{core.ASK_MARK.format(stamp=question['stamp'])}\n**Вопрос сессии тикета #{n}**\n\n"
+            f"{question.get('text') or ''}\n\n---\n@{owner} Ответ — комментарием в этом тикете "
+            "(можно с телефона): работа продолжится сама, «продолжай» писать не нужно."
+        )
+        # Ждущее владельца — `agent:stopped` (#347); до комментария: сбой между ними повтор
+        # исправит.
+        self.labels(n, add=(STOPPED,))
+        self.comment(n, body)
+        t["posted_ask"] = question["stamp"]
+
+    def post_stop(self, n: int, t: dict, st) -> None:
+        """Отчёт об остановке сессии пути v2 — в тикет от оркестратора (#341): текст —
+        `stop-report.md` маршрута рядом с состоянием, с упоминанием владельца и меткой
+        `agent:stopped` (#347); уже опубликованный (то же время остановки) — не повторяется."""
+        stop = st.data.get("stop") if isinstance(st.data.get("stop"), dict) else {}
+        at = stop.get("at") or ""
+        if not t.get("v2") or t.get("posted_stop") == at:
+            return
+        try:
+            text = read_inside(self.clone, st.rel / "stop-report.md").decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            text = f"{core.REPORT_MARK}: {stop.get('reason') or 'сессия остановила маршрут'}\n"
+        owner = self.repo.split("/")[0]
+        text = f"{text.rstrip()}\n\n{SESSION_STOP_TAIL}"  # четыре раздела, как у своих (#347)
+        self.labels(n, add=(STOPPED,))
+        self.comment(n, ship.with_mention(text, owner, need=f"метка `{STOPPED}`"))
+        t["posted_stop"] = at
+        if t.get("pr"):
+            line = "Сессия остановилась с отчётом — он в тикете"
+            self.sender().mark(n, t, v2_card.ATTENTION, line, key="stop")
 
     def answer_lost(self, n: int, t: dict, last: dict, summary: dict) -> None:
         """Запуск после ответа кончился, а вопрос всё ещё ждёт: ответ сессия не взяла.
@@ -3529,11 +4150,17 @@ class Orchestrator:
                 f"{limit_name(last)}: запуск после ответа владельца остановлен по "
                 f"`--max-budget-usd {last.get('budget')}`: {result}",
             )
-        if not last.get("resumed"):
+        # Путь v2 (#339) не возобновляет: запуск после ответа — уже новая сессия; оборванный
+        # (сон Mac, сбой) — ещё одна, один раз, как у возобновления.
+        if not last.get("resumed") and not (t.get("v2") and not last.get("replaces")):
             return self.stop(n, t, f"новая сессия кончилась, не взяв ответ владельца: {result}")
         if self.hold(n, "новая сессия после ответа владельца"):
             return
-        self.after_answer(n, t, why=f"сессия не возобновилась ({result})")
+        if not t.get("v2"):
+            return self.after_answer(n, t, why=f"сессия не возобновилась ({result})")
+        self.after_answer(n, t, why=f"сессия после ответа кончилась, не взяв его ({result})")
+        if t["phase"] == "session":
+            t["runs"][-1]["replaces"] = True  # второй такой — отчёт об остановке
 
     def session_lost(self, n: int, t: dict, summary: dict) -> None:
         """Возобновление не нашло сессию (её транскрипт удалён с песочницей, #262) на любом шаге:
@@ -3579,16 +4206,20 @@ class Orchestrator:
         self, n: int, t: dict, reason: str, remove: tuple[str, ...] = (), by_owner: bool = False
     ) -> None:
         """Отчёт об остановке «Причина / Сделано / Доступно» с упоминанием владельца (решение
-        16.10, п. 11: уведомление), `agent:stopped` и `ready-for-human`; ветка и PR сохраняются.
+        16.10, п. 11: уведомление), `agent:stopped` и `ready-for-human`; на пути v2 (#347) —
+        четвёртый раздел «Рекомендация и риск» и только `agent:stopped`; ветка и PR сохраняются.
         `by_owner` — стоп по `agent:stop` владельца: без упоминания, это его команда (#264).
         Шаг остановки — в `resume` (с него продолжит `agent:go`). Метки — до комментария: их сбой
         не повторит комментарий на следующем такте."""
         if t["phase"] not in ("stopped", "queued"):
             t["resume"] = t["phase"]
         body = self.report(n, t, reason, by_owner)
-        self.labels(n, add=(STOPPED, HUMAN), remove=remove)
+        # Путь v2 (#347): ждущее владельца — `agent:stopped`, `ready-for-human` — ручным сессиям.
+        self.labels(n, add=(STOPPED,) if t.get("v2") else (STOPPED, HUMAN), remove=remove)
         self.comment(n, body)
         t.update(phase="stopped", reason=reason, reports=t.get("reports", 0) + 1)
+        if t.get("v2"):
+            self.catchup().release(n)  # вставший место слияния не держит (#348)
         if by_owner:
             t["owner_stops"] = t.get("owner_stops", 0) + 1
         self.free(n)
@@ -3609,24 +4240,45 @@ class Orchestrator:
         if cost["excluded"]:
             done += f" (оценка запусков, прерванных `{STOP}` владельца, в предел не входит)"
         done += "."
-        if t.get("resume") in ("ci", "merge"):
+        refused = t.get("refused") or {}
+        advice = ADVICE_OWNER if by_owner else ADVICE
+        if t.get("v2") and refused.get("reason") == reason:  # отказ допуска (#346) — по коду
+            go = v2_gates.GO[refused["code"]]
+            advice = v2_gates.ADVICE[refused["code"]]
+        elif t.get("resume") in ("ci", "merge"):
             go = "снова проверка CI и отметка `review`, черновик PR снимается"
         elif t.get("resume") == "settle":
             go = "разбор итога кончившейся сессии, без нового запуска"
+        elif t.get("resume") == "rtest":
+            go = "тест ревьюера продолжится с того же места, без новой сессии (#344)"
         elif t.get("resume") == "question":
             go = (
                 "тикет снова ждёт ответа на вопрос (ответ — комментарием в тикете); вопроса в "
                 f"тикете нет — нужен `{RETRY}`"
             )
+        elif t.get("v2") and self.resumable(n, t):
+            go = (
+                "новая сессия на той же ветке — с тикетом, диффом и отчётом передачи, черновик PR "
+                "снимается"
+            )
         elif self.resumable(n, t):
             go = "та же сессия возобновится, черновик PR снимается"
         else:
             go = "новая сессия запустится"
-        if exhausted(spent) and t.get("resume") not in ("ci", "merge", "settle"):
+        if t.get("v2") and (limited := v2_limits.advice(t, reason)):  # предел кругов (#349)
+            go, advice = limited
+        if t.get("v2") and t.get("edited") == reason:  # «тикет изменён» (#347): новый снимок
+            go = v2_snapshot.GO.format(go=go)
+            advice = v2_snapshot.ADVICE
+        if exhausted(spent) and t.get("resume") not in ("ci", "merge", "settle", "rtest"):
             go += f" — но предел тикета исчерпан: запуск сразу остановится, нужен `{RETRY}`"
         owner = self.repo.split("/")[0]
         mention = "" if by_owner else f"@{owner}, "  # стоп владельца — без упоминания (#264)
         human = f"{mention}нужен человек: метка `{HUMAN}`."
+        risk = ""
+        if t.get("v2"):  # путь v2 (#347): четвёртый раздел, ждущее владельца — `agent:stopped`
+            human = f"{mention}тикет ждёт вас: метка `{STOPPED}`."
+            risk = f"**Рекомендация и риск:** {advice}\n\n"
         return (
             f"{core.REPORT_MARK} (оркестратор)\n\n"
             f"**Причина:** {reason}\n\n"
@@ -3636,6 +4288,7 @@ class Orchestrator:
             f"- `{RETRY}` — с чистого листа: PR закрыт с комментарием, ветка, worktree и "
             "состояние удалены, тикет снова в очереди;\n"
             "- ничего не ставить — тикет ждёт, место оркестратора свободно.\n\n"
+            + risk
             + f"{human[0].upper()}{human[1:]}\n"
         )
 
@@ -3691,14 +4344,26 @@ class Orchestrator:
                     n, t, "новая сессия вместо потерянной кончилась до разбора находок ревью"
                 )
             self.hand_over(n, st)
-            self.launch(n, resume=t["session"])
+            self.launch(n, resume=t.get("session"))
             if t["phase"] == "session":  # засчитан только начатый запуск (сбой подготовки — нет)
                 t["handovers"] = t.get("handovers", 0) + 1
             return
-        # Ревью — по ветке с GitHub: head «код готов» сессия ещё не отправляла, push — изнутри.
-        if problem := self.publish(n, st):
+        # Ревью — по ветке с GitHub: head «код готов» сессия ещё не отправляла. Старый путь —
+        # push изнутри токеном сессии; путь v2 — ворота отправки оркестратора (#341).
+        if t.get("v2"):
+            # Догон на сервере (#348): висящий — до отправки, отставшая ветка — до ревью.
+            catchup = self.catchup()
+            if not catchup.settle(n, t, "review"):
+                return  # слияние ещё не пришло или остановка: ревью — на следующем такте
+            st = self.route(n)  # пришедший догон — «эта версия» (`overlay`)
+            if not self.sender().ready(n, t, st) or not catchup.before_review(n, t, st):
+                return
+            st = self.route(n)
+        elif problem := self.publish(n, st):
             return self.stop(n, t, f"ветка «код готов» не на GitHub: {problem}")
         head = st["ready"]["head"]
+        # Тикет — до чекаута (#343): сбой `gh` не оставит чекаут ревью на диске.
+        ticket = self.ticket_input(n) if t.get("v2") else []
         try:
             checkout = self.checkout("review", n, head)
         except Failure as exc:
@@ -3708,11 +4373,12 @@ class Orchestrator:
         env = without_tokens()
         env["PATH"] = f"{self.claude_shim()}{os.pathsep}{os.environ.get('PATH', '')}"
         env.pop(roles.V2_ENV, None)  # старый путь — без таблицы ролей, что бы ни было в такте
-        if t.get("v2"):  # модель и усилие ревью — роль пути v2 из таблицы (`claude_run.role`)
-            env[roles.V2_ENV] = "1"
-        say(f"#{n}: ревью ошибок head {head[:7]}")
         budget = f"{min(REVIEW_LIMIT, TICKET_LIMIT - spent):.2f}"  # ревью тоже в пределе тикета
         review = [sys.executable, str(HERE / "review"), str(report), "--max-budget-usd", budget]
+        if t.get("v2"):  # модель и усилие ревью — роль пути v2 из таблицы (`claude_run.role`)
+            env[roles.V2_ENV] = "1"
+            review += ticket  # тикет целиком — вход, флаги брифа — как у мест (#343)
+        say(f"#{n}: ревью ошибок head {head[:7]}")
         before = report.stat().st_mtime_ns if report.exists() else None
         started, clock = stamp(), time.monotonic()
 
@@ -3762,8 +4428,67 @@ class Orchestrator:
         cost = data.get("total_cost_usd")
         t["cost"]["review"] = cost if isinstance(cost, (int, float)) else 0
         t["reviewed"] = True
+        if t.get("v2"):
+            self.review_card(n, t, data.get("canon_review"))
+            if self.rtest().begin(n, t, data):
+                return  # тест ревьюера (#344): разбор — после исходов точечного прогона
         self.hand_over(n, st)
-        self.launch(n, resume=t["session"])  # находки — той же сессии заданием маршрута
+        self.launch(n, resume=t.get("session"))  # находки — той же сессии заданием маршрута
+
+    def ticket_input(self, n: int) -> list[str]:
+        """Аргументы входа ревью ошибок пути v2 (#343): `--ticket` — тикет целиком (заголовок,
+        тело и нескрытые комментарии участников репозитория: ответы владельца, уточнения;
+        комментарии App и посторонних — нет: это отчёты маршрута или чужой текст), файлом рядом
+        со своим отчётом ревью; `--flags` — флаги брифа тем же правилом, что у мест
+        (`claims_of`); брифа по образцу нет — флаги ревью берёт из текста тикета."""
+        issue = core.gh_json("issue", "view", str(n), "--json", "title,body,comments") or {}
+        parts = [f"# #{n}: {issue.get('title') or ''}".rstrip(": "), issue.get("body") or ""]
+        said = [
+            (c.get("body") or "").strip()
+            for c in issue.get("comments") or []
+            if core.member(c) and not c.get("isMinimized")
+        ]
+        if said := [s for s in said if s]:
+            parts.append("## Комментарии участников\n\n" + "\n\n---\n\n".join(said))
+        path = self.dir / "reviews" / f"ticket-{n}.issue.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n\n".join(p.strip() for p in parts) + "\n", encoding="utf-8")
+        found = self.claims_of(n)
+        given = [] if found is None else ["--flags", ",".join(found["flags"])]
+        return ["--ticket", str(path), *given]
+
+    def review_card(self, n: int, t: dict, review) -> None:
+        """Итог ревью ошибок пути v2 — в карточку PR (#343): сводка видов находок; отказ от
+        теста при блокирующей находке и вопрос владельцу до слияния — в «Требует внимания»."""
+        block = review.get("v2") if isinstance(review, dict) else None
+        if not isinstance(block, dict):
+            return
+        send, count = self.sender(), block.get("count") or {}
+        got = {k: count.get(k, 0) for k in ("test", "verify", "no_test", "unproved", "other")}
+        # Та же сводка, что строка `review: путь v2 …` скрипта: счёт — из его отчёта.
+        line = (
+            f"Ревью ошибок: находок {sum(got.values())} — блокирующих "
+            f"{got['test'] + got['verify'] + got['no_test']} (тест {got['test']}, /verify "
+            f"{got['verify']}, отказ от теста {got['no_test']}), без доказательства "
+            f"{got['unproved']}, прочих {got['other']}"
+        )
+        send.mark(n, t, v2_card.DONE, line, key="review", publish=False)
+        for item in block.get("refused") or []:
+            text = (
+                f"Ревью отказалось от теста при блокирующей находке {item['n']} "
+                f"`{item['where']}` — {item['summary']}: «{item['reason']}». Решение — вопросом "
+                "в разборе находок"
+            )
+            send.mark(n, t, v2_card.ATTENTION, text, key=f"refused-{item['n']}", publish=False)
+        flag = block.get("serious_flag")
+        for item in block.get("owner_question") or []:
+            text = (
+                f"Находка {item['n']} `{item['where']}` без доказательства, флаг «{flag}» — "
+                "вопрос владельцу до слияния"
+            )
+            send.mark(n, t, v2_card.ATTENTION, text, key=f"unproved-{item['n']}", publish=False)
+        if t.get("pr"):
+            send.publish(n, t)
 
     @staticmethod
     def fresh_report(report: Path, before: int | None) -> dict | None:
@@ -3874,6 +4599,9 @@ class Orchestrator:
             n, names = issue["number"], label_names(issue)
             if READY_FOR_AGENT not in names:
                 continue
+            if HUMAN in names and self.v2():  # путь v2 (#347): ручную сессию не берёт
+                waiting[n] = f"тикет для ручной сессии (`{HUMAN}`) — оркестратор его не берёт"
+                continue
             held = [b for b in blockers(issue.get("body"), self.repo) if b in issues.keys() - gone]
             if held or start.IN_PROGRESS in names:
                 waiting[n] = (
@@ -3968,6 +4696,7 @@ class Orchestrator:
                 "runs": len(t["runs"]) + before.get("runs", 0),
             }
         del self.data["tickets"][str(n)]
+        v2_handover.drop(self.dir, n)
         if n in self.data["queue"]:
             self.data["queue"].remove(n)
         self.free(n)
@@ -4037,10 +4766,13 @@ class Orchestrator:
             return {}
         return pr
 
-    def ci(self, n: int, t: dict, cause=None) -> None:
+    def ci(self, n: int, t: dict, cause=None, gate=None) -> None:
         """Шаг CI: красный на head «код готов» — возврат; зелёный — отметка `review`. `cause` —
         разбор причин красного пути v2 (`v2/ci.py`, #335): красный — его `red`, зелёный — сначала
-        его `green`; без него — как раньше."""
+        его `green`; без него — как раньше. `gate` — допуск пути v2 (`v2/gates.py`, #346):
+        условия до перевода PR из черновика (`admit`), условие 1 на зелёном (`trusted`), отметка
+        без авто-мёржа у «миграции» (`hold`). На обоих путях задачи, пропущенные на черновике до
+        его снятия, и точечный прогон тестов ревьюера — не итог CI (`ci_rollup`, #336)."""
         st = self.route(n)
         if not st["pr"]:
             return self.stop(n, t, "«код готов» после разбора, а PR в состоянии тикета нет")
@@ -4049,7 +4781,14 @@ class Orchestrator:
             return closed
         if self.catch_up(n, t, st, pr):
             return
+        if gate and not gate.admit(n, t, st, pr):
+            return  # отказ допуска или возврат: PR остаётся черновиком
         self.own_draft(t, st)
+        try:
+            ready = self.ready_time(st, pr)
+            pr = ci_rollup(pr, ready, self.skip_events(pr, ready))
+        except core.Failure as exc:
+            return say(f"#{n}: перевод PR из черновика не прочитан — CI ждёт: {exc}")
         if red := start.failed_checks(pr):
             if pr["headRefOid"] != (st["ready"] or {}).get("head"):
                 # GitHub ещё отдаёт прошлый head: красный — не этого «код готов», ждём.
@@ -4065,15 +4804,42 @@ class Orchestrator:
             since = t.setdefault("ci_since", stamp())
             if not checks(pr) and seconds_since(since) > CI_WAIT:
                 return self.stop(n, t, f"на PR нет проверок CI {duration(since)}")
+            waiting = [c["name"] for c in checks(pr) if c.get("draft_skipped")]
+            if waiting and seconds_since(since) > CI_WAIT:
+                why = f"после перевода PR из черновика нет полного прогона CI {duration(since)}"
+                return self.stop(
+                    n,
+                    t,
+                    f"{why}: {', '.join(map(str, waiting))} — только пропуск на черновике (CI "
+                    "проекта должен слушать `ready_for_review`, контракт CI шаблона профиля)",
+                )
             return  # CI идёт
         if cause:
             cause.green(n, t, pr)
+        if gate and not gate.trusted(n, t, st, pr):
+            return
+        if gate and (why := self.catchup().waits(n)):  # слияние по одному (#348)
+            if t.get("held_by") != why:
+                say(f"#{n}: отметка ждёт — {why}")
+            t["held_by"] = why
+            return
+        t.pop("held_by", None)
         head = pr["headRefOid"]
         if problem := self.unmarkable(n, t, st, head):
             return self.stop(n, t, f"отметку review не ставлю: {problem}")
         args = ["--mark", "--review-report", str(self.own_report(n))]
         if st["weakening"]:
             args += ["--weakening", st["weakening"]]
+        human = st.data.get("ready_for_human")
+        if t.get("v2") and isinstance(human, str) and human:
+            # Путь v2 (#341): финиш сессии без `ship-finish --pr-only` — сигнал перерасхода
+            # `/verify` и ревью владельцу (метка и комментарий на PR) ставит отметка.
+            args += ["--ready-for-human", human]
+        if gate or v2_switch():  # `protect-main --v2` — на весь репозиторий, и тикету старого пути
+            self.disown_mark(n, head)
+        hold = bool(gate) and gate.hold(n, t, head)
+        if hold:  # флаг «миграция» (#346): отметка без авто-мёржа, «да» владельца — вопросом
+            args.append("--hold")
         # Свой чекаут на ветке тикета в своём клоне: git в клоне сессий Mac не выполняет.
         branch = st.branch()
         checkout = self.checkout("mark", n, head, branch=branch)
@@ -4086,8 +4852,33 @@ class Orchestrator:
             log = self.output_log(n, "mark", res.stdout + res.stderr)
             said = ship.failure(res.stderr or res.stdout, log, "на Mac")
             return self.stop(n, t, f"отметка review не поставлена (код {res.returncode}): {said}")
+        if hold:
+            t.update(marked=head, pr=st["pr"])
+            return gate.ask_merge(n, t, head)
         t.update(phase="merge", marked=head, pr=st["pr"])
+        if gate:
+            self.catchup().marked(n)  # место слияния — до мёржа или остановки (#348)
         say(f"#{n}: отметка review и авто-мёрж на {head[:7]}")
+
+    def disown_mark(self, n: int, head: str) -> None:
+        """Путь v2 (#415): отметку `review` засчитывает только App (`protect-main --v2`).
+        Последняя отметка на head — успех не от App (учётка владельца, чужой бот) — для
+        оркестратора её нет: поверх неё — `pending` от App. Иначе `ship-finish --mark` счёл бы
+        её стоящей, а PR встал бы навсегда."""
+        statuses = core.gh_json("api", f"repos/{self.repo}/commits/{head}/statuses") or []
+        mark = next(
+            (s for s in statuses if isinstance(s, dict) and s.get("context") == start.REVIEW),
+            None,
+        )
+        if not mark or mark.get("state") != "success" or own_mark(mark, core.agent_app()):
+            return
+        who = (mark.get("creator") or {}).get("login") or "?"
+        core.gh(
+            "api", "-X", "POST", f"repos/{self.repo}/statuses/{head}",
+            "-f", "state=pending", "-f", f"context={start.REVIEW}",
+            "-f", f"description={FOREIGN_MARK.format(who=who)}",
+        )  # fmt: skip
+        say(f"#{n}: отметка review на {head[:7]} не от App ({who}) — не засчитана, ставлю свою")
 
     def unmarkable(self, n: int, t: dict, st, head: str) -> str | None:
         """Почему отметку на head PR ставить нельзя; None — можно. Одно ревью на тикет: отчёт
@@ -4136,7 +4927,7 @@ class Orchestrator:
         if self.catch_up(n, t, st, pr):
             return
         self.own_draft(t, st)
-        if red := start.failed_checks(pr):
+        if red := start.failed_checks(ci_rollup(pr, None)):
             return self.give_back(n, t, st, "красный CI после отметки", red)
         if start.is_conflicting(pr):
             return self.stop(n, t, f"PR {st['pr']} в конфликте с main")
@@ -4144,15 +4935,53 @@ class Orchestrator:
             return self.stop(n, t, f"авто-мёрж PR {st['pr']} выключен — PR придержан")
         # ждём авто-мёржа
 
+    def ready_time(self, st, pr: dict) -> str | None:
+        """Время последнего перевода PR из черновика по GitHub (событие `ready_for_review`) —
+        только если на PR есть пропущенные задачи: иначе фильтру `ci_rollup` оно не нужно. Не
+        было — None. Сбой `gh` — `Failure`: без времени пропуск черновика не отличить."""
+        if not any(c.get("conclusion") == "SKIPPED" for c in pr.get("statusCheckRollup") or []):
+            return None
+        owner, name = self.repo.split("/", 1)
+        number = str(st["pr"]).rstrip("/").rsplit("/", 1)[-1]
+        out = core.gh(
+            "api", "graphql", "-f", f"query={READY_QUERY}", "-F", f"owner={owner}",
+            "-F", f"name={name}", "-F", f"number={number}",
+            "--jq", ".data.repository.pullRequest.timelineItems.nodes[0].createdAt // empty",
+        )  # fmt: skip
+        return out.strip() or None
+
+    def skip_events(self, pr: dict, ready: str | None) -> dict[str, str]:
+        """События прогонов пропущенных задач PR, законченных до перевода из черновика (`ready`):
+        `ci_rollup` считает прогоном черновика только `pull_request`. Не прочитано (сбой `gh`) —
+        события нет: пропуск — прогон черновика, как раньше."""
+        since, found = github_time(ready), {}
+        for c in pr.get("statusCheckRollup") or []:
+            done = github_time(c.get("completedAt"))
+            rid = run_id(c)
+            if not (since and done and done < since and rid) or c.get("conclusion") != "SKIPPED":
+                continue
+            if rid in found:
+                continue
+            try:
+                info = core.gh_json("run", "view", rid, "--json", "event", "-R", self.repo) or {}
+            except core.Failure as exc:
+                say(f"событие прогона {rid} не прочитано — пропуск считается черновиком: {exc}")
+                continue
+            if isinstance(info.get("event"), str):
+                found[rid] = info["event"]
+        return found
+
     def own_draft(self, t: dict, st) -> None:
-        """Черновик, поставленный на время догона основы (`undraft`), — снять: догон кончился."""
+        """Черновик, поставленный на время догона основы (`undraft`), — снять: догон кончился.
+        Задачи, пропущенные на черновике до снятия, — не итог (`ci_rollup`)."""
         if t.get("undraft"):
             self.draft(st, False)
             t.pop("undraft")
 
     def catch_up(self, n: int, t: dict, st, pr: dict) -> bool:
         """Основа ушла вперёд (отметка `behind`: слит другой тикет оркестратора или GitHub
-        говорит `BEHIND`), а head PR не содержит `origin/main` — догон той же сессией: PR — в
+        говорит `BEHIND`), а head PR не содержит `origin/main`. Путь v2 (#348) — догон на сервере
+        (`v2/catchup.py`), сессией — только конфликт. Старый путь — догон той же сессией: PR — в
         черновик (старый head с отметкой не сольётся посреди догона), задание «догони основу»;
         конфликт сводит сессия по правилам маршрута, ревью не повторяется. Отметка снимается,
         когда основа в ветке: прерванный догон (стоп, сбой запуска) повторится. Та же основа не
@@ -4160,9 +4989,17 @@ class Orchestrator:
         такта сделан (догон начат или остановка)."""
         if pr.get("mergeStateStatus") == "BEHIND":
             t["behind"] = True  # слияние в main мимо оркестратора
+        fetched = False
+        if t.get("v2") and not t.get("behind") and t.get("admitted") != pr.get("headRefOid"):
+            # Путь v2 (#348): до допуска основа сверяется всегда — допуск и CI идут на свежей.
+            self.own_repo(refetch=True)
+            fetched = True
+            if not self.ancestor("origin/main", pr["headRefOid"]):
+                t["behind"] = True
         if not t.get("behind"):
             return False
-        self.own_repo(refetch=True)  # основа и head PR — свежие, с GitHub, в своём клоне
+        if not fetched:
+            self.own_repo(refetch=True)  # основа и head PR — свежие, с GitHub, в своём клоне
         base = self.git("rev-parse", "origin/main").stdout.strip()
         if self.ancestor("origin/main", pr["headRefOid"]):
             t.pop("behind")  # основа в ветке (догон сделан или маршрут догнал её сам)
@@ -4172,6 +5009,8 @@ class Orchestrator:
             t.pop("behind")
             self.stop(n, t, f"сессия догоняла основу {base[:7]}, а head PR её не содержит")
             return True
+        if t.get("v2") and self.catchup().behind(n, t, st, pr):
+            return True  # догон на сервере (#348); конфликт в пределе — догон сессией ниже
         if not self.resumable(n, t):
             t.pop("behind")
             self.stop(n, t, "основа ушла вперёд, а догнать её некому: нет сессии")
@@ -4180,28 +5019,67 @@ class Orchestrator:
             return True
         self.draft(st, True)
         t["undraft"] = True
-        self.launch(n, resume=t["session"], task=CATCH_UP.format(n=n, **self.task_words(n)))
+        self.launch(n, resume=t.get("session"), task=CATCH_UP.format(n=n, **self.task_words(n)))
         if t["phase"] == "session":
             t["caught"] = base
-            say(f"#{n}: основа ушла вперёд — догон той же сессией")
+            t.pop("refused", None)  # отказ допуска «ветка отстала» (#346) — исполнен его `agent:go`
+            if t.get("v2"):
+                self.catchup().conflict_started(n, t)  # конфликт засчитан начатым запуском (#348)
+            who = "новой сессией" if t.get("v2") else "той же сессией"
+            say(f"#{n}: основа ушла вперёд — догон {who}")
         return True
 
-    def give_back(self, n: int, t: dict, st, why: str, red: list[str]) -> None:
-        """Красный CI — **возврат**: та же сессия с заданием по CI, в пределах тикета, без второго
-        ревью; возвратов не больше `RETURNS`, следующий красный — отчёт об остановке. Возврат
-        засчитан, только если запуск начат."""
+    def give_back(
+        self,
+        n: int,
+        t: dict,
+        st,
+        why: str,
+        red: list[str],
+        task: str | None = None,
+        checks: bool = True,
+    ) -> None:
+        """Красный CI — **возврат**: та же сессия с заданием по CI (`task` — своё задание, у
+        проверки в песочнице пути v2, #342), в пределах тикета, без второго ревью; возвратов не
+        больше `RETURNS`, следующий красный — отчёт об остановке. Возврат засчитан, только если
+        запуск начат. Путь v2 (#349): красные проверки (`checks`) — предел вида `checks`
+        (`v2/limits.py`, с запасом от `agent:go`), третий круг — проверка посылки (роль `parcel`,
+        засчитана, когда запуск начат), после неё — остановка по пределу с рекомендацией; её
+        `agent:go` — этот же возврат. Возвраты исправлений после ревью (`checks=False`) идут в тот
+        же счёт, но проверки посылки не дают."""
         what = f"{why}: {', '.join(red)}"
-        if t.get("returns", 0) >= RETURNS:
-            return self.stop(n, t, f"{what} — возвратов сессии уже {RETURNS}")
+        task = task or CI_TASK.format(n=n, why=what, pr=st["pr"], **self.task_words(n))
+        v2, parcel = t.get("v2"), False
+        allowed = v2_limits.allowed(t, "checks") if v2 else RETURNS
+        if v2 and checks and t.get("returns", 0) >= allowed:
+            if not v2_limits.parcel_due(t, "checks"):
+                reason = v2_limits.reason(t, "checks", what)
+                v2_limits.hit(t, "checks", reason)
+                if t["phase"] == "session":  # `agent:go` — новая сессия: с этим же возвратом
+                    t["task"] = task
+                    v2_limits.state(t)["next"] = {"count": ["return", "checks"]}
+                return self.stop(n, t, reason)
+            parcel = True
+        elif t.get("returns", 0) >= allowed:
+            return self.stop(n, t, f"{what} — возвратов сессии уже {allowed}")
         if not self.resumable(n, t):
             return self.stop(n, t, f"{what} — вернуть некому: нет сессии")
         if self.hold(n, "возврат по красному CI"):
             return
-        task = CI_TASK.format(n=n, why=what, pr=st["pr"], **self.task_words(n))
-        self.launch(n, resume=t["session"], task=task)
-        if t["phase"] == "session":
+        if v2 and st["pr"]:
+            # Путь v2 (#346): починка — без CI, PR снова черновик; полный CI — при переводе.
+            self.draft(st, True)
+            t["undraft"] = True
+        if parcel:  # роль и счёт — назначенным запуском: отложенный «средой» их не потеряет
+            task = v2_limits.parcel_task(n, what, task)
+            v2_limits.state(t)["next"] = {"role": "parcel", "count": ["parcel", "checks"]}
+        self.launch(n, resume=t.get("session"), task=task, **v2_limits.relaunch(t))
+        if t["phase"] == "session" and parcel:
+            say(f"#{n}: {what} — починки не помогли: проверка посылки новой сессией")
+        elif t["phase"] == "session":
             t["returns"] = t.get("returns", 0) + 1
-            say(f"#{n}: {what} — возврат той же сессии ({t['returns']}/{RETURNS})")
+            who = "новой сессией" if v2 else "той же сессии"
+            say(f"#{n}: {what} — возврат {who} ({t['returns']}/{allowed})")
 
     def task_words(self, n: int) -> dict:
         """Общие слова заданий оркестратора: вызов маршрута, до чего, вопрос владельцу, правила
@@ -4219,6 +5097,11 @@ class Orchestrator:
 
     def merged(self, n: int, t: dict, st, pr: dict) -> None:
         gone, problems = self.retire(n, pr.get("headRefOid"))
+        if t.get("v2"):  # уборка в песочнице — токеном на чтение: метку снимает оркестратор
+            try:
+                self.labels(n, remove=(start.IN_PROGRESS,))
+            except core.Failure as exc:
+                problems.append(f"метка `{start.IN_PROGRESS}` не снята: {exc}")
         cost = self.costs(t, st)
         lines = [
             f"Оркестратор: тикет слит — PR {st['pr']}.",
@@ -4235,11 +5118,30 @@ class Orchestrator:
         for suffix in (".json", ".md"):  # отчёт этого круга новой работе по тикету не годится
             self.own_report(n).with_suffix(suffix).unlink(missing_ok=True)
         self.forget(n, t, st["pr"], cost)
+        if t.get("v2"):
+            self.ask_accept(n, st["pr"])
+            self.catchup().release(n)  # слияние по одному (#348): место — следующему
         for other in self.data["tickets"].values():  # ещё не слиты: основа ушла вперёд
             other["behind"] = True
         say(
             f"#{n}: слит, "
             + (f"уборка не доделана: {'; '.join(problems)}" if problems else "убрано")
+        )
+
+    def ask_accept(self, n: int, pr: str) -> None:
+        """Путь v2 (#347): «принято?» по карточке PR слитого тикета до этапа выката
+        (`v2/accept.py`). Сбой — в лог: тикет уже слит, вопрос не повторяется."""
+        try:
+            merge = (core.gh_json("pr", "view", pr, "--json", "mergeCommit") or {}).get(
+                "mergeCommit"
+            ) or {}
+            v2_accept.ask(self, self.accept_tools(), n, pr, merge.get("oid"))
+        except (core.Failure, *COMMAND_ERRORS) as exc:
+            say(f"#{n}: вопрос «принято?» не записан — {exc}")
+
+    def accept_tools(self):
+        return types.SimpleNamespace(
+            core=core, asks=asks, say=say, stamp=stamp, seconds_since=seconds_since
         )
 
     def retire(self, n: int, head) -> tuple[bool, list[str]]:
@@ -4452,6 +5354,14 @@ def without_tokens() -> dict:
     return {k: v for k, v in os.environ.items() if k not in TOKENS}
 
 
+def own_mark(status: dict, app: str | None) -> bool:
+    """Статус поставил App канона: бот `<slug>[bot]` из `canon.agentApp`; App не задан — своего
+    не узнать, любой статус чужой (#415)."""
+    creator = status.get("creator") or {}
+    login = str(creator.get("login") or "").lower()
+    return bool(app) and creator.get("type") == "Bot" and login == f"{app.lower()}[bot]"
+
+
 def checks(pr: dict) -> list[dict]:
     """Проверки CI на PR — без сторожа и самой отметки."""
     return [
@@ -4459,6 +5369,67 @@ def checks(pr: dict) -> list[dict]:
         for c in pr.get("statusCheckRollup") or []
         if c.get("name") != start.GUARD and c.get("context") != start.REVIEW
     ]
+
+
+def github_time(text: str | None) -> datetime | None:
+    """Время GitHub (`2026-10-18T09:30:00Z`); нет или не время — None."""
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")) if text else None
+    except ValueError:
+        return None
+
+
+def ci_rollup(pr: dict, ready: str | None, events: dict | None = None) -> dict:
+    """Проверки PR, которые — итог CI (#336). Время — только GitHub (`ready` — последний перевод
+    PR из черновика, событие `ready_for_review`; у проверок — `startedAt`, `completedAt`):
+    часы Mac с ним не сравниваются.
+
+    - задачи точечного прогона тестов ревьюера (`start.SPOT_WORKFLOW`) — не CI PR;
+    - задача, пропущенная (`SKIPPED`) и законченная до `ready`, — прогон черновика: CI проекта
+      пропускает задачи на черновике, а пропущенная задача для GitHub — успех, хотя полный прогон
+      идёт после перевода. Нет у её имени записи новее — «ждём полного прогона»: запись в очереди
+      с признаком `draft_skipped` (зелёным CI не станет, `ci` назовёт причину по пределу).
+      Прогон черновика — только у события `pull_request` (контракт CI): `events` — событие
+      прогона пропущенной задачи по его id (`skip_events`); известно и другое (задачи workflow
+      `dependabot-review` — `pull_request_target`: перевода не слушают, живой прогон #346) —
+      пропуск законный, зелёный; не известно — прогон черновика, как раньше;
+    - отменённая задача, у имени которой есть запись, начатая позже, — устаревшая: прогон
+      черновика, отменённый прогоном перевода из той же группы `concurrency`."""
+    since, events = github_time(ready), events or {}
+    rollup = [
+        c for c in pr.get("statusCheckRollup") or [] if c.get("workflowName") != start.SPOT_WORKFLOW
+    ]
+
+    def draft_run(c: dict) -> bool:
+        done = github_time(c.get("completedAt"))
+        if not (since and done and done < since) or (c.get("conclusion") or "") != "SKIPPED":
+            return False
+        return events.get(run_id(c), "pull_request") == "pull_request"
+
+    def begun(c: dict) -> datetime | None:
+        return github_time(c.get("startedAt") or c.get("completedAt"))
+
+    def overtaken(c: dict) -> bool:
+        at = begun(c)
+        return (c.get("conclusion") or "") == "CANCELLED" and any(
+            o.get("name") == c.get("name") and at and (later := begun(o)) and later > at
+            for o in rollup
+        )
+
+    skipped = {c.get("name") for c in rollup if draft_run(c)}
+    kept = [c for c in rollup if not draft_run(c) and not overtaken(c)]
+    names = {c.get("name") for c in kept}
+    kept += [
+        {"name": name, "status": "QUEUED", "conclusion": "", "draft_skipped": True}
+        for name in sorted(skipped - names, key=str)
+    ]
+    return {**pr, "statusCheckRollup": kept}
+
+
+def run_id(c: dict) -> str | None:
+    """Id прогона Actions проверки PR по её ссылке; не прогон Actions — None."""
+    match = start.GUARD_RUN.fullmatch(c.get("detailsUrl") or "")
+    return match.group(2) if match else None
 
 
 def ci_green(pr: dict) -> bool:
