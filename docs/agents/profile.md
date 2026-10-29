@@ -95,3 +95,16 @@ PR Dependabot сами не перестраиваются (`rebase-strategy: di
 ```
 
 Ожидается `sandbox: error: количество должно быть положительным` и `exit 2`.
+
+## Инструмент проверки для `/verify` пути v2
+
+`/verify` пути v2 (воркфлоу #351) проверяет критерии тикета командами инструмента проверки по
+карте функций, оба — из `main` (ветка их не подменит). Инструмент — `tools/verify/tool.py`
+(вывод — JSON, пробный режим `--dry-run`), карта — `tools/verify/map.md`; «доктор» — его команда
+`doctor`: приложение в проверяемой копии запускается (`.venv` копии; без окружения — красный).
+
+```verify-tool
+tool tools/verify/tool.py
+map tools/verify/map.md
+doctor python3 tools/verify/tool.py doctor
+```
