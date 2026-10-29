@@ -11,6 +11,8 @@ on:
   # Dependabot токеном workflow push-CI не запускает).
   schedule:
     - cron: "0 3 * * *"
+  # Ручной полный прогон `main` — выход из остановки линии (workflow#357).
+  workflow_dispatch:
 
 # Контракт CI оркестратора (workflow#335, «Ожидаемые job CI» шаблона профиля): новый push в PR
 # отменяет прогон старого head; прогоны `main` — каждый в своей группе (по коммиту) и не
@@ -20,8 +22,43 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Ночь без изменений `main` пропускается, но не дольше 3 суток (workflow#357, контракт CI
+  # шаблона профиля): последний полный прогон `main` зелёный, на том же коммите и моложе 60 ч.
+  night:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      skip: ${{ steps.last.outputs.skip }}
+    steps:
+      - id: last
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          since=$(date -u -d '60 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          ids=$(gh run list --workflow "$WORKFLOW" --branch main --status completed --limit 30 \
+            --json databaseId,event \
+            --jq '.[] | select(.event == "schedule" or .event == "workflow_dispatch") | .databaseId')
+          skip=false
+          for id in $ids; do
+            run=$(gh run view "$id" --json conclusion,headSha,createdAt,jobs)
+            full=$(jq '[.jobs[] | select(.name != "night" and .conclusion != "skipped")] | length > 0' <<<"$run")
+            [ "$full" = true ] || continue
+            skip=$(jq --arg sha "$GITHUB_SHA" --arg since "$since" \
+              '.conclusion == "success" and .headSha == $sha and .createdAt > $since' <<<"$run")
+            break
+          done
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
   test:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: night
+    if: >-
+      !cancelled() && needs.night.outputs.skip != 'true'
+      && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # gitleaks-action читает коммиты PR через API.
