@@ -56,8 +56,9 @@ def run(root: Path, args: list[str], dry: bool) -> dict:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "argv": argv, "error": f"приложение не запустилось: {exc}"}
     out = {"ok": True, "argv": argv, "exit": res.returncode, "lines": res.stdout.splitlines()}
-    if res.returncode != 0:
-        out["error"] = res.stderr.strip()
+    if res.returncode != 0:  # причина — последняя строка: у traceback это сама ошибка
+        lines = res.stderr.strip().splitlines()
+        out["error"] = lines[-1] if lines else f"код {res.returncode}, stderr пуст"
     return out
 
 
