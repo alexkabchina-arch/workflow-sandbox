@@ -25,6 +25,19 @@
 быть»), — PASS. Пунктов нет или дифф PR — только документы (маршрут `/verify` не гоняет) —
 доказывать запуском нечего, условие выполнено.
 
+**PR из `.github/`** (решение владельца 30.10): правку CI запуском приложения не
+доказать — `/verify` заменяет прогон CI. Доказательства `/verify` нет — условие 4 переходит на
+шаг после зелёного полного CI (`v2/gates.py`, `proved`): доказательство — номера прогонов
+полного CI на этой версии, а правка вызываемого `ci.yml` при стоящем на этой версии
+`canon-mainline.yml` — ещё зелёный ручной прогон `canon-mainline` на ветке (он один идёт по
+`workflow_call`). Номера — в `t["evidence"]["ci"]` и строке карточки. Путь-ограничитель
+`.github/` это не снимает: одобрения CODEOWNERS PR лица агента ждёт правилом GitHub. Рядом с
+`.github/` могут быть документы (решение 30.10, второе): поведения они не меняют, а документ
+здесь — правилом `review` (`is_docs`), только профиль для допуска — документ, если ветка правит в
+нём одну прозу: все блоки кода (```verify-tool, ```checks, ```gates и прочие — команды, как после
+#417) те же, что на основе, и профиль есть на обеих версиях. Задет хоть один другой файл (код
+приложения, инструкции агенту) — `/verify` как обычно.
+
 Удалить: выключить переключатель, затем этот файл; `evidence()` и `points` снимка в
 `orchestrator`, условие 4 в `v2/gates.py`, вызовы `keep` и `scrub` в `v2/send.py`.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
@@ -35,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 KEY = "verify"  # строка «Сводки доказательств» карточки
 # Отчёт `/verify` в теле PR от маршрута (`ticket_ship.pr_body`) — до последнего `</details>`: в
@@ -42,6 +56,13 @@ KEY = "verify"  # строка «Сводки доказательств» ка�
 OPEN = "<details><summary>Что проверил /verify</summary>"
 CLOSE = "</details>"
 STORE = "в PR не выкладываются: в выводе команд бывают секреты, на снимках — данные кабинета"
+CI_DIR = ".github/"  # PR из этих файлов (и документов): доказательство — прогон CI, а не `/verify`
+CI_LATER = (
+    "PR из `.github/`: доказательство — прогоны полного CI на этой версии (после перевода из "
+    "черновика)"
+)
+PROFILE = "docs/agents/profile.md"  # для допуска — документ, если правится только проза
+FENCE = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)  # блок кода профиля: команды
 
 
 class Evidence:
@@ -140,6 +161,9 @@ class Evidence:
         if record is None:
             if self.docs_only(head):  # маршрут /verify не гоняет — доказывать запуском нечего
                 return None
+            if self.ci_and_docs(head):  # доказательство — полный CI, условие 4 — после него
+                t["evidence"] = {"heads": [head], "missing": CI_LATER, "by_ci": True}
+                return None
             why = held.get("missing") or "оркестратор их не забирал"
             return f"доказательств /verify у оркестратора нет — {why}"
         heads = record.get("heads") or []
@@ -160,6 +184,17 @@ class Evidence:
             return f"не доказаны пункты: {', '.join(left)}"
         return None
 
+    def deferred(self, t: dict, head: str) -> bool:
+        """Условие 4 этой версии ждёт полного CI: PR из `.github/` без `/verify`."""
+        held = t.get("evidence") or {}
+        return held.get("heads") == [head] and held.get("by_ci") is True
+
+    def by_ci(self, n: int, t: dict, head: str, runs: list[str], manual: str | None) -> None:
+        """Доказательство PR из `.github/` — номера прогонов CI: в состояние и карточку."""
+        t["evidence"] = {"heads": [head], "ci": runs, **({"manual": manual} if manual else {})}
+        text = f"/verify на `{head[:7]}`: {ci_line(t['evidence'])}"
+        self.orch.sender().mark(n, t, self.t.card.EVIDENCE, text, key=KEY)
+
     @staticmethod
     def other_points(listed: list[dict], record: dict) -> list[str]:
         """Номера пунктов, текст которых у прогона `/verify` (`points` записи) не тот, что у
@@ -171,19 +206,64 @@ class Evidence:
         texts = {str(p.get("id")): p.get("text") for p in seen if isinstance(p, dict)}
         return [p["id"] for p in listed if p["id"] in texts and texts[p["id"]] != p["text"]]
 
-    def docs_only(self, head: str) -> bool:
-        """Дифф PR (`origin/main...head`) — только документы: маршрут /verify не гоняет."""
+    def files(self, head: str) -> list[str] | None:
+        """Файлы диффа PR (`origin/main...head`); не прочитан — None."""
         res = self.orch.git("diff", "--name-only", "-z", "--no-renames", f"origin/main...{head}")
-        files = [f for f in res.stdout.split("\0") if f] if res.returncode == 0 else []
-        return bool(files) and all(self.t.is_docs(f) for f in files)
+        return [f for f in res.stdout.split("\0") if f] if res.returncode == 0 else None
+
+    def ci_and_docs(self, head: str) -> bool:
+        """Дифф PR — файлы под `.github/` (CI и его настройки) и, может быть, документы:
+        правилом `review` (пути блока ```verify-tool основы — код) и профиль, где правится одна
+        проза. Не прочитан — нет."""
+        files = self.files(head)
+        if not files or not any(f.startswith(CI_DIR) for f in files):
+            return False
+        rest = [f for f in files if not f.startswith(CI_DIR)]
+        if not rest:
+            return True
+        base = self.orch.git("merge-base", "origin/main", head)
+        if base.returncode != 0:
+            return False
+        base = base.stdout.strip()
+        tool = self.orch.fixes().tool_paths(base)
+        if tool is None:
+            return False
+        for f in rest:
+            if f == PROFILE:
+                was, now = self.blocks(base), self.blocks(head)
+                if was is None or was != now:
+                    return False
+            elif not self.t.is_docs(f, tool):
+                return False
+        return True
+
+    def blocks(self, rev: str) -> list[str] | None:
+        """Блоки кода профиля на `rev` по порядку; профиля нет или он не прочитан — None."""
+        shown = self.orch.git("show", f"{rev}:{PROFILE}")
+        return FENCE.findall(shown.stdout) if shown.returncode == 0 else None
+
+    def docs_only(self, head: str) -> bool:
+        """Дифф PR (`origin/main...head`) — только документы: маршрут /verify не гоняет. Пути
+        блока ```verify-tool основы (`merge-base`, как у `review`) — код (#417); не прочитаны —
+        не документы."""
+        o = self.orch
+        files = self.files(head) or []
+        if not files or not all(self.t.is_docs(f) for f in files):
+            return False
+        base = o.git("merge-base", "origin/main", head)
+        tool = o.fixes().tool_paths(base.stdout.strip()) if base.returncode == 0 else None
+        return tool is not None and all(self.t.is_docs(f, tool) for f in files)
 
     # --- PR и карточка ---
 
     def lines(self, n: int, t: dict) -> list[str]:
         """Сводка без данных по пунктам тикета; доказательств нет — строка об этом."""
         record = self.record(t)
+        held = t.get("evidence") or {}
+        if record is None and held.get("ci"):
+            return [ci_line(held)]
         if record is None:
-            missing = (t.get("evidence") or {}).get("missing") or "нет"
+            missing = held.get("missing") or "нет"
             return [f"доказательств у оркестратора нет — {missing}"]
         return self.t.criteria.summary(self.points(n, t), record.get("results") or [])
 
@@ -207,6 +287,14 @@ class Evidence:
                 f"доказательства у оркестратора, {STORE}"
             )
         self.orch.sender().mark(n, t, self.t.card.EVIDENCE, text, key=KEY, publish=False)
+
+
+def ci_line(held: dict) -> str:
+    """Доказательство PR из `.github/` строкой: номера прогонов CI."""
+    said = f"вместо /verify — полный CI, прогоны {', '.join(held['ci'])}"
+    if manual := held.get("manual"):
+        said += f"; ручной прогон `canon-mainline` на ветке — {manual}"
+    return said
 
 
 def rid(row: dict) -> str:

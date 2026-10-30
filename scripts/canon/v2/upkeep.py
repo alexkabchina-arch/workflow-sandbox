@@ -37,8 +37,9 @@
   слияние, «нет» — PR не трогаю (закрывает владелец).
 
 Красный CI, конфликт, правка вне каталога на новом head, авто-мёрж не слил за `MERGE_WAIT` —
-тикет на владельца, раз на head; место слияния свободно. Пока PR обслуживания открыт, новое
-обслуживание не начинается: открытый PR — его ещё не кончившиеся сутки.
+тикет на владельца, раз на head; место слияния свободно. Красный CI при остановленной линии
+`main` (#357, `v2/mainline.py`) — ожидание без тикета: его чинит тикет «`main` красный». Пока PR
+обслуживания открыт, новое обслуживание не начинается: открытый PR — его ещё не кончившиеся сутки.
 
 Удалить: выключить суточный запуск (`upkeep()` и вызов в `tick` оркестратора), затем этот
 файл; роль `upkeep` в `v2/roles.py`; PR обслуживания в `active` у `v2/catchup.py`.
@@ -657,6 +658,11 @@ class Upkeep:
         if conf is None or outside(self.changed(head), conf):
             return self.stuck(e, pr, "outside")
         if red := self.t.start.failed_checks(pr):
+            if why := self.orch.mainline().holds(int(p["number"])):  # #357: причина — `main`
+                if p.get("held_by") != why:
+                    self.t.say(f"PR обслуживания: красный CI — ожидание: {why}")
+                p["held_by"] = why
+                return self.release(e)
             if p.get("red") != head:  # тикет — раз на head; зелёный перезапуск — PR идёт дальше
                 self.stuck(e, pr, "red", red, park=False)
             return self.release(e)

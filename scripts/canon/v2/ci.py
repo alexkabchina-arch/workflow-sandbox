@@ -5,8 +5,15 @@ CI проекта кладёт отчёт по тестам файлом про�
 JUnit XML (контракт — раздел «Ожидаемые job CI» шаблона профиля). Красный CI на head «код готов»
 оркестратор разбирает, когда прогоны с красными задачами закончены целиком, по порядку:
 
+- линия `main` остановлена (красный полный прогон `main`, #357, `v2/mainline.py`), а это не
+  тикет «`main` красный», — ожидание: не возврат, не перезапуск и не остановка (тикет на починку
+  уже заведён); зелёный `main` — разбор заново;
 - упали только тесты, которые падают и на последнем законченном прогоне `main` того же
-  workflow, — «`main` красный»: остановка (ожидание придёт с #357);
+  workflow, а линия идёт (`main` другого workflow или ночь ещё не прошла), — «`main` красный»:
+  остановка с отчётом владельцу; прогон старше последнего полного прогона `main`
+  (`canon-mainline`, #430: ночь и ручной прогон, проектный CI под его вызовом) им вытеснен и
+  не читается — иначе последняя ночь `CI` до переноса судила бы PR вечно; тикет «`main` красный» эту
+  сверку не проходит — он эти тесты и чинит;
 - упало вне диффа ветки, а ветка отстала от `main`, — догон основы на сервере (`v2/catchup.py`,
   #348), затем полный CI на новом head;
 - иначе — один перезапуск упавших задач на том же коммите (`gh run rerun --failed`), не возврат:
@@ -43,6 +50,7 @@ REPORT_LIMIT = 50 * 2**20  # файл отчёта больше — не чит�
 GH_TIMEOUT = 300
 RERUN_WAIT = 1800  # перезапуск не дал нового итога за полчаса — красный, как после перезапуска
 SHOWN = 20  # имён тестов в комментарии и задании — не больше
+MISSING = "could not find any workflows"  # `gh run list --workflow` без такого workflow
 
 
 def failed_tests(folder: Path) -> dict[str, str]:
@@ -62,6 +70,11 @@ def failed_tests(folder: Path) -> dict[str, str]:
                 classname, name = case.get("classname", ""), case.get("name", "")
                 found[f"{classname}.{name}" if classname else name] = classname or name
     return found
+
+
+def missing(exc: Exception) -> bool:
+    """Сбой `gh` — workflow с таким именем в репозитории нет (не прогонов, а самого файла)."""
+    return MISSING in str(exc)
 
 
 def fetch(core, repo: str, run_id: str, folder: str) -> None:
@@ -118,21 +131,28 @@ class Cause:
                 return {}
             return failed_tests(Path(tmp))
 
-    def main_failed(self, workflows: set[str]) -> tuple[set[str], list[str]]:
+    def main_failed(self, workflows: set[str], full: str) -> tuple[set[str], list[str]]:
         """Тесты, упавшие на последнем законченном прогоне `main` каждого workflow, и сами
-        прогоны (id и коммит)."""
-        failed, seen = set(), []
-        for name in sorted(workflows):
+        прогоны (id и коммит). Прогон старше последнего полного прогона `main` (workflow `full`;
+        его в репозитории нет — без него) вытеснен им."""
+        latest = {}
+        for name in sorted(workflows | {full}):
             args = ("--branch", "main", "--workflow", name, "--status", "completed")
             try:
                 out = self.gh(
-                    "run", "list", *args, "--limit", "1", "--json", "databaseId,headSha,conclusion"
-                )
-                found = json.loads(out) if out else []
+                    "run", "list", *args, "--limit", "1",
+                    "--json", "databaseId,headSha,conclusion,createdAt",
+                )  # fmt: skip
+                latest[name] = json.loads(out) if out else []
             except (self.core.Failure, ValueError) as exc:
-                self.say(f"прогоны `main` workflow {name} не прочитаны: {exc}")
-                continue
+                if not (name == full and missing(exc)):
+                    self.say(f"прогоны `main` workflow {name} не прочитаны: {exc}")
+        since = max((r.get("createdAt") or "" for r in latest.get(full) or []), default="")
+        failed, seen = set(), []
+        for name, found in latest.items():
             for item in found or []:
+                if name != full and (item.get("createdAt") or "") < since:
+                    continue  # вытеснен полным прогоном `main`
                 seen.append(f"{item['databaseId']} на {str(item.get('headSha'))[:7]}")
                 if item.get("conclusion") != "success":
                     failed |= set(self.report(str(item["databaseId"])))
@@ -160,6 +180,13 @@ class Cause:
         runs, done = self.runs(pr)
         if not done:
             return  # другие задачи тех же прогонов ещё идут: ждём их итога
+        line = orch.mainline()
+        if why := line.holds(n):  # линия `main` остановлена (#357): ожидание, не возврат
+            if t.get("line_wait") != head:
+                t["line_wait"] = head
+                self.say(f"#{n}: красный CI на {head[:7]} — ожидание, не возврат: {why}")
+            return
+        t.pop("line_wait", None)
         items = [c for c in pr.get("statusCheckRollup") or [] if self.start.is_red(c)]
         rerun = t.get("rerun") or {}
         if rerun.get("head") == head:
@@ -179,7 +206,9 @@ class Cause:
         tests = sorted(places)
         t["red"] = {"head": head, "key": key, "checks": red, "tests": tests, "places": places}
         workflows = {w for w in runs.values() if w}
-        on_main, seen = self.main_failed(workflows) if tests else (set(), [])
+        # Тикет «`main` красный» (#357) чинит эти тесты сам: сверка с `main` — не для него.
+        mine = tests and not line.fixes(n)
+        on_main, seen = self.main_failed(workflows, line.workflow) if mine else (set(), [])
         names = red + ([f"тесты: {listed(tests)}"] if tests else [])
         if tests and set(tests) <= on_main:
             t["red"]["cause"] = "main"

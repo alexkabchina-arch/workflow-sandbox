@@ -48,6 +48,10 @@ TEST, FIRST = "test", "first"
 KINDS = {"тест неверный": TEST, "впервые задел": FIRST}
 LINE = re.compile(rf"^\s*(\d+)\s*[.)]?\s*[—–-]+\s*({'|'.join(KINDS)})\s*:\s*(\S.*)$", re.I | re.M)
 FIXED = "исправлено"
+PROFILE = "docs/agents/profile.md"
+# Блок инструмента проверки профиля и его ключи-пути — как у `review` (`TOOL_BLOCK`, `TOOL_KEYS`).
+TOOL_BLOCK = re.compile(r"^```verify-tool[ \t]*\n(.*?)^```", re.MULTILINE | re.DOTALL)
+TOOL_KEYS = ("tool", "map")
 
 JUDGE_INPUT = """## Спор «{kind}» по находке {k}
 
@@ -288,7 +292,9 @@ class Fixes:
         только в файлах, которые меняет сама ветка (`origin/main...head`): догон основы не
         засчитывает код соседних тикетов; в файле, который меняют и ветка, и `main`, строки
         `main` из догона после `base` — тоже нет (сравнение с тем, что дало бы слияние `base` и
-        `origin/main` без правок ветки, как у условия допуска 3, #348). Не прочитано — None."""
+        `origin/main` без правок ветки, как у условия допуска 3, #348). Пути блока ```verify-tool
+        профиля на `base` — код, как у короткого ревью `review --base` (#417). Не прочитано —
+        None."""
         o = self.orch
         start = self.merged_base(base, head)
         res = o.git("diff", "--numstat", "-z", "--no-renames", start, head)
@@ -296,6 +302,7 @@ class Fixes:
         if res.returncode != 0 or own.returncode != 0:
             return None
         mine = set(own.stdout.split("\0"))
+        tool = None  # пути инструмента — только когда есть документ по простому правилу
         total = 0
         for row in res.stdout.split("\0"):
             parts = row.split("\t")
@@ -307,11 +314,37 @@ class Fixes:
             if folder and (path == folder or path.startswith(folder.rstrip("/") + "/")):
                 continue
             if self.t.is_docs(path):
-                continue
+                if tool is None and (tool := self.tool_paths(base)) is None:
+                    return None
+                if self.t.is_docs(path, tool):
+                    continue
             total += (int(added) if added.isdigit() else 1) + (
                 int(deleted) if deleted.isdigit() else 0
             )
         return total
+
+    def tool_paths(self, rev: str) -> tuple[str, ...] | None:
+        """Пути `tool` и `map` блока ```verify-tool профиля на `rev` своего клона (основа диффа)
+        — для `is_docs`, как `review.tool_paths`: под ними код (#417). Нет профиля или блока —
+        пусто; сбой git — None, а не «документы»."""
+        o = self.orch
+        listed = o.git("ls-tree", "--name-only", rev, "--", PROFILE)
+        if listed.returncode != 0:
+            return None
+        if not listed.stdout.strip():
+            return ()
+        shown = o.git("show", f"{rev}:{PROFILE}")
+        if shown.returncode != 0:
+            return None
+        found = TOOL_BLOCK.search(shown.stdout)
+        if found is None:
+            return ()
+        paths = []
+        for line in found.group(1).splitlines():
+            key, _, value = line.strip().partition(" ")
+            if key in TOOL_KEYS and value.strip():
+                paths.append(value.strip())
+        return tuple(paths)
 
     def merged_base(self, base: str, head: str) -> str:
         """Начало сравнения правок ветки после `base`: догон основы после него — дерево слияния

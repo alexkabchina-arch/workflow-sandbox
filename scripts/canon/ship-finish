@@ -29,8 +29,10 @@
    Sandboxes, `scripts/vm-test run --commit <коммит> -- <файлы>` (#376), а где запускателя нет —
    каждый своей командой `python3 -m unittest`. Хоть одно красное — отказ (код 3) со списком:
    имя, код выхода и лог (у прогона в машине — и итог `run.py` с упавшими файлами); ничего не
-   отправлено, отметки нет. Машина занята другим прогоном — ворота ждут её до 30 минут. Набора в
-   машине не было (нет `sbx` или образа, занята дольше, сбой машины) и остальное зелёное — отказ
+   отправлено, отметки нет. Машина занята — `vm-test --wait` ждёт в её очереди (#382) и
+   печатает место и примерное ожидание в лог ворот; предел — 30 минут без движения очереди
+   (`CANON_VM_BUSY_WAIT`), всего — 40 минут. Набора в машине не было (нет `sbx` или образа,
+   очередь стояла, сбой машины) и остальное зелёное — отказ
    с кодом 1 и выходом: повторить или прогон на Mac, `CANON_TESTS_ON_MAC=1` перед той же
    командой.
    Зелёный коммит запоминается (`canon-gates-green` в каталоге git) — повтор ворот не гоняет.
@@ -103,7 +105,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import types
 from pathlib import Path
 
@@ -126,11 +127,12 @@ VM_TEST = Path("scripts/vm-test")  # запускатель машины тес�
 VM_NO_RUN = {
     2: "машины нет (`sbx` или образ) — `scripts/vm-test image` или прогон на Mac: "
     "`CANON_TESTS_ON_MAC=1` перед той же командой",
-    3: "машина тестов занята другим прогоном дольше 30 минут — повторить позже",
+    3: "машина тестов занята: очередь к ней не двигалась 30 минут или ждали дольше 40 — "
+    "повторить позже",
     4: "сбой машины тестов — повторить; не проходит — прогон на Mac: `CANON_TESTS_ON_MAC=1`",
     130: "прогон в машине прерван — повторить",
 }
-VM_BUSY, VM_BUSY_POLL, VM_BUSY_WAIT = 3, 30, 1800  # код «занято», опрос и предел ожидания, с
+VM_BUSY_WAIT = 1800  # предел ожидания машины без движения её очереди, с (#382)
 CONTEXT = "review"
 TARGET = "origin/main"
 LABEL = "ready-for-human"
@@ -296,7 +298,8 @@ def affected_tests(root: Path, sha: str) -> list[str]:
 
 
 def vm_busy_wait() -> float:
-    """Сколько ждать занятую машину тестов: `CANON_VM_BUSY_WAIT` секунд (тесты), иначе 30 мин."""
+    """Сколько ждать очередь машины тестов без её движения: `CANON_VM_BUSY_WAIT` секунд
+    (тесты), иначе 30 мин."""
     try:
         return float(os.environ.get("CANON_VM_BUSY_WAIT", VM_BUSY_WAIT))
     except ValueError:
@@ -342,7 +345,11 @@ def check_gates(sha: str) -> None:
         if tests and (tree / VM_TEST).is_file():
             # Затронутые тесты — одним прогоном в машине (#376), а не по файлу на Mac.
             vm = f"тесты в машине ({len(tests)})"
-            gates.append((vm, [sys.executable, str(VM_TEST), "run", "--commit", sha, "--", *tests]))
+            # Машина занята — `vm-test` ждёт в её очереди сам и печатает место (#382).
+            queue = ["--wait", f"{vm_busy_wait():g}"]
+            gates.append(
+                (vm, [sys.executable, str(VM_TEST), "run", "--commit", sha, *queue, "--", *tests])
+            )
         else:
             gates += [(test, [sys.executable, "-m", "unittest", test]) for test in tests]
         for name, argv in gates:
@@ -350,15 +357,7 @@ def check_gates(sha: str) -> None:
             label = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "gate"
             label = "vm-test" if name == vm else label
             cmd = [sys.executable, str(HERE / "run-log"), "-n", "0", "-l", label, "--", *argv]
-            waited, limit = 0.0, vm_busy_wait()
-            while True:
-                res = subprocess.run(cmd, cwd=tree, capture_output=True, text=True, check=False)
-                # Машина занята другим прогоном (сессия, суточный, выпуск) — ждём, а не стоп.
-                if name != vm or res.returncode != VM_BUSY or waited >= limit:
-                    break
-                print("ship-finish: машина тестов занята — жду", flush=True)
-                time.sleep(min(VM_BUSY_POLL, limit))
-                waited += min(VM_BUSY_POLL, limit)
+            res = subprocess.run(cmd, cwd=tree, capture_output=True, text=True, check=False)
             if res.returncode != 0:
                 log = next(reversed(RUN_LOG_END.findall(res.stdout)), None)
                 failed.append(f"{name} (код {res.returncode}" + (f", лог {log})" if log else ")"))

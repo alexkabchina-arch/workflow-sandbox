@@ -37,6 +37,7 @@
       "Edit(/**/.claude/skills/triage/**)",
       "Edit(/**/.claude/skills/wayfinder/**)",
       "Edit(/**/.claude/skills/writing-for-agents/**)",
+      "Edit(/**/.github/workflows/canon-mainline.yml)",
       "Edit(/**/.github/workflows/dependabot-review.yml)",
       "Edit(/**/.github/workflows/review-guard.yml)",
       "Edit(/**/.github/workflows/review-guard-rerun.yml)",

@@ -1111,8 +1111,19 @@ class Route:
         if not self.core.git_ok("cat-file", "-e", f"{sha}^{{commit}}"):
             return False
         files = self.core.git("diff", "--name-only", "--no-renames", sha, "HEAD").splitlines()
-        is_docs = load_review().is_docs
-        return all(is_docs(f) for f in files)
+        review = load_review()
+        if not all(review.is_docs(f) for f in files):
+            return False
+        if not files:
+            return True
+        # Пути блока ```verify-tool — код, как у `review` (#417): основы и ветки (блок, который
+        # завела ветка, — тоже); не прочитаны — не документы.
+        try:
+            base = self.core.git("merge-base", "origin/main", "HEAD").strip()
+            tool = review.tool_paths(base) + review.tool_paths("HEAD")
+        except (review.UsageError, self.core.Failure):
+            return False
+        return all(review.is_docs(f, tool) for f in files)
 
     # --- /verify ---
 

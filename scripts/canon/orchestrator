@@ -229,6 +229,10 @@ git на него ставятся внутри (`app-token shims`); `sbx` ид�
 (роль `parcel`), затем остановка с рекомендацией; `agent:go` после неё — ещё один круг этого
 вида; сбой роли сессии — повтор по виду (предел, сеть, инструмент, неизвестное), после двух —
 остановка с кодом.
+Линия `main` пути v2 (#357, `v2/mainline.py`): красный полный прогон `main` (ночной или ручной) —
+авто-мёрж снят с готовых PR, отметок нет, красный CI соседних PR — ожидание; тикет «`main`
+красный» заводит оркестратор, он идёт первым сверх числа мест; после его слияния — ручной полный
+прогон, зелёный — линия идёт.
 Код выхода 0 — такт прошёл; 1 — сбой (`gh`, git, App, состояние); 2 — ошибка запуска.
 Как устроено — `docs/orchestrator.md` канона.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
@@ -570,6 +574,7 @@ v2_dependabot = load("canon_v2_dependabot_orchestrator", "v2/dependabot.py")  # 
 v2_criteria = load("canon_v2_criteria_orchestrator", "v2/criteria.py")  # исходы /verify (#351)
 v2_evidence = load("canon_v2_evidence_orchestrator", "v2/evidence.py")  # доказательства (#352)
 v2_upkeep = load("canon_v2_upkeep_orchestrator", "v2/upkeep.py")  # обслуживание инструмента (#353)
+v2_mainline = load("canon_v2_mainline_orchestrator", "v2/mainline.py")  # линия `main` (#357)
 is_docs = ship.load_review().is_docs  # строки короткого ревью — без документов, правилом `review`
 claude_run = load("canon_claude_run_orchestrator", "claude_run.py")  # проверка итога `claude -p`
 
@@ -1212,6 +1217,14 @@ class Orchestrator:
             BROWSER_ENV=BROWSER_ENV, REVIEW_LIMIT=REVIEW_LIMIT, REVIEW_TIMEOUT=REVIEW_TIMEOUT,
         )  # fmt: skip
         return v2_upkeep.Upkeep(self, tools)
+
+    def mainline(self):
+        """Остановка линии при красном полном прогоне `main` (`v2/mainline.py`, #357)."""
+        tools = types.SimpleNamespace(
+            core=core, ci=v2_ci, fresh=fresh, say=say, stamp=stamp, READY=READY_FOR_AGENT,
+            QUEUED=QUEUED,
+        )  # fmt: skip
+        return v2_mainline.Mainline(self, tools)
 
     # --- состояние ---
 
@@ -2064,6 +2077,17 @@ class Orchestrator:
                 errors += self.answered()
                 errors += v2_accept.poll(self, self.accept_tools())  # «принято?» (#347)
                 errors += self.prd_queue()
+                # Линия `main` (#357): до шагов мест — отметки и красный CI идут по ней. Опечатка в
+                # переключателе — строкой итога: шаги мест идут (такт упадёт ниже, как раньше).
+                try:
+                    line = self.v2()
+                except Failure as exc:
+                    errors.append(str(exc))
+                    line = None
+                if line:
+                    errors += self.mainline().poll()
+                elif line is False:  # путь выключен — линии нет: никто её не снимет
+                    self.mainline().clear("путь v2 выключен — линия снята")
                 for n in list(self.data["slots"]):
                     if n not in self.data["slots"]:
                         continue
@@ -3403,8 +3427,11 @@ class Orchestrator:
         errors, ahead, told, unchecked = [], [], False, False
         capacity = self.capacity()
         for n in list(self.data["queue"]):
-            if len(self.data["slots"]) >= capacity:
-                break
+            # Тикет «`main` красный» (#357) — место сверх числа мест: остальные ждут его. Мест
+            # нет вовсе (вне окна расписания) — ждёт и он.
+            first = capacity > 0 and v2_mainline.first(self.data, n)
+            if len(self.data["slots"]) >= capacity and not first:
+                continue
             if n not in self.data["queue"]:
                 continue
             if str(n) not in self.data["tickets"]:
@@ -3459,7 +3486,9 @@ class Orchestrator:
         (бриф — на момент старта) не пересекаются с владениями занятых мест, тикетов, ждущих
         ответа владельца, и ждущих впереди в очереди (`ahead`); тикет без строк по образцу идёт
         один. Бриф читается и без соседей: владения запоминаются на старте — по ним сверяют
-        следующих."""
+        следующих. Тикет «`main` красный» (#357) — без сверки: остальные ждут его."""
+        if v2_mainline.first(self.data, n):
+            return []
         mine = self.claims_of(n, fresh=True)
         queue = self.data["queue"]
         tracked = [*self.data["slots"], *ahead, *(int(k) for k in self.data["tickets"])]

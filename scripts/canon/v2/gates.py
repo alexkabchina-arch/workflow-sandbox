@@ -14,7 +14,10 @@
    в коммите «только тест»; конфиг сборки тестов (`TEST_CONFIG`) ветка с того коммита не меняла;
 4. `evidence` — на этой версии у оркестратора есть доказательство `/verify` по каждому критерию и
    примеру замысла из снимка тикета и по каждой находке со сценарием `/verify`, итог по ним —
-   PASS (`v2/evidence.py`, #352);
+   PASS (`v2/evidence.py`, #352). PR из `.github/` и документов без `/verify` (решение владельца
+   30.10) — после зелёного полного CI (`proved`): его прогоны на этой версии, а при правке
+   вызываемого `ci.yml` и стоящем `canon-mainline.yml` — ещё зелёный ручной прогон
+   `canon-mainline` на ветке (запускает допуск, раз на версию);
 5. `fresh` — в ветке есть последняя основа. Отставшую ветку шаг CI догоняет на сервере раньше
    допуска (`v2/catchup.py`, #348); отказ — только если основа ушла между догоном и допуском,
    `agent:go` после него — догон на сервере (`catch_up` оркестратора);
@@ -22,9 +25,10 @@
    («ослабление — …»): ослабление, которого тикет не просит, блокирует.
 
 Порядок — шаг CI (`orch.ci` с этим объектом): условия 2, 3, 4, 5, 7 (`admit`) → перевод PR из
-черновика → полный CI → условие 1 (`trusted`) → отметка `review` и авто-мёрж режимом
-`ship-finish --mark`. Красный полный CI — PR снова черновик (`give_back` оркестратора): починка
-без CI, с проверкой в песочнице; полный CI — при следующем переводе. Любой новый коммит — допуск
+черновика → полный CI → условие 4 PR из `.github/` и документов (`proved`) и 1 (`trusted`) →
+отметка `review` и авто-мёрж режимом `ship-finish --mark`. Красный полный CI — PR снова черновик
+(`give_back` оркестратора): починка без CI, с проверкой в песочнице; полный CI — при следующем
+переводе. Любой новый коммит — допуск
 заново (`admitted` — head, прошедший условия), отметка — на новый коммит.
 
 Исключения из авто-мёржа: флаг «миграция» — отметка без авто-мёржа (`ship-finish --mark --hold`)
@@ -45,6 +49,7 @@ PR на пути-ограничители ждёт одобрения CODEOWNERS
 
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -58,6 +63,11 @@ MIGRATION = "миграция"
 # Ответ `gh run download`, когда у прогона нет артефакта отчёта: не сбой, отчёта у него нет.
 NO_REPORT = re.compile(r"no valid artifacts found|no artifact matches", re.I)
 NONE: dict = {}  # итог `report` у прогона без отчёта: пусто, но узнаётся (`is NONE`)
+# Правка вызываемого `ci.yml` при стоящем файле воркфлоу (#430): `workflow_call` проверяет только
+# ручной прогон `canon-mainline` на ветке — прогон PR идёт по `pull_request`.
+CALLED = ".github/workflows/ci.yml"
+MAINLINE = ".github/workflows/canon-mainline.yml"
+MAINLINE_RUN = "canon-mainline"  # имя workflow — как `WORKFLOW` в `v2/mainline.py`
 
 CI, REVIEW, FINDINGS, FRESH, WEAKENING = "ci", "review", "findings", "fresh", "weakening"
 EVIDENCE = "evidence"
@@ -90,7 +100,8 @@ GO = {
     "test_changed": RESTORE_GO,
     "config_changed": RESTORE_GO,
     "unproved": "оркестратор заново забирает доказательства `/verify` из сессии тикета, затем "
-    "допуск заново; их нет и там — отказ повторится",
+    "допуск заново; их нет и там — отказ повторится (PR из `.github/` и документов — снова "
+    "полный CI и ручной прогон `canon-mainline`)",
     "stale": "догон основы на сервере (конфликт — свежая сессия с заданием догона), затем "
     "полный CI и допуск заново",
     "weakening": "снова допуск — отказ повторится, пока ослабление не решено: `agent:go` его не "
@@ -112,8 +123,9 @@ ADVICE = {
     "config_changed": RESTORE_ADVICE,
     "unproved": "посмотрите, каких пунктов не хватает. Сбой чтения ответа `/verify` — `agent:go`; "
     "пункт `/verify` не проверял (сессия сочла `/verify` ненужным, находка ревью не попала в "
-    "пункты) — `agent:retry`. **Риск:** слить без доказательства нельзя — критерий был бы "
-    "принят на слово.",
+    "пункты) — `agent:retry`. PR из `.github/` и документов: ручной прогон `canon-mainline` не "
+    "дождался или сбой запуска — `agent:go`; красный — откройте прогон: сломан `ci.yml` ветки — "
+    "`agent:retry`. **Риск:** слить без доказательства нельзя — критерий был бы принят на слово.",
     "stale": "`agent:go`: оркестратор догонит основу на сервере. **Риск:** конфликт с новой "
     "основой — задание свежей сессии; не сведёт — снова остановка.",
     "weakening": "прочитайте ослабление в карточке PR. Тикет его не просит — `agent:retry` или "
@@ -209,6 +221,9 @@ class Gates:
         if refused.get("head") == head and refused.get("code") in RESTORE:
             return self.restore(n, t, st, head, refused["code"])
         if refused.get("head") == head and refused.get("code") == "unproved":
+            # PR из `.github/` и документов: ручной прогон — заново, срок ожидания — с нуля.
+            t.pop("dispatched", None)
+            t.pop("trusted_since", None)
             evidence = self.orch.evidence()  # `agent:go`: забрать заново (#352), сводку — тоже
             evidence.keep(n, t, st, head)
             evidence.mark(n, t, head)
@@ -374,6 +389,8 @@ class Gates:
         head = pr["headRefOid"]
         if t.get("admitted") != head and not self.admit(n, t, st, {**pr, "isDraft": True}):
             return False  # новый коммит без допуска — допуск заново
+        if not self.proved(n, t, st, pr):
+            return False
         held = self.fx.held(t)
         if not held:
             return True
@@ -414,14 +431,100 @@ class Gates:
         self.orch.sender().mark(n, t, self.t.card.EVIDENCE, line, key=f"trusted-{head}")
         return True
 
-    def wait(self, n: int, t: dict, st, head: str, why: str) -> bool:
-        """Ожидание условия 1 — до `CI_WAIT`; дольше — отказ с причиной. Итог — False."""
+    def wait(self, n: int, t: dict, st, head: str, why: str, code: str = "untested") -> bool:
+        """Ожидание условия 1 (или 4 на CI) — до `CI_WAIT`; дольше — отказ с причиной. Итог —
+        False."""
         since = t.setdefault("trusted_since", self.t.stamp())
         if self.t.seconds_since(since) > self.t.CI_WAIT:
             t.pop("trusted_since")
-            return self.refuse(n, t, st, head, "untested", f"{why} {self.t.CI_WAIT // 60} мин")
-        self.t.say(f"#{n}: условие допуска 1 ждёт — {why}")
+            return self.refuse(n, t, st, head, code, f"{why} {self.t.CI_WAIT // 60} мин")
+        number = 4 if code == "unproved" else 1
+        self.t.say(f"#{n}: условие допуска {number} ждёт — {why}")
         return False
+
+    # --- условие 4 PR из `.github/` и документов: на зелёном полном CI ---
+
+    def proved(self, n: int, t: dict, st, pr: dict) -> bool:
+        """PR из `.github/` и документов без `/verify` (условие 4 при допуске отложено):
+        доказательство — прогоны полного CI на этой версии, а правка `CALLED` при `MAINLINE` на
+        ней — ещё зелёный ручной прогон на ветке. True — доказано (или не тот случай); False —
+        отказ или ожидание."""
+        head = pr["headRefOid"]
+        ev = self.orch.evidence()
+        if not ev.deferred(t, head):
+            return True
+        runs = self.runs(pr)
+        if not runs:
+            why = f"PR из `.github/`, а прогонов полного CI на `{head[:7]}` нет"
+            return self.refuse(n, t, st, head, "unproved", why)
+        manual = None
+        if self.calls(ev, head):
+            manual = self.manual(n, t, st, head)
+            if not manual:
+                return False
+        t.pop("trusted_since", None)
+        ev.by_ci(n, t, head, runs, manual)
+        self.orch.sender().body(n, t, st, head)  # сводка в теле PR — та же, что в карточке
+        self.t.say(f"#{n}: условие допуска 4 — полный CI на {head[:7]} вместо /verify")
+        return True
+
+    def calls(self, ev, head: str) -> bool:
+        """Дифф правит вызываемый `ci.yml` (не прочитан — считается, что правит), а файл
+        воркфлоу на этой версии стоит."""
+        files = ev.files(head)
+        if files is not None and CALLED not in files:
+            return False
+        return self.orch.git("cat-file", "-e", f"{head}:{MAINLINE}").returncode == 0
+
+    def manual(self, n: int, t: dict, st, head: str) -> str | None:
+        """Зелёный ручной прогон `canon-mainline` на ветке этой версии — его номер; нет — запуск
+        (раз на версию), ожидание до `CI_WAIT` или отказ (красный — `agent:go` запустит заново)."""
+        core, branch = self.t.core, st.branch()
+
+        def gh(*args: str) -> str:
+            return core.gh(*args, "-R", self.orch.repo, timeout=self.t.ci.GH_TIMEOUT)
+
+        try:
+            out = gh(
+                "run", "list", "--workflow", MAINLINE_RUN, "--branch", branch, "--event",
+                "workflow_dispatch", "--limit", "20",
+                "--json", "databaseId,headSha,status,conclusion",
+            )  # fmt: skip
+            listed = json.loads(out) if out.strip() else []
+        except (core.Failure, ValueError) as exc:
+            why = f"ручной прогон `{MAINLINE_RUN}` не прочитан — {str(exc)[:200]}"
+            return self.wait(n, t, st, head, why, "unproved") or None
+        red = t.get("manual_red") or []
+        found = [
+            r
+            for r in listed
+            if isinstance(r, dict)
+            and r.get("headSha") == head
+            and str(r.get("databaseId")) not in red
+        ]
+        if not found:
+            if t.get("dispatched") != head:
+                try:
+                    gh("workflow", "run", MAINLINE_RUN, "--ref", branch)
+                except core.Failure as exc:
+                    why = f"ручной прогон `{MAINLINE_RUN}` на `{branch}` не запущен — {exc}"
+                    return self.refuse(n, t, st, head, "unproved", why) or None
+                t["dispatched"] = head
+                self.t.say(f"#{n}: ручной прогон {MAINLINE_RUN} на {branch} ({head[:7]})")
+            why = f"ручного прогона `{MAINLINE_RUN}` на `{head[:7]}` ещё нет"
+            return self.wait(n, t, st, head, why, "unproved") or None
+        run, number = found[0], str(found[0].get("databaseId"))
+        if run.get("status") != "completed":
+            why = f"ручной прогон `{MAINLINE_RUN}` {number} идёт"
+            return self.wait(n, t, st, head, why, "unproved") or None
+        if run.get("conclusion") != "success":
+            t["manual_red"] = [*red, number]
+            t.pop("dispatched", None)
+            why = (
+                f"ручной прогон `{MAINLINE_RUN}` {number} на `{head[:7]}` — {run.get('conclusion')}"
+            )
+            return self.refuse(n, t, st, head, "unproved", why) or None
+        return number
 
     def runs(self, pr: dict) -> list[str]:
         """Прогоны Actions этого репозитория на PR — без сторожа, точечного прогона и пропущенных

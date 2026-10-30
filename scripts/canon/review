@@ -54,7 +54,10 @@
 пояснение»): false — `canon_review.weakening` пуст, true — текст остаётся (без текста —
 `WEAKENS_UNSAID`); флаг — и в `canon_review.v2.weakens`. Блокирующие берутся из ответа по
 схеме (в оригинале `ReportFindings` доказательств нет), прочие —
-из оригинала без совпавших с блокирующими (файл и строка). В `<отчёт>.md` — вид и доказательство
+из оригинала без повторов блокирующих: блокирующая заменяет находку оригинала, на которую
+ссылается полем `original` (номер, то же место, #390); ссылки нет или она неверна — совпавшие
+по сути (файл и `summary`) или единственная на месте единственной блокирующей (файл и строка).
+В `<отчёт>.md` — вид и доказательство
 каждой находки и правило разбора (отказ от теста — решение «вопрос»), в `canon_review.v2` — вид
 находок по номерам, отказы от теста (строка карточки PR), сценарии `/verify` и вопросы владельцу
 до слияния (флаг брифа из `SERIOUS_FLAGS` и находка без доказательства). Старый путь — прежний.
@@ -174,8 +177,9 @@ SCHEMA = {
             "доступы), правила (CLAUDE.md и его импорты, в том числе .claude/canon/process.md, "
             "AGENTS.md, скиллы, профиль, CODEOWNERS) или "
             "обезличивание данных? Ослабление — снять, отключить, сузить, сделать "
-            "необязательным или обходимым. Нет — пустая строка; да — что именно ослабляется, "
-            "файл и строка, простыми словами",
+            "необязательным или обходимым; в CI (`.github/`) — ещё удалённые шаги или задачи "
+            "тестов, `continue-on-error`, пропуск проверки условием `if:`. Нет — пустая "
+            "строка; да — что именно ослабляется, файл и строка, простыми словами",
         },
     },
     "required": ["findings", "weakening"],
@@ -205,9 +209,16 @@ EVIDENCE = {
         "тикетом» — с цитатой)",
     },
 }
+# Ссылка блокирующей на её находку оригинала (#390): ту же ошибку модель называет в обоих
+# списках своими словами, и по месту повтор не отличить от другой находки на той же строке.
+ORIGINAL = {
+    "type": "integer",
+    "description": "блокирующей: номер этой же находки в списке ReportFindings — с 1, по всем "
+    "принятым вызовам подряд, одинаковые считаются один раз; там её нет — не указывать",
+}
 FINDING_V2 = {
     **FINDING,
-    "properties": {**FINDING["properties"], **EVIDENCE},
+    "properties": {**FINDING["properties"], **EVIDENCE, "original": ORIGINAL},
     "required": [*FINDING["required"], "blocking"],
 }
 # Живой прогон #345: на вопрос weakening модель отвечает «Нет: пояснение» — текст не годится
@@ -236,6 +247,7 @@ RULES_V2 = """Путь v2. Тикет ниже — обязательный вх
   находка — одна проверка; где тестом не выразить (миграции, гонки, экран) — verify: сценарий
   `/verify` на копии прода; не даёшь ни того, ни другого, потому что поведение задано тикетом, —
   no_test с причиной. Без сценария и доказательства находка не блокирует.
+- Блокирующую, которую ты уже отдал ReportFindings, свяжи с ней: original — её номер там.
 - Прочие находки — blocking: false; их тоже перечисли.
 - Стиль не смотри: его держат форматер и линтер.
 - Вопрос weakening — обязательный, как всегда: ослабление есть — опиши его там, просит его
@@ -881,17 +893,33 @@ def spot(item: dict) -> tuple:
     return item["file"].strip(), line if isinstance(line, int) else None
 
 
-def duplicates(items: list[dict], claimed: list[dict]) -> set[int]:
-    """Номера в `items` находок, повторяющих блокирующую: та же суть (файл и `summary`) или
-    единственная находка на месте (файл и строка) единственной там блокирующей. Сомнение — в
-    сторону лишней прочей находки, а не потерянной: две разные на одной строке остаются обе."""
-    found = {
+def linked(items: list[dict], b: dict) -> int | None:
+    """Номер в `items` находки оригинала, на которую блокирующая ссылается полем `original`
+    (с 1); ссылки нет, она вне списка или на находку другого места (файл и строка) — None:
+    ошибка счёта модели не снимает чужую находку."""
+    ref = b.get("original")
+    if type(ref) is not int or not 1 <= ref <= len(items):
+        return None
+    return ref - 1 if spot(items[ref - 1]) == spot(b) else None
+
+
+def duplicates(items: list[dict], claimed: list[dict], by_ref: bool = True) -> set[int]:
+    """Номера в `items` находок, повторяющих блокирующую: та же суть (файл и `summary`); та, на
+    которую она ссылается (`linked`, при `by_ref`; на одну находку ссылаются две — ссылка
+    неверна у обеих); без верной ссылки — единственная находка на месте (файл и строка)
+    единственной там блокирующей. Сомнение — в сторону лишней прочей находки, а не потерянной:
+    две разные на одной строке без ссылки остаются обе."""
+    links = [linked(items, b) if by_ref else None for b in claimed]
+    links = [None if links.count(ref) > 1 else ref for ref in links]
+    found = {ref for ref in links if ref is not None}
+    found |= {
         number
         for number, item in enumerate(items)
         for b in claimed
         if spot(item)[0] == spot(b)[0] and item["summary"].strip() == b["summary"].strip()
     }
-    for b in claimed:
+    unlinked = [b for b, ref in zip(claimed, links) if ref is None]
+    for b in unlinked:
         where = spot(b)
         if where[1] is None or [spot(c) for c in claimed].count(where) != 1:
             continue
@@ -907,9 +935,10 @@ def triage_v2(items: list[dict], answer: dict) -> list[tuple[dict, str]]:
     блокирующих (`duplicates`)."""
     given = answer.get("findings") if isinstance(answer.get("findings"), list) else []
     claimed = [i for i in given if is_finding(i) and i.get("blocking") is True]
-    if items is given:  # пересказ: блокирующие — те же записи списка
+    retold = items is given
+    if retold:  # пересказ: блокирующие — те же записи списка, ссылаться не на что
         items = [i for i in items if not any(i is b for b in claimed)]
-    seen = duplicates(items, claimed)
+    seen = duplicates(items, claimed, by_ref=not retold)
     rest = [(i, "other") for number, i in enumerate(items) if number not in seen]
     ordered = sorted(((i, kind_of(i)) for i in claimed), key=lambda pair: KINDS.index(pair[1]))
     return ordered + rest
