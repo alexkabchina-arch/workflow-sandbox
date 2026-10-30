@@ -38,6 +38,8 @@ version-update:semver-patch`; вида нет — как major. **PR целик�
 
 **Красный CI** — тикет на владельца (`issue create`, раз на head; новый красный head — комментарий
 в том же тикете), авто-мёрж выключен, место свободно; зелёный после починки — PR идёт дальше сам.
+Линия `main` остановлена (#357, `v2/mainline.py`) — красный CI не тикет, а ожидание: причина —
+`main`, его чинит тикет «`main` красный».
 «Нет» владельца — дорожка PR больше не трогает (закрывает его владелец).
 
 Удалить: выключить переключатель, затем этот файл; `dependabot()` и его вызов в `tick`
@@ -272,6 +274,11 @@ class Dependabot:
             return self.release(key)  # встал на этом head: ждём нового коммита Dependabot
         e.pop("parked", None)
         if red := self.t.start.failed_checks(pr):
+            if why := self.orch.mainline().holds(int(key)):  # #357: причина — `main`, не PR
+                if e.get("held_by") != why:
+                    self.t.say(f"PR Dependabot #{key}: красный CI — ожидание: {why}")
+                e["held_by"] = why
+                return self.release(key)
             return self.red(key, e, pr, red)
         if not self.t.ci_green(pr):
             return  # CI идёт (или идёт на новом head после догона)

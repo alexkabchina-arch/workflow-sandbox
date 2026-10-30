@@ -1,0 +1,75 @@
+# Вендорен из канона alexkabchina-arch/workflow (`canon-sync`, `.canon.lock`): руками не править.
+#
+# Полный прогон `main` проекта на пути v2 (#430) — процессная часть CI, проверки проекта он не
+# знает: ночью (`schedule`) и вручную (`workflow_dispatch`, выход из остановки линии, #357) он
+# вызывает проектный `ci.yml` (`on: workflow_call`, контракт CI шаблона профиля). По имени этого
+# workflow оркестратор находит решающий прогон `main` (`v2/mainline.py`, `WORKFLOW`). Ставит и
+# обновляет его `canon-sync` только проекту на пути v2: PR обновления отмечает App выпуском, без
+# ручного PR в проект.
+#
+# Ночь без изменений `main` пропускается, но не дольше 3 суток: задача `night` читает прошлые
+# полные прогоны `main` этого workflow (`schedule` и `workflow_dispatch`; полный — в нём шла хоть
+# одна задача, кроме `night`); последний из них зелёный, на том же коммите и моложе 60 часов —
+# вызов CI пропускается. Вручную она сама пропущена, сбой её чтения — полный прогон.
+#
+# Права токена — потолок для задач проектного `ci.yml`: вызванная задача не получит больше, чем
+# дал вызов `ci`, а лишнее право её задачи — сбой старта прогона. Потолок — права, которые
+# контракт CI профиля разрешает задачам проекта; сами задачи берут только объявленные своим блоком
+# `permissions` (контракт), как на PR. Нужно сверх потолка — тикет в канон.
+# `concurrency` здесь нет: группа `ci.yml` под вызовом — `canon-mainline-<коммит>`, своя у
+# каждого коммита, и та же группа у вызова заперла бы вызванный прогон.
+
+name: canon-mainline
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  night:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      skip: ${{ steps.last.outputs.skip }}
+    steps:
+      - name: Пропуск ночи без изменений main
+        id: last
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          since=$(date -u -d '60 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          ids=$(gh run list --workflow "$WORKFLOW" --branch main --status completed --limit 30 \
+            --json databaseId,event \
+            --jq '.[] | select(.event == "schedule" or .event == "workflow_dispatch") | .databaseId')
+          skip=false
+          for id in $ids; do
+            run=$(gh run view "$id" --json conclusion,headSha,createdAt,jobs)
+            full=$(jq '[.jobs[] | select(.name != "night" and .conclusion != "skipped")] | length > 0' <<<"$run")
+            [ "$full" = true ] || continue
+            skip=$(jq --arg sha "$GITHUB_SHA" --arg since "$since" \
+              '.conclusion == "success" and .headSha == $sha and .createdAt > $since' <<<"$run")
+            break
+          done
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: night
+    if: ${{ !cancelled() && needs.night.outputs.skip != 'true' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      packages: read
+      actions: read
+      checks: write
+      id-token: write
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
