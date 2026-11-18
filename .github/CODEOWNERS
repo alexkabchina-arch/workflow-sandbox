@@ -28,8 +28,8 @@ CLAUDE.md                       @alexkabchina-arch
 CLAUDE.local.md                 @alexkabchina-arch
 AGENTS.md                       @alexkabchina-arch
 
-# Обязательный раздел `CLAUDE.md` — файл канона, подключённый импортом (#144): правило агенту,
-# как сам `CLAUDE.md`, хоть его содержимое и сверяет `.canon.lock`.
+# Эталон части воркфлоу в `AGENTS.md` (между метками `canon:process`): с ним её сверяет
+# `.canon.lock`; правило агенту, как сам `AGENTS.md`.
 /.claude/canon/                 @alexkabchina-arch
 
 # Инструмент проверки и карта функций для `/verify` пути v2 (спека воркфлоу #329, #351).

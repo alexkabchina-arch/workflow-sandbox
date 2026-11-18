@@ -6,7 +6,9 @@
 и GitHub на момент запроса (`gh pr view`): состояние PR и итог CI — живые, не из файла; красный
 сторож `review-guard` — не красный CI: «перезапуск сторожа», «сторож: нужен агент» (перезапуск
 не поможет: исчерпаны или прогон не от сторожа канона) или «нет отметки». Слитый тикет
-показывается один раз (`MERGED`), дальше скрыт без запросов к GitHub — в конце их число.
+показывается один раз (`MERGED`), дальше скрыт без запросов к GitHub — в конце их число. Промахи
+отбора задетых тестов (`canon-tests/misses.jsonl`, пишет `ticket wait`, #464) — строкой под
+таблицей: сколько и последний.
 Таблица — в чат владельцу как есть; копии на GitHub нет (спека #111, этап B).
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
 Только стандартная библиотека Python 3.
@@ -14,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import types
 from pathlib import Path
 
@@ -24,6 +27,7 @@ REVIEW = "review"  # отметка ревью — статус на head
 RERUN = "перезапуск сторожа"
 STUCK = "сторож: нужен агент"  # перезапуск сторожа не поможет (#204, п. 5)
 NEEDS_AGENT = ("красный", "нет отметки", STUCK)
+MISSES = "canon-tests/misses.jsonl"  # промахи отбора задетых тестов (#464)
 HEADER = ("Тикет", "Шаг", "Ждём", "PR", "Состояние PR", "CI", "Расход", "На шаге")
 
 
@@ -142,6 +146,37 @@ def table(core, header: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
         core.say("| " + " | ".join(line) + " |")
 
 
+def misses_line(core) -> str | None:
+    """Сводка промахов отбора задетых тестов: число и последний (тикет, тесты, файлы)."""
+    try:
+        lines = (core.common_dir() / MISSES).read_text(encoding="utf-8").splitlines()
+    except (OSError, core.Failure):
+        return None
+    records = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            records.append(item)
+    if not records:
+        return None
+    last = records[-1]
+    return (
+        f"\nПромахи отбора задетых тестов: {len(records)}; последний — тикет "
+        f"#{last.get('ticket')}: {shown(last.get('tests'))} при правке {shown(last.get('files'))} "
+        "(отбор — блок ```affected-tests профиля)."
+    )
+
+
+def shown(items, limit: int = 5) -> str:
+    """Имена через запятую, не больше `limit`; остальные — числом."""
+    items = [str(x) for x in items] if isinstance(items, list) else []
+    more = len(items) - limit
+    return ", ".join(items[:limit]) + (f" и ещё {more}" if more > 0 else "")
+
+
 def main(argv: list[str], core) -> int:
     if argv:
         print("ticket status: аргументов нет", flush=True)
@@ -163,4 +198,6 @@ def main(argv: list[str], core) -> int:
     table(core, HEADER, rows)
     if hidden:
         core.say(f"\nСлитых тикетов не показано: {hidden}.")
+    if line := misses_line(core):
+        core.say(line)
     return 0

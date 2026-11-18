@@ -3,7 +3,8 @@
 Журнал — `events.jsonl` в каталоге состояния оркестратора (`.git/canon-orchestrator/` главного
 чекаута): вне песочницы (она видит только свой клон и канон чтением) и вне ветки. Пишет его
 оркестратор, когда запуск роли кончился, — только у тикета пути v2; у старого пути записи нет.
-Отчётов по журналу пока нет: данные копятся для пределов ролей и сравнения попыток.
+По журналу — условие 8 допуска (пределы ролей, `v2/limits.py`) и метрики тикета при слиянии
+(`v2/metrics.py`, #356).
 
 Событие — объект JSON в строке:
 
@@ -13,6 +14,7 @@
   `claude`, а без него — по часам оркестратора; не измерена (осиротевшая сессия) — `null`;
 - `tokens` — `input`, `output`, `cache_read`, `cache_write`: сумма по моделям `modelUsage`
   итога (с субагентами), без токенов в ней — `usage`; итога нет — `null` (неизвестно, а не ноль);
+- `turns` — ходы: `num_turns` итога (#356); итога или поля нет — `null`;
 - `usd`, `estimated` — расход: факт итога или оценка худшим случаем (`--max-budget-usd`), когда
   итога нет;
 - у возобновлённой сессии `modelUsage` и `total_cost_usd` итога `claude -p --resume` накоплены
@@ -79,6 +81,11 @@ def seconds(result: dict | None, measured: float | None) -> float | None:
     return None if measured is None else round(max(measured, 0), 3)
 
 
+def turns(result: dict | None) -> int | None:
+    value = result.get("num_turns") if isinstance(result, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def usd(result: dict | None) -> float | None:
     cost = result.get("total_cost_usd") if isinstance(result, dict) else None
     return cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
@@ -105,7 +112,29 @@ def event(roles, n: int, role: str, result: dict | None, measured: float | None,
     model, effort = roles.ROLES[role]
     head = {"ticket": n, "role": role, "model": model, "effort": effort}
     used = fields.pop("tokens") if "tokens" in fields else tokens(result)
+    fields.setdefault("turns", turns(result))
     return {**head, **fields, "seconds": seconds(result, measured), "tokens": used}
+
+
+def read(directory: Path, n: int, since: str | None = None) -> list[dict]:
+    """События тикета `n` из журнала в `directory`, записанные не раньше `since` (ISO 8601, как
+    `at`); испорченная строка — пропуск. Журнала нет — пусто."""
+    try:
+        lines = (directory / EVENTS).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    found = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("ticket") != n:
+            continue
+        if since and str(record.get("at") or "") < since:
+            continue
+        found.append(record)
+    return found
 
 
 def write(directory: Path, record: dict) -> None:

@@ -4,10 +4,9 @@
 
 Дочерний процесс — без меток сессии тикета (иначе Stop-хук `stop-check` держал бы его) и с
 переменными вызывающего поверх окружения (`env`: у `review` — `CLAUDE_CODE_REPORT_FINDINGS=1`), на
-закреплённой модели, с аргументами списком (без оболочки) и пустым stdin. Путь v2 (#333,
-`CANON_V2=1` в окружении — его ставит оркестратор): модель и усилие роли вызывающего скрипта из
-таблицы `v2/roles.py`; иначе — `MODEL` и усилие по умолчанию, как у старого пути. Окружением
-выбирается только «таблица или нет»: ни модель, ни усилие им не задать, и признак дочернему
+закреплённой модели, с аргументами списком (без оболочки) и пустым stdin. Модель и усилие — роль
+вызывающего скрипта из таблицы `v2/roles.py`, одной для пути `/start` и пути v2 (#469: `review` —
+xhigh, `/verify` — medium); окружением их не задать, признак пути v2 (`CANON_V2`) дочернему
 `claude` не передаётся. Итог — всегда по
 схеме (`--json-schema`): ответ — в поле `structured_output`, `.md` пишет вызывающий (из него или,
 как `review`, из событий потока).
@@ -45,7 +44,7 @@ from pathlib import Path
 
 
 def load_roles():
-    """Таблица ролей пути v2 (`v2/roles.py` рядом) как модуль — без `sys.path` и `__pycache__`."""
+    """Таблица ролей (`v2/roles.py` рядом, одна для `/start` и v2) как модуль — без `sys.path`."""
     path = Path(__file__).resolve().parent / "v2/roles.py"
     module = types.ModuleType("canon_v2_roles")
     module.__file__ = str(path)
@@ -54,9 +53,9 @@ def load_roles():
 
 
 roles = load_roles()
-MODEL = "claude-opus-5-5"
+MODEL = roles.ROLES["review"][0]  # модель ревью — для строк итога и сверки `modelUsage`
 # Признак пути v2 — не дальше вызывающего скрипта: дочерний `claude` и его команды его не видят.
-SESSION_VARS = {"CANON_SESSION", "CANON_ENFORCE_STOP", roles.V2_ENV}
+SESSION_VARS = {"CANON_SESSION", "CANON_ENFORCE_STOP", "CANON_SESSION_MARK", roles.V2_ENV}
 DEFAULT_BASE = "origin/main"
 # Ревью Opus xhigh в разведке workflow#2 стоили 0,82–3,67 USD (в среднем 1,89); уточнить на пилоте.
 DEFAULT_BUDGET_USD = "10"
@@ -107,15 +106,13 @@ def parser(prog: str, description: str) -> argparse.ArgumentParser:
     return result
 
 
-def role(name: str | None = None) -> tuple[str, str | None]:
-    """Модель и усилие дочернего `claude -p`. Путь v2 (`CANON_V2=1`) — роль `name` (по умолчанию
-    имя вызывающего скрипта: `review`, `verify`) из таблицы `v2/roles.py`; роли нет —
-    `UsageError` до запуска. Иначе — `MODEL` без усилия."""
-    if os.environ.get(roles.V2_ENV) != "1":
-        return MODEL, None
+def role(name: str | None = None) -> tuple[str, str]:
+    """Модель и усилие дочернего `claude -p` — роль `name` (по умолчанию имя вызывающего
+    скрипта: `review`, `verify`) из таблицы `v2/roles.py`, на пути `/start` и на пути v2 одна
+    (#469); роли нет — `UsageError` до запуска."""
     name = name or Path(sys.argv[0]).name
     if name not in roles.ROLES:
-        raise UsageError(f"путь v2: роли {name!r} нет в v2/roles.py")
+        raise UsageError(f"роли {name!r} нет в v2/roles.py")
     return roles.ROLES[name]
 
 
@@ -175,7 +172,7 @@ def run_claude(
     events: list | None = None,
     env: dict | None = None,
 ) -> dict:
-    """Запускает `claude -p --model MODEL [--effort …] --max-budget-usd <budget> --output-format
+    """Запускает `claude -p --model MODEL --effort … --max-budget-usd <budget> --output-format
     json --json-schema <schema> --disallowedTools=Agent,Workflow,Monitor <args>` (модель и усилие —
     `role()`).
 
@@ -197,7 +194,8 @@ def run_claude(
         "-p",
         "--model",
         model,
-        *(["--effort", effort] if effort else []),
+        "--effort",
+        effort,
         "--max-budget-usd",
         budget,
         "--output-format",

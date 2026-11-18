@@ -37,9 +37,7 @@ husky, иначе `hooks/` общего каталога git, например p
 
 from __future__ import annotations
 
-import fnmatch
 import os
-import re
 import shlex
 import signal
 import subprocess
@@ -53,7 +51,6 @@ PROFILE = Path("docs/agents/profile.md")
 HOOK_ENV = "CANON_CHECKS_HOOK"  # «1» — `session-run` ставит хук в worktree сессии
 HOOKS_DIR = "canon-hooks"  # переходник — в личном каталоге git worktree
 FORMAT, SECRETS = "format", "secrets"
-FILES = re.compile(r"^\{files(?::([^}]*))?\}$")
 TIMEOUT = 600
 TAIL = 20  # строк вывода красной проверки в причине
 # Виды хуков на стороне клиента (`git help hooks`): переходник передаёт каждый прежнему хуку.
@@ -170,24 +167,9 @@ def relay(name: str, args: list[str], worktree: Path) -> int:
 
 
 def expand(command: list[str], files: list[str]) -> list[str] | None:
-    """`{files}` и `{files:шаблоны}` — файлы коммита; подходящих нет — None (пропуск)."""
-    out = []
-    for arg in command:
-        m = FILES.match(arg)
-        if not m:
-            out.append(arg)
-            continue
-        patterns = [p.strip() for p in (m[1] or "").split(",") if p.strip()]
-        chosen = [
-            f
-            for f in files
-            if not patterns
-            or any(fnmatch.fnmatch(f, p) or fnmatch.fnmatch(Path(f).name, p) for p in patterns)
-        ]
-        if not chosen:
-            return None
-        out += chosen
-    return out
+    """`{files}` и `{files:шаблоны}` — файлы коммита; подходящих нет — None (пропуск). Разбор —
+    один на маршрут и путь v2: `ticket_core.expand_files` (#464)."""
+    return core().expand_files(command, files)
 
 
 def run(command: list[str], worktree: Path) -> tuple[int, str]:

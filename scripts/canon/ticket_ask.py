@@ -4,13 +4,15 @@
 
 Из worktree тикета. Режим `/start`: владелец может отойти, вопросы копятся в тикете.
 
-- Вопроса в ожидании нет — вопрос (аргумент или `.ticket/ask.md`) уходит комментарием в тикет,
-  тикету — метка `ready-for-human`; в чат сессия пишет тот же вопрос полным текстом со ссылкой
-  на комментарий. Статус «остановка»: ждём владельца.
+- Вопроса в ожидании нет — вопрос (аргумент или `.ticket/ask.md`) уходит комментарием в тикет
+  (пароли и токены — маской `ticket_core.mask`, как в отчёте об остановке, #446), тикету — метка
+  `ready-for-human`, метка триажа `ready-for-agent` снимается (#500); в чат сессия пишет тот же
+  вопрос полным текстом со ссылкой на комментарий. Статус «остановка»: ждём владельца.
 - Вопрос ждёт ответа — ответ ищется в тикете: комментарии после вопроса, кроме комментариев
   самого маршрута и отчётов об остановке. Владелец ответил в чате — сессия кладёт ответ дословно
   в `.ticket/reply.md`, скрипт дублирует его в тикет. Ответа нет — снова «остановка»; есть —
-  метка снимается, ответ и следующий шаг печатаются заданием. Вопрос по находке на шаге разбора
+  метка снимается (`ready-for-agent` не возвращается: продолжению она не нужна), ответ и
+  следующий шаг печатаются заданием. Вопрос по находке на шаге разбора
   `ticket ship` — ответ записывается в `.ticket/answer.md`, как его ждёт `ticket ship`.
 
 Под оркестратором (`CANON_ORCHESTRATOR=1`, #214, #218) чата нет: вопрос — тремя разделами
@@ -37,6 +39,8 @@ LABEL = "ready-for-human"
 # тоже не ответ (`is_answer`).
 # Разделы вопроса под оркестратором (спека #208): владелец отвечает с телефона, не зная хода сессии.
 SECTIONS = ("Причина", "Сделано", "Доступно")
+# Ответить может и координатор по записанному (#457) — не только владелец.
+ANSWER_HEAD = "Ответ на вопрос (владельца или координатора по записанному):"
 
 
 class NoQuestion(Exception):
@@ -93,11 +97,14 @@ def worktree(core, n: int) -> Path:
 
 
 class Ask:
-    def __init__(self, n: int, core):
+    def __init__(self, n: int, core, root: Path | None = None):
+        """`root` — рабочая копия тикета, если её уже знает вызывающий (`ticket start`: план
+        подготовки, #457); иначе — по ветке или `worktree_of`."""
         self.n, self.core = n, core
         self.cmd = core.command("ask", n)
         self.state = core.State(n)
-        self.root = worktree(core, n)
+        self.root = root or worktree(core, n)
+        self.answer = ""  # ответ, найденный `wait`
         self.dir = core.answers(self.root)
 
     def run(self, text: str | None) -> int:
@@ -114,7 +121,7 @@ class Ask:
         if not text:
             form = core.ORCHESTRATED_ASK if core.orchestrated() else ""
             body = (
-                "Вопроса нет. Вопрос владельцу — в `.ticket/ask.md` (инструмент Write): что "
+                "Вопроса нет. Вопрос владельцу запиши в файл `.ticket/ask.md` (Write): что "
                 "неясно, на языке поведения продукта, без имён функций и файлов; варианты и что "
                 f"будет при каждом; рекомендация.{form} Затем вызов:"
             )
@@ -123,7 +130,7 @@ class Ask:
             body = (
                 f"Вопрос не отправлен: под оркестратором нет разделов {', '.join(missing)}."
                 f"{core.ORCHESTRATED_ASK} Каждый раздел — с начала строки (`**Причина:** …`). "
-                "Перепиши `.ticket/ask.md` (инструмент Write), затем вызов:"
+                "Перепиши файл `.ticket/ask.md` (Write), затем вызов:"
             )
             return (core.TURN, "Вопрос владельцу", body, (self.cmd,))
         stamp = core.now()
@@ -148,12 +155,14 @@ class Ask:
                 "Ответ — комментарием в этом тикете (можно с телефона) или в чате сессии; затем в "
                 "чате сессии: «продолжай»."
             )
+        # Пароли и токены — маской (#446): секрет в комментарии остался бы в истории правок.
         comment = (
-            f"{core.ASK_MARK.format(stamp=stamp)}\n**Вопрос сессии тикета #{n}**\n\n{text}\n\n---\n"
-            + footer
+            f"{core.ASK_MARK.format(stamp=stamp)}\n**Вопрос сессии тикета #{n}**\n\n"
+            f"{core.mask(text)}\n\n---\n" + footer
         )
         # Метка — до комментария: сбой между ними повторный вызов исправит без второго вопроса.
         core.gh("issue", "edit", str(n), "--add-label", LABEL)
+        note = core.untriage(n)
         posted = core.gh("issue", "comment", str(n), "--body", comment)
         url = posted.splitlines()[0] if posted else f"тикет #{n}"  # gh печатает ссылку
         st["question"] = {"stamp": stamp, "url": url, "step": st.step, "text": text}
@@ -161,7 +170,7 @@ class Ask:
         core.keep(st, self.dir / "ask.md", f"ask-{stamp}.md")
         # Ответ из чата на прошлый вопрос — не ответ на этот.
         core.keep(st, self.dir / "reply.md", f"reply-stale-{stamp}.md")
-        return self.waiting(f"Вопрос — комментарием в тикете: {url}, метка {LABEL}.")
+        return self.waiting(f"Вопрос — комментарием в тикете: {url}, метка {LABEL}.{note}")
 
     def waiting(self, head: str):
         question = self.state["question"]
@@ -181,14 +190,15 @@ class Ask:
         if self.core.orchestrated():
             body = (
                 f"{head}\nСессия под оркестратором: чата нет, вопрос владелец увидит в тикете. "
-                "Закончи сессию — без `AskUserQuestion`, ничего больше не делая: после ответа "
-                "владельца в тикете оркестратор возобновит её, и тогда — вызов:"
+                "Закончи сессию — не формой выбора (AskUserQuestion), ничего больше не делая: "
+                "после ответа владельца в тикете оркестратор возобновит её, и тогда — вызов:"
             )
             return (self.core.STOPPED, f"Тикет #{self.n}: вопрос владельцу", body, (self.cmd,))
         body = (
-            f"{head}\n{relay}Обычным сообщением, без `AskUserQuestion`: он держит ход, а владельца "
-            "может не быть у экрана. Ждём владельца: он отвечает в чате или в тикете и пишет "
-            "«продолжай». Ответ из чата — дословно в `.ticket/reply.md` (Write). Затем вызов:"
+            f"{head}\n{relay}Обычным сообщением, не формой выбора (AskUserQuestion): она "
+            "держит ход, а владельца может не быть у экрана. Ждём владельца: он отвечает в чате "
+            "или в тикете и пишет «продолжай». Ответ из чата — дословно запиши в файл "
+            "`.ticket/reply.md` (Write). Затем вызов:"
         )
         return (self.core.STOPPED, f"Тикет #{self.n}: вопрос владельцу", body, (self.cmd,))
 
@@ -227,7 +237,7 @@ class Ask:
         if not replies:
             chat = "" if core.orchestrated() else ", `.ticket/reply.md` пуст"  # чата нет (#275)
             return self.waiting(f"Ответа нет: в тикете после вопроса ответа нет{chat}." + held)
-        answer = "\n\n".join(replies)
+        answer = self.answer = "\n\n".join(replies)
         note = ""
         try:
             if not core.v2_task():  # у сессии v2 токен на чтение: метку снял оркестратор (#341)
@@ -237,10 +247,10 @@ class Ask:
         st["question"], st["waiting"] = None, core.AGENT
         st.dir.mkdir(parents=True, exist_ok=True)
         (st.dir / f"answer-{question['stamp']}.md").write_text(answer + "\n", encoding="utf-8")
-        body = f"Ответ владельца:\n\n{core.quote(answer)}\n{note}{held}\n\n{self.next_step(answer)}"
+        body = f"{ANSWER_HEAD}\n\n{core.quote(answer)}\n{note}{held}\n\n{self.next_step(answer)}"
         return (
             core.TURN,
-            f"Тикет #{n}: ответ владельца",
+            f"Тикет #{n}: ответ на вопрос",
             body,
             (core.command("ship", n),),
         )
@@ -252,6 +262,17 @@ class Ask:
                 f"Продолжай по заданию сессии v2 с учётом ответа (правила — `/start {self.n}` "
                 f"или вход сессии); новый вопрос владельцу — снова через `ticket ask {self.n}`. "
                 f"Работа закоммичена — вызов ({core.LONG_CALL}; ревью ошибок идёт 5–8 минут):"
+            )
+        if st.step is None and not core.orchestrated():  # поправки ручного пути — снова (#453)
+            return (
+                f"Продолжай `/implement {self.n}` с учётом ответа и с поправками:\n"
+                f"{core.MANUAL_END.format(n=self.n)}\n- согласование, которое велят скиллы, — "
+                "реши сам по тикету, спеке, ADR и профилю;\n"
+                f"- новый вопрос владельцу — снова через `ticket ask {self.n}`, не формой выбора "
+                "(AskUserQuestion).\n"
+                "Работа закоммичена и самопроверка пройдена — конец работы над тикетом, его "
+                f"задания выполнять до {core.until()}. Вызов ({core.LONG_CALL}; ревью ошибок идёт "
+                "5–8 минут):"
             )
         if st.step is None:
             return (

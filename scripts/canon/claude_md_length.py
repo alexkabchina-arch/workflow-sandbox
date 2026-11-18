@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Мягкое предупреждение о длине `CLAUDE.md` для CI проекта.
+"""Мягкое предупреждение о длине `AGENTS.md` для CI проекта и итога `canon-sync`.
 
 Файл вендорится из канона `alexkabchina-arch/workflow` и лежит под `.canon.lock`: руками не
 править, обновлять через `canon-sync`. Вызывается шагом CI проекта из корня проекта:
 
     python3 scripts/canon/claude_md_length.py
 
-Пишет «`CLAUDE.md` — N строк, ориентир 200» (из корня, только корневой `CLAUDE.md`). Импорт —
-строка `@<путь>` целиком вне блока ```, путь от корня проекта, файл есть — идёт в счёт один раз:
-Claude Code грузит его в контекст вместе с `CLAUDE.md`; тогда «`CLAUDE.md` с импортами — N строк».
-Импорт внутри строки и вложенный не считаются — счёт приблизительный, как и сам ориентир.
-Нет строки `@.claude/canon/process.md` или файла — `::warning`: без них обязательный раздел
-канона «Процесс — канон» молча выпадает из контекста сессии (#144).
-Длиннее ориентира — аннотация GitHub Actions `::warning` (жёлтое предупреждение в PR).
+Имя — прежнее (шаг CI проектов его зовёт), проверяет файл правил `AGENTS.md` (#454): пишет
+«`AGENTS.md` — N строк, ориентир 200» (из корня, только корневой). Часть воркфлоу стоит в нём
+прямо, не импортом, — счёт по одному файлу: `@`-ссылку раскрывает только Claude, другие агенты
+читают файл как есть. Предупреждения — аннотации GitHub Actions `::warning` (жёлтые в PR):
+- длиннее ориентира;
+- больше 32 КБ — предел Codex (`project_doc_max_bytes`): хвост сверх него агент не прочтёт;
+- нет метки части воркфлоу `<!-- canon:process` — обязательный раздел «Процесс — канон» выпал;
+- `CLAUDE.md` — не одна строка `@AGENTS.md`: Claude Code читает `AGENTS.md` только по ней.
 Код выхода всегда 0: длина коммит и мёрж не блокирует.
 """
 
@@ -21,9 +22,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-NAME = "CLAUDE.md"
+NAME = "AGENTS.md"
 TARGET = 200
-CANON_SECTION = ".claude/canon/process.md"
+MAX_BYTES = 32 * 1024
+CANON_BEGIN = "<!-- canon:process"
+POINTER, POINTER_LINE = "CLAUDE.md", "@AGENTS.md"
 
 
 def plural(n: int) -> str:
@@ -39,49 +42,64 @@ def count(data: bytes) -> int:
     return data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
 
 
-def is_file(path: Path) -> bool:
-    try:
-        return path.is_file()
-    except OSError:  # слишком длинное имя, нет доступа — не импорт, шаг не падает
-        return False
+def text_of(path: Path) -> str:
+    """Текст файла без BOM — как его читают `canon-sync` и `check_lock`."""
+    return path.read_bytes().decode(errors="replace").lstrip("﻿")
 
 
-def imports(root: Path, data: bytes) -> list[str]:
-    found, fence = [], False
-    for line in data.decode(errors="replace").split("\n"):
-        line = line.strip()
-        if line.startswith("```"):
-            fence = not fence
-        elif not fence and line.startswith("@") and " " not in line:
-            rel = line[1:]
-            if rel != NAME and rel not in found and is_file(root / rel):
-                found.append(rel)
-    return found
+def check(root: Path) -> tuple[str, list[tuple[str, str]]]:
+    """Строка о длине и предупреждения (заголовок, текст); нет `AGENTS.md` — без предупреждений."""
+    path = root / NAME
+    pointer = root / POINTER
+    if pointer.is_symlink():  # символьная ссылка на `AGENTS.md` — Claude читает его же
+        linked = pointer.resolve() == path.resolve()
+    else:
+        linked = pointer.is_file() and text_of(pointer).strip() == POINTER_LINE
+    if not path.is_file():
+        if linked:  # ссылка на пропавший файл: у сессий нет ни правил процесса, ни проекта
+            return f"{NAME} нет", [
+                (f"Нет {NAME}", f"{POINTER} ссылается на {NAME}, а его нет — правил у сессий нет")
+            ]
+        return f"{NAME} нет — проверять нечего", []
+    data = path.read_bytes()
+    lines = count(data)
+    summary = f"{NAME} — {lines} {plural(lines)}, ориентир {TARGET}"
+    warnings = []
+    if lines > TARGET:
+        warnings.append((f"Длина {NAME}", summary))
+    if len(data) > MAX_BYTES:
+        warnings.append(
+            (
+                f"Размер {NAME}",
+                f"{NAME} — {len(data)} байт, больше 32 КБ: Codex прочтёт только первые 32 КБ",
+            )
+        )
+    text = data.decode(errors="replace")
+    if not any(line.lstrip("﻿").strip().startswith(CANON_BEGIN) for line in text.splitlines()):
+        warnings.append(
+            (
+                "Нет раздела воркфлоу",
+                f"в {NAME} нет части воркфлоу (метки {CANON_BEGIN} …) — обязательный раздел "
+                "«Процесс — канон» не читается; верните её canon-sync той же версии",
+            )
+        )
+    if not linked:
+        warnings.append(
+            (
+                f"{POINTER} не ссылка",
+                f"{POINTER} — не одна строка {POINTER_LINE}: Claude Code читает {NAME} только по "
+                "ней, а правила только для Claude разошлись бы с общими",
+            )
+        )
+    return summary, warnings
 
 
 def report(root: Path) -> str:
-    path = root / NAME
-    if not path.is_file():
-        return f"{NAME} нет — проверять нечего"
-    data = path.read_bytes()
-    extra = imports(root, data)
-    lines = count(data)
-    for rel in extra:
-        try:
-            lines += count((root / rel).read_bytes())
-        except OSError:
-            pass
-    name = f"{NAME} с импортами" if extra else NAME
-    message = f"{name} — {lines} {plural(lines)}, ориентир {TARGET}"
-    if lines > TARGET:
-        message = f"::warning file={NAME},title=Длина {NAME}::{message}"
-    if CANON_SECTION not in extra:
-        section = (
-            f"::warning file={NAME},title=Нет раздела канона::в {NAME} нет строки "
-            f"@{CANON_SECTION} или файла — обязательный раздел «Процесс — канон» не грузится"
-        )
-        message = f"{section}\n{message}"
-    return message
+    summary, warnings = check(root)
+    lines = [f"::warning file={NAME},title={title}::{text}" for title, text in warnings]
+    if not any(text == summary for _, text in warnings):
+        lines.append(summary)
+    return "\n".join(lines)
 
 
 def main() -> int:

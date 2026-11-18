@@ -40,7 +40,7 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 
 | Workflow | Job    | Что делает                            |
 | -------- | ------ | ------------------------------------- |
-| `CI`     | `test` | `check_lock` (`.canon.lock`), длина `CLAUDE.md` (предупреждение, не падает), gitleaks (секреты в коммитах), `ruff check`, `ruff format --check`, `pytest` на Python 3.12 с отчётом JUnit — артефакт `test-report-test` |
+| `CI`     | `test` | `check_lock` (`.canon.lock`), длина `AGENTS.md`, метка части воркфлоу и `CLAUDE.md` — строка `@AGENTS.md` (предупреждения, не падает), gitleaks (секреты в коммитах), `ruff check`, `ruff format --check`, `pytest` на Python 3.12 с отчётом JUnit — артефакт `test-report-test` |
 
 Запускается на `pull_request` и на push в `main`. Ночной и ручной полный прогон `main` — workflow
 `canon-mainline` (`.github/workflows/canon-mainline.yml`, ставит `canon-sync`, workflow#430): он
@@ -59,7 +59,8 @@ PR Dependabot сами не перестраиваются (`rebase-strategy: di
 ## Канон
 
 Файлы канона `alexkabchina-arch/workflow` (`scripts/canon/`, `.claude/settings.base.json`,
-`.claude/settings.json`) вендорятся через `canon-sync` и записаны в `.canon.lock`: руками не правятся,
+`.claude/settings.json`, часть воркфлоу в `AGENTS.md` между метками `canon:process`) вендорятся через
+`canon-sync` и записаны в `.canon.lock`: руками не правятся,
 шаг `check_lock` в CI это ловит. Линтер проекта их не проверяет (`extend-exclude` и
 `force-exclude` в `pyproject.toml`): качество кода канона — забота CI канона, у которого свои
 настройки. Проектные добавки к настройкам Claude Code — в `.claude/settings.project.json` (могут

@@ -415,7 +415,9 @@ class Fixes:
             o.stop(n, t, f"чекаут для короткого ревью не создан: {exc}")
             return False
         report = o.dir / "reviews" / f"ticket-{n}.short.json"
-        budget = f"{min(SHORT_LIMIT, tools.TICKET_LIMIT - spent):.2f}"
+        # Короткое ревью — роль `review`: не больше её предела (#356), иначе условие 8 отказало бы
+        # за трату, которую разрешил сам оркестратор.
+        budget = tools.limits.role_budget("review", SHORT_LIMIT, tools.TICKET_LIMIT - spent, t)[0]
         why = "после ослабления защиты" if weakened else f"{lines} строк кода"
         tools.say(f"#{n}: короткое ревью `{base[:7]}..{head[:7]}` — {why}")
         cmd = [str(HERE.parent / "review"), str(report), "--base", base, "--max-budget-usd", budget]
@@ -491,7 +493,7 @@ class Fixes:
             t, role, data or None, None, started=started, ended=tools.stamp(), step=step,
             usd=cost if known else float(budget), estimated=not known,
             outcome="error" if error else "ok", code=(data or {}).get("subtype") or "no_result",
-            exit=None,
+            exit=None, limited=True,
         )  # fmt: skip
         return (data if isinstance(data, dict) else {}), error
 

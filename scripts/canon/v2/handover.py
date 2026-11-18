@@ -151,11 +151,11 @@ def compose(n: int, facts: dict, route: dict, why: str) -> str:
     checks = (route.get("checks") or {}).get("head")
     head = facts.get("head") or ""
     if checks and checks == head:
-        checked = f"- тесты и линтеры маршрута пройдены на head `{head[:7]}`"
+        checked = f"- проверки маршрута засчитаны на head `{head[:7]}`"
     elif checks:
-        checked = f"- тесты и линтеры маршрута пройдены на `{checks[:7]}`, не на head `{head[:7]}`"
+        checked = f"- проверки маршрута засчитаны на `{checks[:7]}`, не на head `{head[:7]}`"
     else:
-        checked = "- тесты и линтеры маршрута не пройдены"
+        checked = "- проверки маршрута не пройдены"
     question = route.get("question") or {}
     asked = f"- вопрос владельцу: {question['url']}" if question.get("url") else "- нет"
     if question.get("stamp") and not question.get("url"):  # вопрос сессии v2 (#341)

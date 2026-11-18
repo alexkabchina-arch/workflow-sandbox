@@ -26,8 +26,16 @@ SETTINGS_BASE = ".claude/settings.base.json"
 SETTINGS_PROJECT = ".claude/settings.project.json"
 # Блок владений тикета: `canon-sync` вписывает его в трекер проекта с профилем (#215).
 OWNERSHIP = ".claude/canon/ticket-ownership.md"
+# Блок v2 (#354): проекту на пути v2 `canon-sync` вписывает его вместо прежнего.
+OWNERSHIP_V2 = ".claude/canon/ticket-ownership-v2.md"
 PROFILE = "docs/agents/profile.md"
 TRACKER = "docs/agents/issue-tracker.md"
+# Часть воркфлоу (#454): `canon-sync` вписывает её в `AGENTS.md`, `CLAUDE.md` — строка-ссылка.
+# Сам воркфлоу (скрипты не вендорятся) до выпуска с #455 держит в замке файл части версии до #454
+# — без меток: сверять его с `AGENTS.md` нечего (#455). Проект сверяется всегда.
+PROCESS = ".claude/canon/process.md"
+PROCESS_BEGIN = "<!-- canon:process"
+AGENTS = "AGENTS.md"
 
 
 class MergeError(Exception):
@@ -100,17 +108,42 @@ def check(root: Path) -> list[str]:
                     f"{SETTINGS}: не совпадает со склейкой {SETTINGS_BASE} + {SETTINGS_PROJECT}"
                 )
 
-    block = root / OWNERSHIP
-    if OWNERSHIP in lock["files"] and block.is_file() and (root / PROFILE).is_file():
+    # Блок в трекере — любой из поставленных: какой вписать, решает `canon-sync` по пути проекта.
+    blocks = [
+        rel for rel in (OWNERSHIP_V2, OWNERSHIP) if rel in lock["files"] and (root / rel).is_file()
+    ]
+    if blocks and (root / PROFILE).is_file():
         tracker = root / TRACKER
         text = tracker.read_bytes().decode(errors="replace") if tracker.is_file() else ""
         text = text.lstrip("﻿").replace("\r\n", "\n")
-        if text.count(block.read_text(encoding="utf-8")) != 1:
+        if not any(text.count((root / rel).read_text(encoding="utf-8")) == 1 for rel in blocks):
             problems.append(
-                f"{TRACKER}: блок владений не совпадает с {OWNERSHIP} (правлен, удалён или "
-                "файл переписан) — запустите canon-sync той же версии"
+                f"{TRACKER}: блок владений не совпадает с {' / '.join(blocks)} (правлен, удалён "
+                "или файл переписан) — запустите canon-sync той же версии"
             )
-    return problems
+
+    return problems + process_problems(root, lock["files"])
+
+
+def process_problems(root: Path, locked: dict) -> list[str]:
+    """Часть воркфлоу в `AGENTS.md` против `.claude/canon/process.md` установленной версии
+    (`locked` — файлы замка). Общая с хуком перед коммитом (`hooks/commit_checks.py`, #463)."""
+    own = "scripts/canon/check_lock.py" not in locked  # сам канон: скрипты не вендорятся
+    part = normalized(root / PROCESS)
+    if PROCESS not in locked or (own and not part.startswith(PROCESS_BEGIN)):
+        return []
+    if normalized(root / AGENTS).count(part) == 1:
+        return []
+    return [
+        f"{AGENTS}: часть воркфлоу не совпадает с {PROCESS} (правлена, удалена или файл "
+        "переписан) — запустите canon-sync той же версии"
+    ]
+
+
+def normalized(path: Path) -> str:
+    """Текст файла без BOM и с `\\n`; нет файла — пусто."""
+    text = path.read_bytes().decode(errors="replace") if path.is_file() else ""
+    return text.lstrip("﻿").replace("\r\n", "\n")
 
 
 def main(argv: list[str]) -> int:

@@ -35,8 +35,22 @@
 отчёта), `failures` (повторы по сбою роли подряд: виды), `task` (задание оркестратора до первого
 повтора), `next` (назначенный запуск: роль, модель, что засчитать, когда он начат).
 
-Удалить — по списку раздела «Пределы кругов, проверка посылки и сбой роли» в
-`docs/orchestrator.md` канона.
+**Пределы на роль** (#356) — таблица `ROLE_LIMITS`: время (секунды), ходы и USD одного запуска
+роли; числа — 90-й процентиль попытки 2, где её метрики есть (`SOURCES`), у прочих ролей и
+величин — аварийные потолки `EMERGENCY` (2 ч и 30 USD на запуск; ходов — без предела). Числа —
+настройка: правка таблицы, кода они не меняют. Упор роли в свой предел — не повтор, а стоп и
+вопрос владельцу (`ROLE_CODE`): `agent:go` — превышение этого запуска принято, а следующий
+запуск роли — один раз с потолком запуска (`raised`); `agent:retry` — тикет с нуля. Упор в
+остаток предела тикета (60 USD) — остановка, как у старого пути.
+
+**Условие 8 допуска** (`over`): деньги и время в пределах — расход тикета не больше предела
+тикета, каждый запуск роли попытки по журналу (`v2/journal.py`), начатый с пределом роли
+(`limited`), — не больше пределов своей роли, `/verify` — по расходу маршрута попытки;
+превышение, принятое владельцем (`agent:go` после стопа по пределу роли или после отказа
+условия 8), — не отказ.
+
+Удалить — по списку раздела «Пределы кругов, проверка посылки и сбой роли» и «Пределы на роль и
+метрики тикета» в `docs/orchestrator.md` канона.
 Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
 Только стандартная библиотека Python 3.
 """
@@ -123,6 +137,146 @@ RETRY_TASK = {
 }
 
 
+# --- пределы на роль (#356) ---
+
+EMERGENCY = {"seconds": 2 * 3600, "turns": None, "usd": 30.0}  # аварийные потолки запуска
+# 90-й процентиль попытки 2 (ozon #1139–#1169, старый путь; `docs/control-runs/2026-10-30-role-
+# limits.md`): сессия — по запуску, ревью и `/verify` — по тикету (их запуски не разделены).
+# Нет числа — аварийный потолок этой величины.
+ROLE_LIMITS = {
+    "session": {"seconds": 1230, "turns": 45, "usd": 8.5},
+    "review": {"usd": 4.2},
+    "verify": {"usd": 6.0},
+}
+SOURCES = {
+    "session": "90-й процентиль попытки 2 по 56 запускам",
+    "review": "90-й процентиль попытки 2 по 17 тикетам",
+    "verify": "90-й процентиль попытки 2 по 17 тикетам",
+}
+EMERGENCY_SOURCE = "аварийный потолок: метрик попытки 2 по роли нет"
+ROLE_CODE = "предел-роли"
+QUANTITIES = {"seconds": "время", "turns": "ходы", "usd": "USD"}
+ROLE_GO = (
+    "снова запуск этой роли (сессия — новая, на той же ветке с отчётом передачи) с аварийным "
+    "потолком вместо предела роли — один раз; превышение этого запуска принято"
+)
+# Предел времени — по часам такта: в них ещё `sbx exec`, worktree и хуки, которых нет в
+# `duration_ms` итога, из которого выведено число.
+CLOCK_SLACK = 120
+ROLE_ADVICE = (
+    "запуск роли упёрся в свой предел — 90-й процентиль прошлых тикетов: такая работа дороже или "
+    "дольше 9 из 10. Посмотрите отчёт передачи и дифф в PR: работа идёт и осталось немного — "
+    "`agent:go`; тикет велик или сессия ходит по кругу — разрежьте тикет и `agent:retry`. "
+    "**Риск:** `agent:go` тратит ещё до предела запуска; `agent:retry` теряет сделанное в ветке."
+)
+OVER_CODE = "предел-превышен"
+
+
+def role_limit(role: str) -> dict:
+    """Пределы роли: число таблицы, иначе аварийный потолок; `source` — откуда числа."""
+    own = ROLE_LIMITS.get(role) or {}
+    found = {k: own.get(k, v) for k, v in EMERGENCY.items()}
+    return {**found, "source": SOURCES.get(role) or EMERGENCY_SOURCE}
+
+
+def role_budget(role: str, run_limit: float, left: float, t: dict | None = None) -> tuple[str, str]:
+    """`--max-budget-usd` запуска роли и что его дало: `role` — предел роли (или потолок
+    запуска), `raised` — потолок запуска после `agent:go` на стопе по пределу этой роли,
+    `ticket` — остаток предела тикета."""
+    raised = role in (((t or {}).get("limits") or {}).get("raised") or [])  # только чтение
+    cap = run_limit if raised else min(role_limit(role)["usd"], run_limit)
+    if left < cap:
+        return f"{left:.2f}", "ticket"
+    return f"{cap:.2f}", "raised" if raised else "role"
+
+
+def spend_raise(t: dict, role: str, key: list) -> None:
+    """Запуск с поднятым пределом начат: подъём израсходован, его превышение принято."""
+    raised = (t.get("limits") or {}).get("raised") or []
+    if role in raised:
+        raised.remove(role)
+        accept(t, [key])
+
+
+def turns_args(role: str) -> list[str]:
+    """`--max-turns` роли, если у неё есть предел ходов."""
+    turns = role_limit(role)["turns"]
+    return ["--max-turns", str(turns)] if turns else []
+
+
+def role_reason(role: str, what: str, why: str) -> str:
+    """Причина стопа по пределу роли: код, величина, предел и откуда он."""
+    limit = role_limit(role)
+    return (
+        f"предел роли, код `{ROLE_CODE}`: запуск роли «{role}» упёрся в предел — {what} "
+        f"({limit['source']}): {why}"
+    )
+
+
+def role_hit(t: dict, reason: str, key: list) -> None:
+    """Стоп по пределу роли: `agent:go` после него примет превышение запуска `key` и поднимет
+    предел следующего запуска этой роли до потолка запуска."""
+    state(t)["hit"] = {"kind": "role", "reason": reason, "keys": [key]}
+
+
+def run_key(event: dict) -> list:
+    """Запуск роли в журнале: роль и начало."""
+    return [event.get("role"), event.get("started")]
+
+
+def overruns(events: list[dict]) -> list[tuple[list, str]]:
+    """Запуски журнала сверх пределов своей роли: `(ключ, что превышено)`. Только запуски,
+    начатые с пределом роли (`limited`): запуск до #356 шёл по старым правилам. Оценка расхода
+    (`estimated`) — это бюджет запуска, а не трата: не превышение."""
+    found = []
+    for e in events:
+        if not e.get("limited"):
+            continue
+        limit = role_limit(e.get("role") or "")
+        said = []
+        for key, name in QUANTITIES.items():
+            value = e.get(key)
+            if key == "usd" and e.get("estimated"):
+                continue
+            if isinstance(value, (int, float)) and limit[key] is not None and value > limit[key]:
+                said.append(f"{name} {value:g} > {limit[key]:g}")
+        if said:
+            found.append((run_key(e), f"«{e.get('role')}» {', '.join(said)}"))
+    return found
+
+
+def over(
+    t: dict, events: list[dict], spent: float, ticket_limit: float, route: dict | None = None
+) -> tuple[str, list]:
+    """Условие 8: превышения, не принятые владельцем, — `(почему, ключи)`; нет — `("", [])`.
+    `route` — расход дочерних прогонов маршрута попытки: `/verify` идёт внутри сессии, в журнал
+    не пишется — его предел (число на тикет) сверяется с этим расходом."""
+    accepted = state(t).get("accepted") or []
+    said, keys = [], []
+    if spent > ticket_limit and not state(t).get("ticket_ok"):
+        said.append(f"расход тикета {spent:.2f} USD > предела тикета {ticket_limit:g} USD")
+        keys.append(["ticket", None])
+    verify, limit = (route or {}).get("verify") or 0, role_limit("verify")["usd"]
+    if verify > limit and ["verify", None] not in accepted:
+        said.append(f"«verify» USD {verify:g} > {limit:g} на попытку")
+        keys.append(["verify", None])
+    for key, what in overruns(events):
+        if key not in accepted:
+            said.append(what)
+            keys.append(key)
+    return "; ".join(said), keys
+
+
+def accept(t: dict, keys: list) -> None:
+    """Превышения `keys` приняты владельцем (`agent:go`): условие 8 их больше не считает."""
+    accepted = state(t).setdefault("accepted", [])
+    for key in keys:
+        if key == ["ticket", None]:
+            state(t)["ticket_ok"] = True
+        elif key not in accepted:
+            accepted.append(key)
+
+
 def state(t: dict) -> dict:
     return t.setdefault("limits", {})
 
@@ -165,16 +319,26 @@ def advice(t: dict, why: str) -> tuple[str, str] | None:
     if found.get("reason") != why:
         return None
     kind = found["kind"]
+    if kind == "role":
+        return ROLE_GO, ROLE_ADVICE
     return GO.format(name=NAMES[kind]), CONFLICT_ADVICE if kind == "conflicts" else ADVICE
 
 
 def grant(t: dict) -> str | None:
     """`agent:go` на остановке: сбои роли подряд — с нуля (после остановки по ним — снова
-    повторы); по пределу — ещё один круг этого вида. Итог — вид или None."""
+    повторы); по пределу — ещё один круг этого вида; по пределу роли — превышение запуска
+    принято (#356). Итог — вид или None."""
     state(t).pop("failures", None)
     found = state(t).pop("hit", None)
     if not found:
         return None
+    if found["kind"] == "role":
+        accept(t, found.get("keys") or [])
+        raised = state(t).setdefault("raised", [])
+        for role, _ in found.get("keys") or []:
+            if role not in raised:
+                raised.append(role)
+        return "role"
     extra = state(t).setdefault("extra", {})
     extra[found["kind"]] = extra.get(found["kind"], 0) + 1
     return found["kind"]
@@ -211,6 +375,7 @@ def retry(t: dict, kind: str) -> bool:
 
 def retried(t: dict, kind: str) -> None:
     state(t).setdefault("failures", []).append(kind)
+    state(t)["retried"] = state(t).get("retried", 0) + 1  # всего повторов — в метрики (#356)
 
 
 def succeeded(t: dict) -> None:
