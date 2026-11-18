@@ -1,0 +1,1256 @@
+#!/usr/bin/env python3
+"""affected-tests — задетые тесты: отбор по изменённым файлам и прогон отобранных (#464).
+
+    python3 scripts/canon/affected-tests [ФАЙЛ…]           # отбор и прогон
+    python3 scripts/canon/affected-tests --list [ФАЙЛ…]    # только отбор, по строке на тест
+    python3 scripts/canon/affected-tests --build-map       # карта зависимостей (`select: map`)
+    python3 scripts/canon/affected-tests --docs [ФАЙЛ…]    # задетые документы (#512)
+
+Из корня рабочей копии. Файлы — изменённые файлы ветки: допуск маршрута (`ticket ship`; в
+тестах исправлений — файлы починки) и проверка в песочнице пути v2 подставляют их на место
+`{files}` в строке `tests` блока ```checks профиля (`tests: python3 scripts/canon/affected-tests
+{files}`).
+Настройки — блок ```affected-tests профиля (`docs/agents/profile.md`), строки `ключ: значение`:
+
+- `tests` — где тесты, шаблоны через пробел (по умолчанию `tests/**/test*.py`);
+- `sources` — каталоги кода, внутри которых ищутся импорты, через пробел; не задано — каталог
+  самого изменённого файла;
+- `slow` — медленные тесты, шаблоны через пробел: идут, только когда изменён сам тест или его
+  «свой» файл (имя теста без `test_` — имя файла, `-` и `_` не различаются); иначе их гоняет CI;
+- `limit` — предел времени прогона отобранных, секунд; превышен — прогон остановлен, код 124;
+- `run` — команда прогона (без оболочки), отобранные тесты — её аргументами в конце;
+- `paused`, `paused-code` — сцены пути на паузе и их код: сцена идёт, только когда изменена она
+  сама или её код;
+- `select` — `names` (по умолчанию, ниже) или `map`: по карте «тест → функции, которые он
+  выполнял, файлы, которые читал и запускал»; карту собирает `--build-map` полным прогоном с
+  трассировкой в каталог git, правки берутся от её коммита (#509, `docs/affected-tests.md`
+  канона).
+
+Отбор — общий, по именам и импортам (так же отбирают местные ворота самого воркфлоу,
+`ship-finish`): тест идёт, если он сам изменён или упоминает имя изменённого файла (у файла
+кода — имя без расширения, у прочих — с ним) или имя файла, который упоминает изменённый модуль
+(импорт: путь модуля от каталога `sources` без расширения). Отобранного нет — код 0 без
+прогона. Проект может заменить отбор своим: своя команда в строке `tests` с теми же `{files}`.
+
+`--docs` — задетые документы (#512): шаблоны — блок ```affected-docs профиля (`docs` — документы
+механизма, `tutorial` — учебник отдельной строкой); документ идёт, если изменён сам или называет
+изменённый файл тем же именем, что отбор по именам, целым словом, без шага импортов. Блока нет —
+пусто. Список читает допуск маршрута (`ticket ship`): по каждому документу сессия отвечает.
+
+Отбор записывается файлом JSON (`files`, `tests`), если задан `CANON_AFFECTED_OUT`: по нему
+`ticket wait` узнаёт промах — CI упал на тесте вне отбора (`docs/affected-tests.md` канона).
+Своя команда проекта может писать тот же файл; не пишет — промахи не ловятся.
+Код выхода: код команды `run`; 2 — ошибка настроек, 124 — превышен `limit`.
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import ast
+import difflib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+
+PROFILE = Path("docs/agents/profile.md")
+BLOCK = re.compile(r"^```affected-tests[ \t]*\n(.*?)^```", re.M | re.S)
+KEYS = ("tests", "sources", "slow", "limit", "run", "select", "paused", "paused-code")
+MODES = ("names", "map")
+DEFAULT_TESTS = ("tests/**/test*.py",)
+OUT_ENV = "CANON_AFFECTED_OUT"
+TIMEOUT_CODE = 124
+# Файл кода — по имени без расширения: так его называет импорт (`import calc`, `from './calc'`).
+CODE = {
+    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".vue", ".svelte", ".go", ".rb", ".rs",
+    ".java", ".kt", ".swift", ".php", ".cs",
+}  # fmt: skip
+SCAN_LIMIT = 2**20  # файл больше — в поиске импортов не читается
+
+
+class SettingsError(Exception):
+    pass
+
+
+def block_lines(body: str, name: str, keys: tuple[str, ...]):
+    """Строки `ключ: значение` блока ```name: (ключ, значение, слова значения). Пустые строки и
+    `#` пропускаются; строка не `ключ: значение`, ключ не из `keys`, разбор слов или незаполненная
+    заглушка шаблона (`<…>`) — `SettingsError`."""
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if not sep or key not in keys:
+            raise SettingsError(
+                f"блок ```{name}: строка «{line}» — нужна `ключ: значение`, ключи: "
+                f"{', '.join(keys)}"
+            )
+        try:
+            words = shlex.split(value)
+        except ValueError as exc:
+            raise SettingsError(f"блок ```{name}, `{key}`: {exc}") from None
+        if any(w.startswith("<") or w.endswith(">") for w in words):
+            raise SettingsError(
+                f"блок ```{name}, `{key}`: заглушка шаблона не заполнена — «{value}»"
+            )
+        yield key, value, words
+
+
+def parse(text: str | None) -> dict:
+    """Настройки из блока ```affected-tests; блока нет — по умолчанию. Строка не `ключ: значение`
+    или ключ незнакомый — `SettingsError`."""
+    conf = {
+        "tests": list(DEFAULT_TESTS),
+        "sources": [],
+        "slow": [],
+        "limit": None,
+        "run": [],
+        "select": "names",
+        "paused": [],
+        "paused-code": [],
+    }
+    block = BLOCK.search(text or "")
+    if not block:
+        return conf
+    for key, value, words in block_lines(block.group(1), "affected-tests", KEYS):
+        if key == "limit":
+            try:
+                conf["limit"] = float(value)
+            except ValueError:
+                raise SettingsError(
+                    f"блок ```affected-tests: `limit` — секунды, а не «{value}»"
+                ) from None
+            if conf["limit"] <= 0:
+                raise SettingsError("блок ```affected-tests: `limit` — больше нуля")
+        elif key == "select":
+            if value not in MODES:
+                raise SettingsError(
+                    f"блок ```affected-tests: `select` — {' или '.join(MODES)}, а не «{value}»"
+                )
+            conf["select"] = value
+        else:
+            conf[key] = [w.rstrip("/") if key == "sources" else w for w in words]
+    if conf["paused"] and not conf["paused-code"]:
+        raise SettingsError(
+            "блок ```affected-tests: `paused` без `paused-code` — сцены на паузе не шли бы никогда"
+        )
+    return conf
+
+
+def profile_text(root: Path, profile: Path = PROFILE) -> str | None:
+    try:
+        return (root / profile).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def read_settings(root: Path, profile: Path = PROFILE) -> dict:
+    return parse(profile_text(root, profile))
+
+
+def pattern_re(pattern: str) -> re.Pattern:
+    """Шаблон пути как у git: `*` и `?` — внутри одного каталога, `**/` — любые каталоги, в том
+    числе ни одного."""
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:[^/]+/)*")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def matches(path: str, patterns: list[str]) -> bool:
+    return any(pattern_re(p).match(path) for p in patterns)
+
+
+def name_of(path: PurePosixPath) -> str:
+    """Имя, по которому файл упоминают: у кода — без расширения, у прочих — целиком."""
+    return path.stem if path.suffix in CODE else path.name
+
+
+def plain(name: str) -> str:
+    return name.lower().replace("-", "_")
+
+
+def tracked(root: Path) -> list[str]:
+    """Файлы рабочей копии из git (неотслеживаемые не участвуют). Сбой git — `SettingsError`:
+    пустой список выглядел бы зелёным «задетых тестов нет»."""
+    res = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=root, capture_output=True, text=True, check=False
+    )
+    if res.returncode != 0:
+        raise SettingsError(f"git ls-files: {(res.stderr or res.stdout).strip()}")
+    return [p for p in res.stdout.split("\0") if p]
+
+
+def read(root: Path, rel: str) -> str:
+    path = root / rel
+    try:
+        if path.stat().st_size > SCAN_LIMIT:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def import_keys(changed: list[PurePosixPath], sources: list[str]) -> dict[PurePosixPath, set]:
+    """Ключи импорта изменённых модулей по каталогам поиска: путь модуля от каталога кода
+    (`sources`, иначе каталог самого файла) без расширения — через `/` (`v2/roles`, так его грузят
+    скрипты) и через точку (`pkg.rules`, импорт Python); соседям по каталогу — ещё имя (`.rules`,
+    `./rules`)."""
+    keys: dict[PurePosixPath, set] = {}
+    for path in changed:
+        if path.suffix not in CODE:
+            continue
+        roots = [PurePosixPath(s) for s in sources if path.is_relative_to(PurePosixPath(s))]
+        if sources and not roots:
+            continue
+        base = max(roots, key=lambda r: len(r.parts)) if roots else path.parent
+        key = path.relative_to(base).with_suffix("").as_posix()
+        keys.setdefault(base, set()).update({key, key.replace("/", ".")})
+        keys.setdefault(path.parent, set()).add(path.stem)
+    return keys
+
+
+def importers(
+    root: Path, files: list[str], changed: list[PurePosixPath], sources: list[str]
+) -> set[str]:
+    """Имена файлов кода, которые упоминают изменённый модуль (`import_keys`); каждый файл
+    читается один раз."""
+    keys = import_keys(changed, sources)
+    found: set[str] = set()
+    if not keys:
+        return found
+    own = set(changed)
+    for rel in files:
+        other = PurePosixPath(rel)
+        if other in own or (other.suffix and other.suffix not in CODE):
+            continue
+        wanted = {
+            k
+            for base, group in keys.items()
+            if base == PurePosixPath(".") or other.is_relative_to(base)
+            for k in group
+        }
+        if not wanted:
+            continue
+        text = read(root, rel)
+        if any(k in text for k in wanted):
+            found.add(name_of(other))
+    return found
+
+
+def select(root: Path, changed: list[str], conf: dict) -> list[str]:
+    """Задетые тесты по изменённым файлам `changed` (пути от корня) — отсортированный список;
+    способ — ключ `select` настроек: `names` (по упоминанию имён) или `map` (по карте
+    зависимостей, собранной трассировкой)."""
+    files = tracked(root)
+    if conf["select"] == "map":
+        return select_map(root, files, changed, conf)
+    return select_names(root, files, changed, conf)
+
+
+def slow_own(test: str, own: set[str]) -> bool:
+    """Медленный тест идёт по «своему» файлу: имя теста без `test_` — имя файла."""
+    stem = plain(PurePosixPath(test).stem)
+    return stem.removeprefix("test_") in own or stem.removesuffix("_test") in own
+
+
+def select_names(root: Path, files: list[str], changed: list[str], conf: dict) -> list[str]:
+    """Отбор по упоминанию: тест упоминает имя изменённого файла или файла, который его грузит."""
+    tests = sorted(f for f in files if matches(f, conf["tests"]))
+    changed_set = set(changed)
+    own = {plain(name_of(PurePosixPath(p))) for p in changed}
+    names_of: dict[tuple[str, ...], set[str]] = {}
+    chosen = []
+    for test in tests:
+        if test in changed_set:
+            chosen.append(test)
+            continue
+        if matches(test, conf["slow"]):
+            if slow_own(test, own):
+                chosen.append(test)
+            continue
+        relevant = paused_filter(test, changed, conf)
+        if relevant is None:
+            continue
+        key = tuple(relevant)
+        if key not in names_of:
+            paths = [PurePosixPath(p) for p in relevant]
+            names = {name_of(p) for p in paths} | importers(root, files, paths, conf["sources"])
+            names.discard("")
+            names_of[key] = names
+        text = read(root, test)
+        if any(name in text for name in names_of[key]):
+            chosen.append(test)
+    return chosen
+
+
+# --- отбор по карте зависимостей (`select: map`, #509) ---
+
+MAP_FILE = "canon-tests/deps-map.json"  # в каталоге git, общем для рабочих копий
+MAP_VERSION = 1
+MAINLINE = "origin/main"  # основная ветка: правки после карты берутся до точки ответвления
+TRACE_DIR_ENV = "AFFECTED_TRACE_DIR"  # не `CANON_…`: сцены тестов чистят `CANON_*` окружения
+MODULE = "<module>"
+ALL = "*"  # файл задет целиком: не Python, удалён или не разбирается
+SAME = "="  # текст файла тот же, что в коммите карты
+# Процесс прочёл больше файлов кода — массовая операция (копия, хэш, линтер), а не проверка их
+# текста: такие чтения кода не в счёт.
+BULK = 16
+DOC = "<doc>"  # докстринг модуля: виден только запуску скриптом (`--help`, usage)
+
+# Трассировка процесса при сборке карты: `sitecustomize` во временном каталоге первым в
+# `PYTHONPATH`. Пишет строками `вид\tзначение…`: `c` — выполнен код (файл, имя функции), `r` —
+# файл прочитан, `x` — скопирован, `p` — запущен (`subprocess`, `exec`), `w` — каталог процесса.
+# Потом исполняет `sitecustomize`, который стоял бы без неё (у Python Homebrew он есть).
+TRACER = r"""
+import os
+import sys
+
+
+def _canon_trace(out):
+    test = os.environ.get("AFFECTED_TRACE_TEST", "")
+    here = os.path.dirname(os.path.abspath(__file__))
+    skip = tuple({sys.base_prefix, sys.prefix, sys.base_exec_prefix, sys.exec_prefix, here})
+    name = f"{os.getpid()}-{os.urandom(4).hex()}.log"
+    fd = os.open(os.path.join(out, name), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_EXCL, 0o600)
+
+    def put(*parts):
+        line = "\t".join(str(p).replace("\t", " ").replace("\n", " ") for p in parts) + "\n"
+        try:
+            os.write(fd, line.encode("utf-8", "replace"))
+        except OSError:
+            pass
+
+    def ours(path):
+        return isinstance(path, str) and path[:1] != "<" and not path.startswith(skip)
+
+    put("t", test)
+    put("w", os.getcwd())
+    mon = getattr(sys, "monitoring", None)
+    if mon is not None:
+        for tool in (mon.COVERAGE_ID, 3, 4):  # свободные номера инструментов `sys.monitoring`
+            try:
+                mon.use_tool_id(tool, "canon-affected")
+                break
+            except ValueError:
+                continue
+        else:
+            tool = None
+        if tool is not None:
+
+            def start(code, offset):
+                if ours(code.co_filename):
+                    put("c", os.path.abspath(code.co_filename), code.co_qualname)
+                return mon.DISABLE
+
+            mon.register_callback(tool, mon.events.PY_START, start)
+            mon.set_events(tool, mon.events.PY_START)
+    else:
+        seen = set()
+
+        def profile(frame, event, arg):
+            if event != "call":
+                return
+            code = frame.f_code
+            if code not in seen:
+                seen.add(code)
+                if ours(code.co_filename):
+                    qual = getattr(code, "co_qualname", code.co_name)
+                    put("c", os.path.abspath(code.co_filename), qual)
+
+        sys.setprofile(profile)
+        import threading
+
+        threading.setprofile(profile)
+
+    def importing():
+        # Файл открыл сам загрузчик модулей (кадр, вызвавший `open`), а не код модуля при импорте.
+        frame = sys._getframe(2)
+        return frame is not None and frame.f_code.co_filename.startswith("<frozen importlib")
+
+    def ran(args, cwd):
+        # Запущенная программа, а у интерпретатора Python — ещё его скрипт; прочие аргументы —
+        # данные (путь файла поддельной команде — не её запуск).
+        if isinstance(args, (str, bytes, os.PathLike)):
+            args = os.fsdecode(args).split()
+        words = [os.fsdecode(a) if isinstance(a, (bytes, os.PathLike)) else str(a) for a in args]
+        if not words:
+            return
+        targets = [words[0]]
+        if os.path.basename(words[0]).startswith("python"):
+            rest = iter(words[1:])
+            for word in rest:
+                if word in ("-c", "-m"):
+                    break
+                if word in ("-W", "-X", "-Q"):
+                    next(rest, None)  # значение опции
+                elif not word.startswith("-"):
+                    targets.append(word)
+                    break
+        for word in targets:
+            if "/" in word or word.endswith(".py"):
+                put("p", os.path.join(cwd or os.getcwd(), word))
+
+    def audit(event, args):
+        try:
+            if event == "open":
+                path, mode, flags = args
+                if isinstance(path, bytes):
+                    path = os.fsdecode(path)
+                if not isinstance(path, str):
+                    return
+                if isinstance(mode, str):
+                    reading = "r" in mode and "+" not in mode
+                else:
+                    reading = (flags & 3) == 0
+                if reading:
+                    path = os.path.abspath(path)
+                    if ours(path) and not importing():
+                        put("r", path)
+            elif event == "compile":
+                name = args[1]
+                if isinstance(name, bytes):
+                    name = os.fsdecode(name)
+                if isinstance(name, str) and ours(name):
+                    put("k", os.path.abspath(name))
+            elif event == "shutil.copyfile":
+                put("x", os.path.abspath(os.fsdecode(args[0])))
+            elif event == "subprocess.Popen":
+                ran(args[1], args[2] and os.fsdecode(args[2]))
+            elif event in ("os.exec", "os.posix_spawn"):
+                ran(args[1], None)
+        except Exception:
+            pass
+
+    sys.addaudithook(audit)
+
+
+def _canon_chain():
+    # Следующий `sitecustomize` в `sys.path`, кроме таких же трассировщиков (их может быть
+    # несколько: сборка карты внутри сборки карты), — иначе они звали бы друг друга по кругу.
+    import importlib.machinery
+    import importlib.util
+
+    rest = list(sys.path)
+    while True:
+        spec = importlib.machinery.PathFinder.find_spec("sitecustomize", rest)
+        if spec is None or spec.loader is None or not spec.origin:
+            return
+        try:
+            with open(spec.origin, encoding="utf-8", errors="replace") as fh:
+                ours = "_canon_affected_traced" in fh.read()
+        except OSError:
+            return
+        if not ours:
+            break
+        here = os.path.dirname(os.path.abspath(spec.origin))
+        rest = [p for p in rest if os.path.abspath(p or ".") != here]
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["sitecustomize"] = module
+    spec.loader.exec_module(module)
+
+
+if os.environ.get("AFFECTED_TRACE_DIR") and not getattr(sys, "_canon_affected_traced", False):
+    sys._canon_affected_traced = True
+    try:
+        _canon_trace(os.environ["AFFECTED_TRACE_DIR"])
+    except Exception:
+        pass
+_canon_chain()
+"""
+
+
+def git_out(root: Path, *args: str) -> str | None:
+    res = subprocess.run(
+        ["git", *args], cwd=root, capture_output=True, text=True, errors="replace", check=False
+    )
+    return res.stdout if res.returncode == 0 else None
+
+
+def map_path(root: Path) -> Path | None:
+    common = git_out(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return Path(common.strip()) / MAP_FILE if common else None
+
+
+def load_map(root: Path) -> tuple[dict | None, str]:
+    """Карта и пустая строка — или None и причина, почему её нет."""
+    path = map_path(root)
+    if path is None or not path.is_file():
+        return None, "карты нет"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"карта не читается ({exc})"
+    if not isinstance(data, dict) or data.get("version") != MAP_VERSION:
+        return None, "карта другой версии"
+    commit = data.get("commit", "")
+    if not commit or git_out(root, "cat-file", "-e", f"{commit}^{{commit}}") is None:
+        return None, f"коммита карты {commit[:12]} нет в репозитории"
+    return data, ""
+
+
+def is_code(root: Path, rel: str) -> bool:
+    """Файл кода: расширение языка или скрипт без расширения (`#!` в начале)."""
+    path = PurePosixPath(rel)
+    if path.suffix:
+        return path.suffix in CODE
+    try:
+        with open(root / rel, "rb") as fh:
+            return fh.read(2) == b"#!"
+    except OSError:
+        return False
+
+
+def python_text(rel: str, text: str) -> bool:
+    if rel.endswith(".py"):
+        return True
+    first = text.split("\n", 1)[0]
+    return not PurePosixPath(rel).suffix and first.startswith("#!") and "python" in first
+
+
+def trivial(line: str) -> bool:
+    stripped = line.strip()
+    return not stripped or stripped.startswith("#")
+
+
+def scope_chains(tree: ast.AST, count: int) -> tuple[list[tuple[str, ...]], dict[str, int]]:
+    """Для каждой строки (с нуля) — цепочка областей снаружи внутрь: имена функций и классов, как
+    у `co_qualname` их кода (`Ship.run`, `main.<locals>.inner`); и отступ строки `def`/`class`
+    каждой области."""
+    chains: list[tuple[str, ...]] = [()] * count
+    cols: dict[str, int] = {}
+
+    def paint(node: ast.AST, chain: tuple[str, ...], qual: str, in_func: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = child.name
+                sub = f"{qual}.<locals>.{name}" if in_func else (f"{qual}.{name}" if qual else name)
+                inner = (*chain, sub)
+                cols[sub] = child.col_offset
+                for line in range(child.lineno - 1, min(child.end_lineno or child.lineno, count)):
+                    chains[line] = inner
+                paint(child, inner, sub, not isinstance(child, ast.ClassDef))
+            else:
+                paint(child, chain, qual, in_func)
+
+    paint(tree, (), "", False)
+    return chains, cols
+
+
+def doc_lines(tree: ast.AST) -> tuple[set[int], set[int]]:
+    """Строки (с нуля) докстрингов: модуля — и функций с классами."""
+    module: set[int] = set()
+    inner: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            first = body[0]
+            lines = range(first.lineno - 1, first.end_lineno or first.lineno)
+            (module if isinstance(node, ast.Module) else inner).update(lines)
+    return module, inner
+
+
+def top_names(tree: ast.AST) -> set[str]:
+    """Имена верхнего уровня модуля: функции, классы, присваивания, импорты."""
+    names: set[str] = set()
+    for node in getattr(tree, "body", []):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name).split(".")[0] for a in node.names)
+        else:
+            names.update(n.id for n in ast.walk(node) if isinstance(n, ast.Name))
+    return names
+
+
+def literal(node: ast.AST | None) -> bool:
+    """Значение без побочных действий при импорте: литерал и наборы литералов."""
+    if node is None or isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(literal(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(literal(k) and literal(v) for k, v in zip(node.keys, node.values))
+    if isinstance(node, ast.UnaryOp):
+        return literal(node.operand)
+    return False
+
+
+def quiet_def(node: ast.AST, lazy: bool) -> bool:
+    """Функция или класс, чьё определение при импорте ничего не исполняет: без декораторов,
+    значения по умолчанию — литералы, аннотации отложены (`from __future__ import annotations`)
+    или их нет; у класса — без баз и с таким же телом."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        args = node.args
+        notes = [a.annotation for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
+        notes += [node.returns, args.vararg and args.vararg.annotation]
+        notes += [args.kwarg and args.kwarg.annotation]
+        return (
+            not node.decorator_list
+            and all(literal(d) for d in (*args.defaults, *args.kw_defaults))
+            and (lazy or all(n is None for n in notes))
+        )
+    if isinstance(node, ast.ClassDef):
+        if node.decorator_list or node.bases or node.keywords:
+            return False
+        for item in node.body:
+            if isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant):
+                continue
+            if isinstance(item, (ast.Assign, ast.AnnAssign)) and literal(item.value):
+                continue
+            if not quiet_def(item, lazy):
+                return False
+        return True
+    return False
+
+
+def added_top(tree: ast.AST, old_names: set[str]) -> set[int]:
+    """Строки (с нуля) нового верхнего уровня, которых старый код не видит и чьё определение при
+    импорте ничего не исполняет: функции, классы и литеральные константы с новыми именами
+    (`READY = "…"`). Декоратор, база класса, вычисляемое значение и занятое имя (перепривязка) —
+    правка модуля."""
+    body = getattr(tree, "body", [])
+    lazy = any(
+        isinstance(n, ast.ImportFrom)
+        and n.module == "__future__"
+        and any(a.name == "annotations" for a in n.names)
+        for n in body
+    )
+    lines: set[int] = set()
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in old_names or not quiet_def(node, lazy):
+                continue
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not all(isinstance(t, ast.Name) and t.id not in old_names for t in targets):
+                continue
+            if not literal(node.value):
+                continue
+        else:
+            continue
+        lines.update(range(node.lineno - 1, node.end_lineno or node.lineno))
+    return lines
+
+
+def string_lines(tree: ast.AST) -> set[int]:
+    """Строки (с нуля) внутри многострочных строковых литералов: там `#` и пустая строка — текст,
+    а не комментарий."""
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Constant, ast.JoinedStr)) and (node.end_lineno or 0) > node.lineno:
+            lines.update(range(node.lineno, node.end_lineno or node.lineno))
+    return lines
+
+
+def headers(tree: ast.AST, chains: list[tuple[str, ...]]) -> dict[int, str]:
+    """Строки (с нуля) заголовков `def`/`class` (декораторы, значения по умолчанию, базы) —
+    область, где они исполняются: охватывающая функция или класс, иначе `<module>`."""
+    out: dict[int, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            first = min([node.lineno, *(d.lineno for d in node.decorator_list)]) - 1
+            last = node.body[0].lineno - 1 if node.body else node.lineno
+            parent = chains[node.lineno - 1][:-1] if node.lineno - 1 < len(chains) else ()
+            for line in range(first, max(last, node.lineno)):
+                out[line] = parent[-1] if parent else MODULE
+    return out
+
+
+def doc_users(tree: ast.AST, chains: list[tuple[str, ...]]) -> set[str]:
+    """Области, где код читает `__doc__` модуля (описание argparse, usage скрипта)."""
+    users: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "__doc__":
+            chain = chains[node.lineno - 1] if node.lineno - 1 < len(chains) else ()
+            users.add(chain[-1] if chain else MODULE)
+    return users
+
+
+def changed_scopes(old: str, new: str) -> set[str] | str:
+    """Области старой версии файла Python, которые задела правка: имена функций и классов,
+    `<module>` — код уровня модуля (и заголовки `def`/`class` верхнего уровня: декораторы,
+    значения по умолчанию, базы), `<doc>` — докстринг модуля (он идёт в `--help` и usage
+    скрипта; задевает и функции, которые читают `__doc__`); `ALL` — не разбирается. Не правка:
+    пустые строки и комментарии вне строковых литералов, докстринги функций и классов, новая
+    функция, класс или литеральная константа с новым именем на верхнем уровне, если их
+    определение ничего не исполняет, — их вызов появится только в изменённом коде."""
+    try:
+        old_tree, new_tree = ast.parse(old), ast.parse(new)
+    except (SyntaxError, ValueError):
+        return ALL
+    a, b = old.split("\n"), new.split("\n")
+    chains, cols = scope_chains(old_tree, len(a))
+    new_chains, _ = scope_chains(new_tree, len(b))
+    old_doc, old_inner = doc_lines(old_tree)
+    new_doc, new_inner = doc_lines(new_tree)
+    old_text, new_text = string_lines(old_tree), string_lines(new_tree)
+    old_head, new_head = headers(old_tree, chains), headers(new_tree, new_chains)
+    added = added_top(new_tree, top_names(old_tree))
+    skip_old, skip_new = old_doc | old_inner, new_doc | new_inner
+
+    def meaningful(i: int, lines: list[str], text: set[int], skip: set[int]) -> bool:
+        return i not in skip and (i in text or not trivial(lines[i]))
+
+    found: set[str] = set()
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if any(i in old_doc for i in range(i1, i2)) or any(j in new_doc for j in range(j1, j2)):
+            found.add(DOC)
+        real = [i for i in range(i1, i2) if meaningful(i, a, old_text, skip_old)]
+        fresh = [j for j in range(j1, j2) if meaningful(j, b, new_text, skip_new)]
+        for i in real:
+            found.add(chains[i][-1] if chains[i] else MODULE)
+            if i in old_head:
+                found.add(old_head[i])
+        for j in fresh:
+            if j in added:
+                continue
+            if j in new_head:
+                found.add(new_head[j])
+            elif not new_chains[j]:
+                found.add(MODULE)  # новый код уровня модуля исполняется при импорте
+        if real or not fresh:
+            continue
+        before = chains[i1 - 1] if i1 > 0 else ()
+        after = chains[i1] if i1 < len(a) else ()
+        common = ()
+        for x, y in zip(before, after):
+            if x != y:
+                break
+            common = (*common, x)
+        indent = len(b[fresh[0]]) - len(b[fresh[0]].lstrip())
+        # Конец тела: строка после вставки уже вне области — область берётся по отступу.
+        tail = next((q for q in reversed(before) if indent > cols[q]), None)
+        if tail or common:
+            found.add(tail or common[-1])
+    if DOC in found:
+        found |= doc_users(old_tree, chains)
+    return found
+
+
+class Resolver:
+    """Путь из трассировки — файлы рабочей копии. Сцены тестов копируют код во временные
+    каталоги, поэтому путь сверяется хвостом: `/tmp/…/scene/scripts/canon/ticket_core.py` —
+    `project/scripts/canon/ticket_core.py` (через ссылку `scripts/canon`, если она в git). Хвосту
+    отвечают все его двойники (`.claude/skills/ship/SKILL.md` и `project/.claude/…`): сцена могла
+    собраться из любого. Одно имя без каталога — только если такое имя в рабочей копии одно."""
+
+    def __init__(self, root: Path, files: list[str]) -> None:
+        self.root = root.resolve()
+        self.files = set(files)
+        self.alias: dict[str, str] = {}
+        for rel in files:
+            path = root / rel
+            if path.is_symlink() and path.is_dir():
+                try:
+                    target = path.resolve().relative_to(self.root).as_posix()
+                except ValueError:
+                    continue
+                self.alias[rel] = target
+        self.by_name: dict[str, list[str]] = {}
+        for rel in files:
+            self.by_name.setdefault(PurePosixPath(rel).name, []).append(rel)
+        self.cache: dict[str, tuple[str, ...]] = {}
+
+    def known(self, rel: str) -> str | None:
+        if rel in self.files:
+            return rel
+        for link, target in self.alias.items():
+            if rel.startswith(link + "/"):
+                real = target + rel[len(link) :]
+                if real in self.files:
+                    return real
+        return None
+
+    def twins(self, tail: str) -> tuple[str, ...]:
+        """Файлы, чей путь кончается хвостом `tail` (с переходом по ссылкам-каталогам)."""
+        found = {
+            rel
+            for rel in self.by_name.get(PurePosixPath(tail).name, ())
+            if rel == tail or rel.endswith("/" + tail)
+        }
+        if real := self.known(tail):
+            found.add(real)
+        return tuple(sorted(found))
+
+    def __call__(self, path: str) -> tuple[str, ...]:
+        if path in self.cache:
+            return self.cache[path]
+        found: tuple[str, ...] = ()
+        try:
+            rel = self.known(Path(path).resolve().relative_to(self.root).as_posix())
+            found = (rel,) if rel else ()
+        except (ValueError, OSError):
+            pass
+        if not found:
+            parts = PurePosixPath(path).parts[1:]
+            for k in range(len(parts)):
+                tail = "/".join(parts[k:])
+                found = self.twins(tail)
+                if k == len(parts) - 1 and len(found) > 1:
+                    found = ()  # одно имя, а файлов с ним несколько
+                if found:
+                    break
+        self.cache[path] = found
+        return found
+
+
+def merge_traces(root: Path, out: Path, files: list[str]) -> dict[str, dict]:
+    """Записи трассировки — карта «тест → код, чтение, запуск». Прочитанный и тем же процессом
+    скомпилированный файл (загрузка модуля текстом, `exec(compile(…))`) — не чтение;
+    скопированный — тоже."""
+    resolve = Resolver(root, files)
+    tests: dict[str, dict] = {}
+    for log in sorted(out.glob("*.log")):
+        test, code, reads, copied, compiled, ran = "", {}, set(), set(), set(), set()
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            kind, _, rest = line.partition("\t")
+            if kind == "t":
+                test = rest
+            elif kind == "c":
+                path, _, qual = rest.partition("\t")
+                code.setdefault(path, set()).add(qual)
+            elif kind == "r":
+                reads.add(rest)
+            elif kind == "x":
+                copied.add(rest)
+            elif kind == "k":
+                compiled.add(rest)
+            elif kind == "p":
+                ran.add(rest)
+        owners = resolve(test) if test else ()
+        if len(owners) != 1:
+            continue
+        entry = tests.setdefault(owners[0], {"code": {}, "read": set(), "ran": set()})
+        for path, quals in code.items():
+            for rel in resolve(path):
+                entry["code"].setdefault(rel, set()).update(quals)
+        read = {rel for path in reads - copied - compiled for rel in resolve(path)}
+        if sum(1 for rel in read if is_code(root, rel)) > BULK:
+            read = {rel for rel in read if not is_code(root, rel)}  # массовое чтение кода
+        entry["read"].update(read)
+        entry["ran"].update(rel for path in ran for rel in resolve(path))
+    return {
+        test: {
+            "code": {f: sorted(q) for f, q in sorted(e["code"].items())},
+            "read": sorted(e["read"]),
+            "ran": sorted(e["ran"]),
+        }
+        for test, e in sorted(tests.items())
+    }
+
+
+def build_map(root: Path, conf: dict) -> int:
+    """Полный прогон с трассировкой и запись карты в каталог git. Только с чистой рабочей
+    копией (карта — о коммите) и только по зелёному прогону."""
+    if not conf["run"]:
+        print(f"affected-tests: {PROFILE}: в блоке ```affected-tests нет `run`", file=sys.stderr)
+        return 2
+    status = git_out(root, "status", "--porcelain", "--untracked-files=no")
+    commit = (git_out(root, "rev-parse", "HEAD") or "").strip()
+    target = map_path(root)
+    if status is None or not commit or target is None:
+        print("affected-tests: карта не собрана — git не ответил", file=sys.stderr)
+        return 2
+    if status.strip():
+        print(
+            "affected-tests: карта не собрана — в рабочей копии незакоммиченные правки: карта "
+            "описывает коммит",
+            file=sys.stderr,
+        )
+        return 2
+    has_main = git_out(root, "rev-parse", "--verify", "-q", MAINLINE) is not None
+    if has_main and git_out(root, "merge-base", "--is-ancestor", "HEAD", MAINLINE) is None:
+        print(
+            f"affected-tests: карта не собрана — HEAD не из {MAINLINE}. Карта общая для всех "
+            f"рабочих копий: её собирают в главном чекауте на свежем `main`, не в сессии тикета",
+            file=sys.stderr,
+        )
+        return 2
+    files = tracked(root)
+    tests = sorted(f for f in files if matches(f, conf["tests"]))
+    work = Path(tempfile.mkdtemp(prefix="affected-map-"))
+    try:
+        site, out = work / "site", work / "trace"
+        site.mkdir()
+        out.mkdir()
+        (site / "sitecustomize.py").write_text(TRACER, encoding="utf-8")
+        paths = [str(site), *filter(None, [os.environ.get("PYTHONPATH")])]
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(paths), TRACE_DIR_ENV: str(out)}
+        began = time.monotonic()
+        code = run_tests(conf["run"], tests, None, env)
+        if code != 0:
+            print(f"affected-tests: прогон красный (код {code}) — карта не записана", flush=True)
+            return code
+        data = {
+            "version": MAP_VERSION,
+            "commit": commit,
+            "built": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "seconds": round(time.monotonic() - began),
+            "tests": merge_traces(root, out, files),
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    missing = [t for t in tests if t not in data["tests"]]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(target)
+    print(
+        f"affected-tests: карта записана — {target}; коммит {commit[:12]}, тестов "
+        f"{len(data['tests'])}"
+        + (f"; без записей (идут всегда): {' '.join(missing)}" if missing else ""),
+        flush=True,
+    )
+    return 0
+
+
+def select_map(root: Path, files: list[str], changed: list[str], conf: dict) -> list[str]:
+    """Отбор по карте: тест идёт, если он изменён, если его нет в карте, если правка задела
+    функцию, которую он выполнял (или код модуля, который он грузил), или файл, который он
+    прочёл или запустил. Правки — файлы `changed` и всё, что основная ветка изменила после
+    сборки карты (до точки ответвления), каждый файл — от версии карты до рабочей копии: старая
+    карта отбирает шире, а не промахивается. Карты нет или её коммита нет в репозитории — отбор
+    по именам, с предупреждением."""
+    data, why = load_map(root)
+    if data is None:
+        print(
+            f"affected-tests: {why} — отбор по именам. Карту собирает владелец или служба в "
+            "главном чекауте на свежем `main` (`affected-tests --build-map`); сессия тикета её не "
+            "собирает",
+            file=sys.stderr,
+        )
+        return select_names(root, files, changed, conf)
+    base = data["commit"]
+    # Правки основной ветки после карты — дифф до точки, где от неё отошла ветка; правки самой
+    # ветки — файлы `changed` (в тестах исправлений — только файлы починки). Основной ветки нет —
+    # весь дифф от карты до рабочей копии.
+    fork = (git_out(root, "merge-base", "HEAD", MAINLINE) or "").strip()
+    since_args = [base, fork] if fork else [base]
+    since = (git_out(root, "diff", "--name-only", "--no-renames", "-z", *since_args) or "").split(
+        "\0"
+    )
+    behind = (git_out(root, "rev-list", "--count", f"{base}..HEAD") or "?").strip()
+    print(
+        f"affected-tests: отбор по карте коммита {base[:12]} от {data.get('built', '?')[:10]}; "
+        f"коммитов после неё: {behind} (их правки — в отборе)",
+        file=sys.stderr,
+    )
+    every = sorted({f for f in [*changed, *since] if f})
+    scopes: dict[str, set[str] | str | None] = {}
+    for rel in every:
+        old = git_out(root, "show", f"{base}:{rel}")
+        try:
+            new = (root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            new = None
+        if old is None:
+            scopes[rel] = None  # новый файл: старый код его не знает
+        elif new is None:
+            scopes[rel] = ALL
+        elif old == new:
+            scopes[rel] = SAME
+        elif python_text(rel, old):
+            scopes[rel] = changed_scopes(old, new)
+        else:
+            scopes[rel] = ALL
+    tests = sorted(f for f in files if matches(f, conf["tests"]))
+    dirs = {PurePosixPath(t).parent for t in tests}
+    traced = {f for e in data["tests"].values() for f in e["code"]}
+    own = {plain(name_of(PurePosixPath(p))) for p in changed}
+    changed_set = set(changed)
+    chosen = []
+    for test in tests:
+        # Изменён веткой — идёт; изменён основной веткой после карты — по общим правилам ниже.
+        if test in changed_set and scopes.get(test) != SAME:
+            chosen.append(test)
+            continue
+        if matches(test, conf["slow"]):
+            if slow_own(test, own):
+                chosen.append(test)
+            continue
+        relevant = paused_filter(test, every, conf)
+        if relevant is None:
+            continue
+        entry = data["tests"].get(test)
+        if entry is None or any(touches(root, test, entry, f, scopes[f]) for f in relevant):
+            chosen.append(test)
+            continue
+        helpers = [f for f in relevant if is_helper(f, scopes[f], dirs, tests, traced)]
+        if helpers and helper_named(root, test, entry, helpers, dirs):
+            chosen.append(test)
+    return chosen
+
+
+def is_helper(rel: str, scope, dirs: set, tests: list[str], traced: set) -> bool:
+    """Изменённый помощник тестов без трассировки: файл в каталоге тестов, не тест, и ни один
+    тест не выполнял его код (поддельная команда за обёрткой оболочки). Трассированный помощник
+    идёт по карте, как прочий код."""
+    return (
+        scope != SAME
+        and PurePosixPath(rel).parent in dirs
+        and rel not in tests
+        and rel not in traced
+    )
+
+
+def helper_named(root: Path, test: str, entry: dict, helpers: list[str], dirs: set) -> bool:
+    """Помощник тестов (файл в каталоге тестов, не тест) — ещё и по имени: поддельные команды
+    идут через обёртку оболочки с `-S -E`, без трассировки. Имя ищется в тексте теста и модулей
+    сцены из каталога тестов, которые тест выполнял (`orch_scene.py`)."""
+    texts = [read(root, test)]
+    texts += [read(root, f) for f in entry["code"] if PurePosixPath(f).parent in dirs]
+    names = [
+        re.compile(rf"(?<![\w-]){re.escape(name_of(PurePosixPath(h)))}(?![\w-])") for h in helpers
+    ]
+    return any(n.search(text) for n in names for text in texts)
+
+
+def touches(root: Path, test: str, entry: dict, rel: str, scope) -> bool:
+    if scope == SAME:
+        return False
+    if scope is None:  # новый файл — по имени в тексте теста, как в отборе по именам
+        return name_of(PurePosixPath(rel)) in read(root, test)
+    code = entry["code"].get(rel)
+    if rel in entry["read"]:
+        return True  # тест читает файл текстом: задевает любая правка текста
+    if scope == ALL:
+        if code or rel in entry["ran"]:
+            return True
+        # Файл не Python (документ, настройки, шаблон): его могла прочесть не трассируемая
+        # программа (git, оболочка) — ещё и по имени в тексте теста, как в отборе по именам.
+        return not python_text(rel, "") and name_of(PurePosixPath(rel)) in read(root, test)
+    if DOC in scope and rel in entry["ran"]:
+        return True
+    if code:
+        return bool(scope & set(code))
+    return rel in entry["ran"]
+
+
+def paused_filter(test: str, changed: list[str], conf: dict) -> list[str] | None:
+    """Сцены пути на паузе (`paused`) задевает только правка их кода (`paused-code`): прочие
+    изменённые файлы для них не в счёт; задетого своего кода нет — None, тест не идёт."""
+    if not matches(test, conf["paused"]):
+        return changed
+    own = [c for c in changed if matches(c, conf["paused-code"])]
+    return own or None
+
+
+def write_out(changed: list[str], tests: list[str]) -> None:
+    out = os.environ.get(OUT_ENV)
+    if not out:
+        return
+    try:
+        Path(out).write_text(
+            json.dumps({"files": changed, "tests": tests}, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"affected-tests: отбор не записан в {out}: {exc}", file=sys.stderr)
+
+
+def stop_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)  # вся группа: внуки прогона тоже
+    except OSError:
+        pass
+
+
+def run_tests(
+    argv: list[str], chosen: list[str], limit: float | None, env: dict | None = None
+) -> int:
+    """Прогон своей группой процессов (предел — по всей группе). SIGTERM, SIGINT и SIGHUP самому
+    скрипту (`run-log` при остановке, предел проверки пути v2) гасят и прогон: сиротой он
+    менял бы рабочую копию после итога. Обработчик — до строки «отобрано» и до запуска."""
+    running: list[int] = []
+    stopped: list[int] = []  # сигнал пришёл, пока прогон запускался: его гасит код после запуска
+
+    def forward(signum, _frame):
+        stopped.append(signum)
+        if not running:
+            return
+        stop_group(running[0])
+        os._exit(128 + signum)  # без `wait` внутри обработчика: он прервал `wait` прогона
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, forward)
+    print(f"affected-tests: отобрано {len(chosen)}: {' '.join(chosen)}", flush=True)
+    proc = subprocess.Popen([*argv, *chosen], start_new_session=True, env=env)
+    running.append(proc.pid)
+    if stopped:
+        stop_group(proc.pid)
+        os._exit(128 + stopped[0])
+    try:
+        return proc.wait(timeout=limit)
+    except subprocess.TimeoutExpired:
+        stop_group(proc.pid)
+        proc.wait()
+        print(
+            f"affected-tests: предел времени отбора {limit:g} с превышен — прогон остановлен. "
+            "Долгие тесты — пометить медленными (`slow:` блока ```affected-tests профиля): их "
+            "гоняет CI, а отбор — только при правке их самих",
+            flush=True,
+        )
+        return TIMEOUT_CODE
+
+
+# --- задетые документы (`--docs`, #512) ---
+
+DOCS_BLOCK = re.compile(r"^```affected-docs[ \t]*\n(.*?)^```", re.M | re.S)
+DOCS_KEYS = ("docs", "tutorial")
+
+
+def parse_docs(text: str | None) -> dict | None:
+    """Настройки блока ```affected-docs: `docs` — шаблоны документов механизма, `tutorial` —
+    учебник отдельной строкой (владелец включает или убирает его одной строкой). Блока нет —
+    None: документы маршрут не называет; так же — блок без шаблонов (все строки закомментированы).
+    Строка не `ключ: значение`, ключ незнакомый или
+    заглушка шаблона (`<…>`) — `SettingsError`."""
+    block = DOCS_BLOCK.search(text or "")
+    if not block:
+        return None
+    conf: dict[str, list[str]] = {key: [] for key in DOCS_KEYS}
+    for key, _, words in block_lines(block.group(1), "affected-docs", DOCS_KEYS):
+        conf[key] = words
+    return conf if conf["docs"] or conf["tutorial"] else None
+
+
+def read_docs_settings(root: Path, profile: Path = PROFILE) -> dict | None:
+    return parse_docs(profile_text(root, profile))
+
+
+# Имя файла справа от упоминания не продолжается: `-`, `_`, буква или расширение документа
+# (`ticket` — не `ticket.md`); `ticket_ship.py` и `ticket_ship.pr_body` — упоминание.
+DOC_SUFFIX = r"\.(?:md|html?|txt|json|toml|ya?ml)\b"
+
+
+def mention_names(changed: list[PurePosixPath], files: list[str]) -> list[str]:
+    """Как документ называет изменённые файлы: имя (`name_of`), а если такое имя у нескольких
+    файлов рабочей копии (`README.md`, `SKILL.md`, `profile.md`) — с каталогом
+    (`decisions/README.md`, `ship/SKILL.md`): общее имя назвало бы почти все документы."""
+    count: dict[str, int] = {}
+    for rel in files:
+        key = name_of(PurePosixPath(rel))
+        count[key] = count.get(key, 0) + 1
+    names = set()
+    for path in changed:
+        name = name_of(path)
+        if not name:
+            continue
+        if count.get(name, 0) > 1 and path.parent != PurePosixPath("."):
+            name = f"{path.parent.name}/{name}"
+        names.add(name)
+    return sorted(names)
+
+
+def select_docs(root: Path, changed: list[str], conf: dict) -> list[str]:
+    """Задетые документы (#512): документ из шаблонов `docs` и `tutorial` идёт, если ветка
+    изменила его сама или он называет изменённый файл — тем же именем, что отбор тестов по
+    именам (у кода — без расширения, у прочих — целиком; общее имя — с каталогом), но целым
+    словом. Без шага импортов: документ описывает файл, который называет, а грузящих общий
+    модуль — почти все скрипты, и отбор вырос бы до всех документов. Изменённые документы других
+    документов не задевают (ссылки README и «см. также» — не описание). Удалённый файл — в счёт:
+    документ, который его называет, устарел."""
+    patterns = conf["docs"] + conf["tutorial"]
+    files = tracked(root)
+    docs = sorted(f for f in files if matches(f, patterns))
+    changed_set = set(changed)
+    others = [PurePosixPath(p) for p in changed if p and not matches(p, patterns)]
+    names = mention_names(others, files)
+    if not names:
+        return [d for d in docs if d in changed_set]
+    alt = "|".join(re.escape(n) for n in names)
+    found = re.compile(rf"(?<![\w-])(?:{alt})(?![\w-]|{DOC_SUFFIX})")
+    return [d for d in docs if d in changed_set or found.search(read(root, d))]
+
+
+def main_docs(argv: list[str]) -> int:
+    """`--docs ФАЙЛ…` — задетые документы, по строке на документ; блока ```affected-docs нет —
+    пусто, код 0."""
+    root = Path.cwd()
+    try:
+        conf = read_docs_settings(root)
+        chosen = select_docs(root, [a for a in argv if a], conf) if conf else []
+    except SettingsError as exc:
+        print(f"affected-tests: задетые документы: {exc}", file=sys.stderr)
+        return 2
+    if chosen:
+        print("\n".join(chosen))
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] == ["--docs"]:
+        return main_docs(argv[1:])
+    only_list = bool(argv) and argv[0] == "--list"
+    changed = [a for a in (argv[1:] if only_list else argv) if a]
+    root = Path.cwd()
+    try:
+        conf = read_settings(root)
+    except SettingsError as exc:
+        print(f"affected-tests: {PROFILE}: {exc}", file=sys.stderr)
+        return 2
+    if argv[:1] == ["--build-map"]:
+        try:
+            return build_map(root, conf)
+        except SettingsError as exc:
+            print(f"affected-tests: карта не собрана — {exc}", file=sys.stderr)
+            return 2
+    try:
+        chosen = select(root, changed, conf)
+    except SettingsError as exc:
+        print(f"affected-tests: отбор не сделан — {exc}", file=sys.stderr)
+        return 2
+    write_out(changed, chosen)
+    if only_list:
+        print("\n".join(chosen))
+        return 0
+    if not chosen:
+        print(f"affected-tests: задетых тестов нет (изменённых файлов: {len(changed)})")
+        return 0
+    if not conf["run"]:
+        print(
+            f"affected-tests: {PROFILE}: в блоке ```affected-tests нет `run` — нечем гонять "
+            "отобранные тесты",
+            file=sys.stderr,
+        )
+        return 2
+    return run_tests(conf["run"], chosen, conf["limit"])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

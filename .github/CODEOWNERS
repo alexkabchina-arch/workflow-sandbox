@@ -22,15 +22,27 @@
 # файла — под одобрением весь профиль.
 /docs/agents/profile.md         @alexkabchina-arch
 
+# Проектная часть процесса, которую называет `AGENTS.md`: трекер (правила агенту, блок владений)
+# и метки.
+/docs/agents/issue-tracker.md   @alexkabchina-arch
+/docs/agents/triage-labels.md   @alexkabchina-arch
+
 # Правила агенту — `CLAUDE.md` и `AGENTS.md` на любой глубине (Claude Code читает и вложенные,
 # аудит Fable 2.1.6, #61).
 CLAUDE.md                       @alexkabchina-arch
 CLAUDE.local.md                 @alexkabchina-arch
 AGENTS.md                       @alexkabchina-arch
 
-# Обязательный раздел `CLAUDE.md` — файл канона, подключённый импортом (#144): правило агенту,
-# как сам `CLAUDE.md`, хоть его содержимое и сверяет `.canon.lock`.
+# Эталоны канона: часть воркфлоу в `AGENTS.md` (между метками `canon:process`) и блоки владений
+# `docs/agents/issue-tracker.md` — правила агенту, как сам `AGENTS.md`, хоть их содержимое и
+# сверяют `check_lock` и хук перед коммитом.
 /.claude/canon/                 @alexkabchina-arch
 
 # Инструмент проверки и карта функций для `/verify` пути v2 (спека воркфлоу #329, #351).
 /tools/verify/                  @alexkabchina-arch
+
+# Конфиг сборки тестов: через него тесты можно пропустить или ослабить (#355).
+conftest.py                     @alexkabchina-arch
+pytest.ini                      @alexkabchina-arch
+tox.ini                         @alexkabchina-arch
+noxfile.py                      @alexkabchina-arch

@@ -6,7 +6,7 @@
 раз не оплачивается, в `/tmp` ничего не копится. Пишет его только скрипт (атомарной заменой):
 изоляция worktree приложения не даёт агенту писать вне своего worktree (прогон B0).
 
-**Ответы агента** — файлы в `.ticket/` корня worktree тикета (`Write` внутри worktree); каталог
+**Ответы агента** — файлы в `.ticket/` корня worktree тикета (запись файла внутри worktree); каталог
 исключён из git через `info/exclude` общего каталога, в коммиты не попадает.
 
 **Задание** — шаг с суждением: заголовок, текст, команды строками `  ▶ <команда>` и последняя
@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -40,14 +41,17 @@ TURN, DONE, STOPPED = "ход агента", "готово", "остановка
 # Конец сессии под оркестратором (#214): ветка готова к его ревью или к отметке.
 READY = "код готов"
 AGENT, OWNER, CI, ORCHESTRATOR = "агент", "владелец", "CI", "оркестратор"
-# Bash агента по умолчанию обрывает команду через 2 минуты; долгие шаги — с таймаутом 45 минут.
-LONG_CALL = "обычный Bash, не в фоне, timeout 2700000"
+# Вызов команды агента (Bash у Claude Code) по умолчанию обрывается через 2 минуты; долгие шаги —
+# с таймаутом 45 минут. Без имени инструмента и без скобок: задание читает любой агент, а
+# константа стоит внутри скобок задания (#453). Таймаут — параметр вызова, не команда `timeout`.
+LONG_CALL = "команда не в фоне, таймаут вызова 45 минут = 2700000 мс"
 NOT_SIMPLE = re.compile(r"[$`'\"\n;&|<>]|\bcd\b")
 # Шаги маршрута для заданий и `ticket status`; шаг модуля, которого здесь нет, — своим именем.
 STEP_NAMES = {
+    "checks": "допуск",
     "review": "ревью ошибок",
     "findings": "разбор",
-    "checks": "тесты и линтеры",
+    "retest": "тесты исправлений",
     "verify": "/verify",
     "sync": "догон базы",
     "body": "тело PR",
@@ -62,6 +66,10 @@ ASK_MARK = "<!-- canon-ticket-ask {stamp} -->"
 CHECKS_BLOCK = re.compile(r"^```checks[ \t]*\n(.*?)^```", re.M | re.S)
 # Быстрые проверки пути v2 (#338): хук на коммите в песочнице; `format` правит, прочие блокируют.
 FAST_CHECKS_BLOCK = re.compile(r"^```fast-checks[ \t]*\n(.*?)^```", re.M | re.S)
+# Аргумент `{files}` проверки (#464, как у пути v2 — `v2/checks.py`): файлы диффа ветки с
+# `origin/main`, `{files:шаблоны}` — только подходящие (через запятую).
+FILES_ARG = re.compile(r"^\{files(?::([^}]*))?\}$")
+AFFECTED_OUT = "CANON_AFFECTED_OUT"  # куда команда задетых тестов пишет свой отбор (#464)
 # Профиль до блока `checks` (проекты на каноне до #154): строки таблицы «Команды».
 TABLE_CHECKS = {"Тесты": "tests", "Линтер": "lint", "Формат (проверка)": "format"}
 TABLE_ROW = re.compile(r"^\|\s*([^|]+?)\s*\|\s*`([^`]+)`\s*\|", re.M)
@@ -94,11 +102,12 @@ def elapsed(since: str | None) -> str:
 
 
 def run(
-    *cmd: str, cwd: Path | None = None, timeout: float | None = None
+    *cmd: str, cwd: Path | None = None, timeout: float | None = None, env: dict | None = None
 ) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
         cwd=cwd,
+        env=env,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -157,6 +166,8 @@ REPORT_MARK = "Отчёт об остановке"
 # Ответ владельца из чата, переданный сессией в тикет (`ticket ask`): помечен, чтобы не
 # прочитаться вторым ответом. Решение о `/verify` из чата не передаётся (#249).
 REPLY_MARK = "<!-- canon-ticket-reply -->"
+# Форма ответа владельца из правил координатора (#498): «Ответ владельца: «…»».
+OWNER_REPLY = re.compile(r"Ответ владельца: «.*»", re.S)
 # Режим маршрута «под оркестратором» (#214): флаг окружения от оркестратора. Сессия кончается на
 # «код готов» или на вопросе; ревью ошибок, отметку, авто-мёрж, ожидание и уборку делает он.
 ORCHESTRATED = "CANON_ORCHESTRATOR"
@@ -165,6 +176,20 @@ ORCHESTRATED = "CANON_ORCHESTRATOR"
 PROD_COPY = "CANON_PROD_COPY"
 # Ответ оркестратора на запрос свежей копии прода (`ticket fresh`) — файл рядом с состоянием.
 FRESH_ANSWER = "fresh.json"
+# Своя сессия `session-run` (#452): случайная метка, которую `session-run` после своего старта
+# пишет в файл замка worktree (`SESSION_LOCK` личного каталога git) и передаёт `claude`
+# окружением. Совпали — `ticket start` внутри этой сессии подготовку не повторяет.
+SESSION_LOCK = "canon-session.lock"
+SESSION_MARK = "CANON_SESSION_MARK"
+
+
+def session_mark() -> str | None:
+    """Метка из файла замка этого worktree; файла нет или он пуст — None."""
+    lock = Path(git("rev-parse", "--path-format=absolute", "--git-dir")) / SESSION_LOCK
+    try:
+        return lock.read_text(encoding="utf-8").strip() or None
+    except (OSError, ValueError):  # нечитаемый файл — не своя сессия: старт проверит сам
+        return None
 
 
 def orchestrated() -> bool:
@@ -212,6 +237,20 @@ ORCHESTRATED_ASK = (
     "сделать), «Сделано» (что уже готово), «Доступно» (варианты, что будет при каждом, "
     "рекомендация)."
 )
+
+
+# Поправки ручного пути к концу `/implement` Мэтта (#453; решение владельца 30.10 о проверках,
+# #450): копия скилла не правится — правила в задании `/start` и в задании после ответа. Под
+# оркестратором — свои (`ORCHESTRATED_TASK` в `ticket_start`).
+MANUAL_END = """- полный набор тестов в конце `/implement` не гонять: в маршруте его нет — только
+  CI на PR и ночной прогон (у самого воркфлоу, пока его CI выключен, — ночная служба и
+  выпуск); `ticket ship` до ревью гоняет допуск — быстрые проверки хука и задетые тесты по
+  профилю; по ходу — тесты, задетые правкой;
+- порядок конца: сначала коммит, затем самопроверка скиллом Мэтта `code-review`
+  (`.claude/skills/code-review/SKILL.md`, оси Spec и Standards; не встроенное ревью ошибок —
+  его ведёт `ticket ship`): точка — основная ветка (`origin/main`), спека — тикет #{n}; до
+  коммита ей нечего смотреть; её находки по делу — исправить следующим коммитом, сверх тикета
+  молча не править (запахи — на усмотрение);"""
 
 
 def until() -> str:
@@ -279,6 +318,75 @@ def trusted(
     return _app_comments[key]
 
 
+# Отчёт об остановке узнаётся по началу (разметка заголовка впереди не мешает); сигнал перерасхода
+# `ship-finish` («ready-for-human: …») — служебный, не ответ.
+REPORT_HEAD = re.compile(r"^[#*\s]*" + REPORT_MARK)
+SIGNAL = "ready-for-human: "
+ANSWERS_SHOWN = 5
+
+
+def open_pr(branch: str) -> dict | None:
+    """Открытый PR ветки (номер, ссылка, черновик ли) или None."""
+    fields = ["--state", "open", "--json", "number,url,isDraft"]
+    prs = gh_json("pr", "list", "--head", branch, *fields) or []
+    return prs[0] if prs else None
+
+
+def after_report(n: int, branch: str, pr: dict | None | bool = True) -> list[dict]:
+    """Комментарии тикета и открытого PR ветки после последнего отчёта об остановке в каждом:
+    граница — сам отчёт, не часы машины. Где отчёта нет — оттуда ничего. Отчёт — только от
+    своих (`trusted`), как у Stop-хука и `session-start`: «Отчёт об остановке» постороннего
+    сдвинул бы границу за решение владельца (#249). Скрытый свой отчёт — тоже граница:
+    владелец прячет отработанный отчёт, а остановка от этого не раньше. Сбой сверки автора
+    — `Failure`: «не свой» молча пропустил бы ответ. `pr` — открытый PR ветки, если его уже
+    нашёл вызывающий (None — нет); по умолчанию — `open_pr`."""
+    if pr is True:
+        pr = open_pr(branch)
+    sources = [("issue", str(n))] + ([("pr", str(pr["number"]))] if pr else [])
+    found = []
+    for kind, ref in sources:
+        said = (gh_json(kind, "view", ref, "--json", "comments") or {}).get("comments") or []
+        at = next(
+            (
+                i
+                for i in reversed(range(len(said)))
+                if REPORT_HEAD.match(said[i].get("body") or "") and trusted(said[i], strict=True)
+            ),
+            None,
+        )
+        if at is not None:
+            found += said[at + 1 :]
+    return found
+
+
+def report_answers(comments: list[dict]) -> list[dict]:
+    """Ответы владельца на отчёт об остановке среди комментариев после него (#459, слабое
+    место 8): участник репозитория, не скрытый; не служебный маршрута и не сигнал
+    перерасхода — кроме ответа из чата, переданного сессией (`REPLY_MARK`): он тоже голос
+    владельца. App (сессия, оркестратор) — свой, но не ответ (#214). По времени."""
+    found = []
+    for c in sorted(comments, key=lambda c: c.get("createdAt") or ""):
+        body = (c.get("body") or "").strip()
+        if c.get("isMinimized") or not member(c) or not body:
+            continue
+        if REPLY_MARK in body or (is_answer(body) and not body.startswith(SIGNAL)):
+            found.append(c)
+    return found
+
+
+def quoted_answers(answers: list[dict]) -> str:
+    """Ответы цитатой со ссылкой — последние `ANSWERS_SHOWN`: строка ответа не станет командой
+    задания."""
+    shown = answers[-ANSWERS_SHOWN:]
+    parts = [
+        f"{c.get('url') or 'комментарий'}:\n{quote(c['body'].replace(REPLY_MARK, '').strip())}"
+        for c in shown
+    ]
+    if len(answers) > len(shown):
+        parts.append(f"(ранних ответов не показано: {len(answers) - len(shown)})")
+    return "\n\n".join(parts)
+
+
 def keep(st, path: Path, name: str) -> None:
     """Файл ответа агента — в каталог состояния `st`: в worktree он не повторится на новом круге."""
     if path.exists():
@@ -286,10 +394,35 @@ def keep(st, path: Path, name: str) -> None:
         path.replace(st.dir / name)
 
 
+# Метка триажа «можно брать» (`docs/agents/triage-labels.md`): тикет, который ждёт человека
+# (`ready-for-human` — вопрос или отчёт об остановке), её не держит (#500).
+READY_FOR_AGENT = "ready-for-agent"
+
+
+def untriage(number: int) -> str:
+    """Снять с тикета `READY_FOR_AGENT`, если она есть. Сбой `gh` не держит вопрос или отчёт:
+    итог — примечание для задания (пусто — всё снято или снимать нечего)."""
+    try:
+        issue = gh_json("issue", "view", str(number), "--json", "labels") or {}
+        if any(lb.get("name") == READY_FOR_AGENT for lb in issue.get("labels") or []):
+            gh("issue", "edit", str(number), "--remove-label", READY_FOR_AGENT)
+    except Failure as exc:
+        return f"\n(Метку {READY_FOR_AGENT} снять не удалось: {exc} — сними руками.)"
+    return ""
+
+
 def relay_reply(number: int, reply: str) -> str:
     """Ответ владельца из чата (`.ticket/reply.md`) — комментарием в тикет; ссылка на него (`gh`
-    её печатает) или «тикет #N»."""
-    body = f"{REPLY_MARK}\n**Ответ владельца из чата** (передан сессией)\n\n{reply}"
+    её печатает) или «тикет #N». Форма — «Ответ владельца: «…»», как правила координатора
+    называют ответ владельца (#498): второй комментарий не нужен. Ответ уже в этой форме не
+    оборачивается второй раз. Ответ в несколько строк или со ссылкой — кавычки отдельными
+    абзацами: Markdown ответа не ломается, и «»» не прилипнет к ссылке. Строка после ответа
+    говорит, что его передала сессия: под учёткой владельца это не его собственный комментарий."""
+    text = mask(reply.strip())
+    if not OWNER_REPLY.fullmatch(text):
+        inline = "\n" not in text and "://" not in text
+        text = f"Ответ владельца: «{text}»" if inline else f"Ответ владельца: «\n\n{text}\n\n»"
+    body = f"{REPLY_MARK}\n{text}\n\n_Передан сессией тикета из чата._"
     posted = gh("issue", "comment", str(number), "--body", body)
     return posted.splitlines()[0] if posted else f"тикет #{number}"
 
@@ -315,7 +448,7 @@ def quote(text: str) -> str:
 
 
 def pending(question: dict) -> str:
-    """Начало задания, пока вопрос `ticket ask` ждёт ответа (`ticket start`, `ticket ship`; #196):
+    """Начало задания, пока вопрос `ticket ask` ждёт ответа (`ticket ship`; #196):
     вопрос владельцу в чат полным текстом из состояния, как в `ticket ask`, — владелец отвечает
     там, не открывая GitHub. У вопроса, заданного до #194, текста в состоянии нет —
     к комментарию."""
@@ -323,7 +456,8 @@ def pending(question: dict) -> str:
     if text := question.get("text"):
         return (
             f"Вопрос владельцу ждёт ответа: {url}. Владельцу в чат — этот вопрос полным текстом "
-            f"и ссылка на него, обычным сообщением, без `AskUserQuestion`:\n\n{quote(text)}\n\n"
+            f"и ссылка на него, обычным сообщением, не формой выбора (AskUserQuestion):\n\n"
+            f"{quote(text)}\n\n"
         )
     return (
         f"Вопрос владельцу ждёт ответа: {url}. Владельцу в чат — вопрос полным текстом, с "
@@ -520,6 +654,35 @@ def parse_checks(text: str, profile) -> list[tuple[str, list[str]]]:
     return block_lines(block.group(1), profile, "checks")
 
 
+def branch_files(base: str = "origin/main") -> list[str]:
+    """Изменённые файлы ветки — дифф `base...HEAD`, как у пути v2 (`v2/doctor.py`): добавленные,
+    изменённые, переименованные; удалённых нет — линтер на них упал бы."""
+    out = git("diff", "--name-only", "--diff-filter=ACMR", "-z", f"{base}...HEAD")
+    return [p for p in out.split("\0") if p]
+
+
+def expand_files(argv: list[str], files: list[str]) -> list[str] | None:
+    """`{files}` и `{files:шаблоны}` в команде проверки — файлы ветки; подходящих нет — None
+    (проверка пропускается), как у пути v2."""
+    out = []
+    for arg in argv:
+        m = FILES_ARG.match(arg)
+        if not m:
+            out.append(arg)
+            continue
+        patterns = [p.strip() for p in (m[1] or "").split(",") if p.strip()]
+        chosen = [
+            f
+            for f in files
+            if not patterns
+            or any(fnmatch.fnmatch(f, p) or fnmatch.fnmatch(Path(f).name, p) for p in patterns)
+        ]
+        if not chosen:
+            return None
+        out += chosen
+    return out
+
+
 def fast_checks(text: str, profile) -> list[tuple[str, list[str]]] | None:
     """Быстрые проверки пути v2 из блока ```fast-checks профиля (#338): строки `имя: команда`, как
     у ```checks; `format` — форматер, правит файлы сам. Блока нет — None."""
@@ -586,12 +749,119 @@ def without_secret_fields(text: str) -> str:
     return "\n".join(kept)
 
 
+# Маска секретов в тексте для GitHub (#446; #287 п. 5, #294 п. 3) — общая для отчёта об остановке
+# и вопроса владельцу. Пароль в адресе — при любом символе перед схемой (`DB_URL_postgresql://…`,
+# `Ошибкаpostgresql://…`) и при `@` в логине: пароль — до последнего `@` слова (в нём бывают `/`
+# и `@`; лишнее под маской не вредит). Схема начинается не внутри схемы (`(?<!…)`): иначе длинное
+# слово без `://` проверялось бы с каждой буквы — квадратичное время на длинной строке лога.
+URL_PASSWORD = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*://[^\s/:]*:)\S+(@)")
+# Запись `ИМЯ: значение`, `ИМЯ=значение`, `"имя": "значение"` с именем секрета; значение — в
+# кавычках целиком (с пробелами) или до пробела, со схемой `Bearer`/`Basic`/`Token` впереди.
+# Значение — в просмотре вперёд: запись с несекретным именем (`Error: GH_TOKEN=…`) его не
+# забирает, и секретная запись внутри найдётся. Имя — не продолжение слова и не часть пути
+# (`config/token.py:12` — файл и строка, а не запись).
+SECRET_RECORD = re.compile(
+    r"""(?<![A-Za-z0-9_.\-/])(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\1[ \t]*[:=][ \t]*"""
+    r"""(?=("[^"\n]*"|'[^'\n]*'|(?:(?:Bearer|Basic|Token)[ \t]+)?[^\s"',;&]+))""",
+    re.I,
+)
+# Имя секрета: слово внутри имени (`PGPASSWORD`, `GH_TOKEN`; не `tokens`) или часть имени между
+# `_`, `-`, `.` (`api_key`, `KEY`, но не `monkey`, не `author`, не `pass`/`auth` итогов тестов).
+SECRET_WORDS = re.compile(
+    r"token(?!s)|secret|passw(?:or)?d|credential|authorization|dsn|apikey", re.I
+)
+SECRET_PARTS = frozenset({"key", "pwd", "pw", "cookie"})
+# Короткое число у имени `key` (`key: 3`) — итог, а не секрет; прочие числа (`DB_PWD=123456`,
+# `api_key=12345678`) — секрет. Файл и строка (`token.py:12`) — не запись.
+SMALL = re.compile(r"^\d{1,4}[).\]]*$")
+FILE_LINE = re.compile(r"\.[A-Za-z0-9]+$")
+# Токен после `Bearer`/`Basic` — похожий на токен: с цифрой, заглавной внутри или длинный
+# (`Basic dXNlcjpwYXNz` — да, `Basic functionality` — нет).
+BEARER = re.compile(r"\b(Bearer|Basic)([ \t]+)([A-Za-z0-9._~+/=-]{6,})", re.I)
+MASK = "***"
+
+
+def secret_name(name: str) -> bool:
+    return bool(SECRET_WORDS.search(name)) or any(
+        part.lower() in SECRET_PARTS for part in re.split(r"[_.-]", name)
+    )
+
+
+def mask(text: str) -> str:
+    """Текст без паролей и токенов: пароль в адресе, значения записей с именем секрета, токен
+    после `Bearer`/`Basic` — `***`. Строки без секретов не меняются."""
+    text = URL_PASSWORD.sub(rf"\1{MASK}\2", text)
+    hidden: list[tuple[int, int]] = []
+    for m in SECRET_RECORD.finditer(text):
+        name, value = m.group(2), m.group(3)
+        start = m.end()
+        if not secret_name(name) or value == MASK or (hidden and start < hidden[-1][1]):
+            continue
+        if SMALL.match(value) and (name.lower() == "key" or FILE_LINE.search(name)):
+            continue
+        hidden.append((start, start + len(value)))
+    for start, end in reversed(hidden):
+        text = text[:start] + MASK + text[end:]
+
+    def bearer(m: re.Match) -> str:
+        token = m.group(3)
+        if not re.search(r"\d|.[A-Z]", token) and len(token) < 20:
+            return m.group(0)
+        return f"{m.group(1)}{m.group(2)}{MASK}"
+
+    return BEARER.sub(bearer, text)
+
+
 def secrets_command(text: str | None, profile) -> list[str] | None:
     """Команда проверки `secrets` из текста профиля (#258); профиля или блока `checks` нет — None.
     Строка блока не разобрана — `Failure`: защитная проверка из-за опечатки не открывается молча."""
     if text is None or not CHECKS_BLOCK.search(text):
         return None
     return dict(parse_checks(text, profile)).get("secrets")
+
+
+SECRETS = "secrets"
+MAIN = "origin/main"
+
+
+def main_text(path, cwd: Path | None = None) -> str | None:
+    """Файл `path` (от корня) из основной ветки `origin/main`, а не из ветки тикета (#459): ветка
+    не уберёт проверку секретов из профиля и не поменяет её команду. Файла нет — None; нет
+    самой `origin/main` — `Failure`: «нет проверки» молча открыло бы push."""
+    if run("git", "rev-parse", "--verify", "-q", MAIN, cwd=cwd).returncode != 0:
+        raise Failure(f"нет {MAIN} — профиль основной ветки не прочитать (git fetch)")
+    listed = git("ls-tree", "--name-only", MAIN, "--", str(path), cwd=cwd)
+    if not listed:
+        return None
+    return git("show", f"{MAIN}:{path}", cwd=cwd) + "\n"
+
+
+def secrets_line(text: str | None, profile, block: str) -> list[str] | None:
+    """Команда `secrets` блока `block` (`checks` или `fast-checks`) текста профиля; нет — None."""
+    if text is None:
+        return None
+    if block == "fast-checks":
+        return dict(fast_checks(text, profile) or []).get(SECRETS)
+    return secrets_command(text, profile)
+
+
+def trusted_secrets(root: Path, profile, block: str = "checks") -> tuple[list[str] | None, str]:
+    """Команда `secrets` блока `block` и откуда она (#459): из профиля основной ветки
+    `origin/main` — ветка её не уберёт и не подменит («main»); там её нет — из профиля ветки
+    («branch»): ветка, которая проверку добавляет, — не тупик, и проверка лучше, чем никакой;
+    нет нигде — (None, «main», если профиль в основной ветке есть, иначе «»: первая установка
+    воркфлоу, профиль приносит сам PR). Политика одна для хука, допуска и `ship-finish`. Нет
+    `origin/main` или строка блока не разобрана — `Failure`."""
+    main = main_text(profile, root)
+    if (command := secrets_line(main, profile, block)) is not None:
+        return command, "main"
+    try:
+        own = (root / profile).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        own = None
+    if (command := secrets_line(own, profile, block)) is not None:
+        return command, "branch"
+    return None, "main" if main is not None else ""
 
 
 def canon_secrets(argv: list[str], here: Path) -> list[str]:
@@ -633,8 +903,9 @@ def emit(status: str, title: str, body: str = "", commands: tuple[str, ...] = ()
 
 # Владения и флаги брифа (`.claude/canon/ticket-ownership.md`): по ним оркестратор решает, какие
 # тикеты идут параллельно; тикеты с общим флагом параллельно не идут. Разбор общий (#289):
-# оркестратор строки читает, `ticket ship` пишет их в тикет техдолга по путям находок.
-FLAGS = ("миграция", "ядро", "экран")
+# оркестратор строки читает, `ticket ship` пишет их в тикет техдолга по путям находок. «Деньги»
+# (#354) — из блока v2 (`ticket-ownership-v2.md`); разбор общий для обоих путей.
+FLAGS = ("миграция", "ядро", "экран", "деньги")
 OWNS_LINE = re.compile(r"^\*\*Владения:\*\*(.*)$", re.M)
 FLAGS_LINE = re.compile(r"^\*\*Флаги:\*\*(.*)$", re.M)
 

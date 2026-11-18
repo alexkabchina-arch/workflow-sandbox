@@ -30,7 +30,7 @@ WARN, HOLD = 0.8, 0.95
 MULTIPLIERS = (("macos", 10), ("windows", 2))  # метка раннера → множитель; иначе Linux, 1
 # Только нужные поля: прогоны и задачи целиком — мегабайты JSON в сутки.
 RUN_FIELDS = ".workflow_runs[] | {id, event}"
-JOB_FIELDS = ".jobs[] | {started_at, completed_at, conclusion, labels}"
+JOB_FIELDS = ".jobs[] | {name, started_at, completed_at, conclusion, labels}"  # имя — метрикам
 
 if sum(BUDGET.values()) != TOTAL:
     raise ValueError(f"бюджет статей {sum(BUDGET.values())} ≠ {TOTAL}")

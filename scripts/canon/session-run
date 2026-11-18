@@ -27,7 +27,7 @@
   сессии (dev-сервер) и держали worktree занятым после её конца.
 
 - Под оркестратором (`CANON_ORCHESTRATOR=1` в окружении, #214) — всегда headless, флаг передаётся
-  `claude` и Stop-хуку, промпт — режим `/start N` вместо «`/implement`, затем `/ship`»: сессия
+  `claude` и Stop-хуку; промпт, как и у интерактивного запуска, — режим `/start N` (#452): сессия
   кончается на «код готов» или на вопросе. Ещё `--allowedTools` с командами маршрута своего
   тикета (`ROUTE_COMMANDS`, #308): их классификатор не проверяет — 22.10 он остановил тикет на
   `ticket ship N --again`. Правила `allow` настроек проекта в `claude -p` не действуют (папке не
@@ -83,6 +83,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -340,9 +341,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     held = []
+    # Метка своей сессии (#452) — только запуску после своего старта: на `--resume` подготовки с
+    # её проверками не было, и `/start N` пройдёт их сам.
+    mark = None if args.resume else secrets.token_hex(16)
 
     def claim(worktree: Path) -> None:
-        lock = session_start.take_lock(worktree)
+        lock = session_start.take_lock(worktree, mark)
         if lock is None:
             raise session_start.UsageError(f"в {worktree} уже идёт сессия — второй не запускаю")
         held.append(lock)
@@ -375,6 +379,9 @@ def main(argv: list[str] | None = None) -> int:
     # `--` перед промптом: вариадические флаги (`--allowedTools`, `--add-dir`) иначе съедят его.
     cmd += [*extra, "--", prompt]
     env = {**os.environ, "CANON_SESSION": plan["session"]}
+    env.pop(core.SESSION_MARK, None)
+    if mark is not None:
+        env[core.SESSION_MARK] = mark
     # Начало этого запуска для Stop-хука: `--resume` продолжает транскрипт прошлого, и отчёт об
     # остановке прошлого запуска иначе засчитался бы этому.
     env["CANON_RUN_STARTED"] = datetime.now(timezone.utc).isoformat(timespec="seconds")

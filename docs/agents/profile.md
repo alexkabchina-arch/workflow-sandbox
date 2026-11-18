@@ -36,11 +36,32 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 
 Все три проверки быстрые (секунды): вывод можно читать напрямую.
 
+Хук перед коммитом (`scripts/canon/hooks/commit_checks.py`) — команды блока ниже, по порядку:
+
+```fast-checks
+format: .venv/bin/ruff format .
+lint: .venv/bin/ruff check .
+conflicts: git diff --cached --check
+secrets: gitleaks git --pre-commit --staged --redact --no-banner -v
+```
+
+Окружение хука: `.venv` проекта (как поднять — выше) и `gitleaks` на PATH.
+
+Проверки допуска маршрута (`ticket ship`) и `ship-finish` — блок ниже, каждая через
+`scripts/canon/run-log`:
+
+```checks
+tests: .venv/bin/pytest -q
+lint: .venv/bin/ruff check .
+format: .venv/bin/ruff format --check .
+secrets: python3 scripts/canon/secrets
+```
+
 ## Ожидаемые job CI
 
 | Workflow | Job    | Что делает                            |
 | -------- | ------ | ------------------------------------- |
-| `CI`     | `test` | `check_lock` (`.canon.lock`), длина `CLAUDE.md` (предупреждение, не падает), gitleaks (секреты в коммитах), `ruff check`, `ruff format --check`, `pytest` на Python 3.12 с отчётом JUnit — артефакт `test-report-test` |
+| `CI`     | `test` | `check_lock` (`.canon.lock`; падает и на ручной правке части воркфлоу в `AGENTS.md`), `claude_md_length` (длина и размер `AGENTS.md`, метки части воркфлоу, `CLAUDE.md` — строка `@AGENTS.md`; только предупреждения, не падает), gitleaks (секреты в коммитах), `ruff check`, `ruff format --check`, `pytest` на Python 3.12 с отчётом JUnit — артефакт `test-report-test` |
 
 Запускается на `pull_request` и на push в `main`. Ночной и ручной полный прогон `main` — workflow
 `canon-mainline` (`.github/workflows/canon-mainline.yml`, ставит `canon-sync`, workflow#430): он
@@ -59,8 +80,10 @@ PR Dependabot сами не перестраиваются (`rebase-strategy: di
 ## Канон
 
 Файлы канона `alexkabchina-arch/workflow` (`scripts/canon/`, `.claude/settings.base.json`,
-`.claude/settings.json`) вендорятся через `canon-sync` и записаны в `.canon.lock`: руками не правятся,
-шаг `check_lock` в CI это ловит. Линтер проекта их не проверяет (`extend-exclude` и
+`.claude/settings.json`, скиллы `.claude/skills/` и `.agents/skills/` из канона) вендорятся через
+`canon-sync` и записаны в `.canon.lock`: руками не правятся,
+шаг `check_lock` в CI это ловит. Часть воркфлоу в `AGENTS.md` между метками `canon:process`
+сверяется с эталоном `.claude/canon/process.md` из замка — её тоже не править. Линтер проекта их не проверяет (`extend-exclude` и
 `force-exclude` в `pyproject.toml`): качество кода канона — забота CI канона, у которого свои
 настройки. Проектные добавки к настройкам Claude Code — в `.claude/settings.project.json` (могут
 только дополнять базу канона); после их правки — `canon-sync` той же версии.

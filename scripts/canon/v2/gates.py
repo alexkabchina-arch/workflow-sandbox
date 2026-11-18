@@ -3,7 +3,7 @@
 Слияние решает **допуск** — программа, а не модель: условия — список `CONDITIONS` в одном месте,
 у каждого отказа свой код причины (`CODES`). «Эта версия» — head PR, который сессия сдала «код
 готов» после разбора (догон основы на сервере, не задевший файлы тикета, — тоже она, с #348).
-Условия этого тикета и #352 (условие 4); 6 и 8 добавят #355 и #356:
+Условия этого тикета, #352 (условие 4), #355 (условие 6) и #356 (условие 8):
 
 1. `ci` — доверенный CI зелёный на этой версии (полный прогон после перевода из черновика);
    тесты ревьюера подтверждённых находок — в его отчёте по именам как пройденные;
@@ -21,10 +21,20 @@
 5. `fresh` — в ветке есть последняя основа. Отставшую ветку шаг CI догоняет на сервере раньше
    допуска (`v2/catchup.py`, #348); отказ — только если основа ушла между догоном и допуском,
    `agent:go` после него — догон на сервере (`catch_up` оркестратора);
+6. `claims` — изменения во «Владениях» снимка тикета или в белом списке общих документов
+   (`SHARED`); выход за них — строка «выход за «Владения»» карточки PR (`beyond`, не блокирует).
+   Файл диффа во «Владениях» идущего тикета (на месте или ждёт ответа владельца) — отказ
+   `чужие-владения`. Путь-ограничитель (`CODEOWNERS` основы, `v2/intake.py`) — только с
+   разрешения владельца: `agent:as-is` на замечании проверки постановки о нём или `agent:go`
+   после отказа `путь-ограничитель` (разрешает файлы этого отказа);
 7. `weakening` — ослабления защиты, найденного ревью, нет или по нему есть решение разбора
-   («ослабление — …»): ослабление, которого тикет не просит, блокирует.
+   («ослабление — …»): ослабление, которого тикет не просит, блокирует;
+8. `limits` — деньги и время в пределах (`v2/limits.py`, #356): расход попытки не больше предела
+   тикета, каждый запуск роли попытки по журналу событий — не больше пределов своей роли (время,
+   ходы, USD). Превышение, принятое владельцем (`agent:go` после стопа по пределу роли или после
+   отказа `предел-превышен`), — не отказ.
 
-Порядок — шаг CI (`orch.ci` с этим объектом): условия 2, 3, 4, 5, 7 (`admit`) → перевод PR из
+Порядок — шаг CI (`orch.ci` с этим объектом): условия 2–8 (`admit`) → перевод PR из
 черновика → полный CI → условие 4 PR из `.github/` и документов (`proved`) и 1 (`trusted`) →
 отметка `review` и авто-мёрж режимом `ship-finish --mark`. Красный полный CI — PR снова черновик
 (`give_back` оркестратора): починка без CI, с проверкой в песочнице; полный CI — при следующем
@@ -38,7 +48,7 @@ PR на пути-ограничители ждёт одобрения CODEOWNERS
 Отказ — отчёт об остановке с кодом, строка «Требует внимания» карточки PR, PR — черновик; что
 сделает `agent:go` — `GO` по коду, совет и риск — `ADVICE` (четвёртый раздел отчёта, #347).
 Флаги — из снимка тикета (`v2/snapshot.py`, #347); при допуске — строка «выход за «Владения»»
-карточки по путям снимка (`beyond`, не блокирует).
+карточки по путям снимка (`beyond`, условие 6, не блокирует).
 
 Удалить: выключить переключатель, затем этот файл; `gates()`, параметр `gate` у `orch.ci`, ветку
 `v2` в `give_back`, `GO` в `report` оркестратора; вопрос `MERGE` в `v2/send.py`;
@@ -70,7 +80,9 @@ MAINLINE = ".github/workflows/canon-mainline.yml"
 MAINLINE_RUN = "canon-mainline"  # имя workflow — как `WORKFLOW` в `v2/mainline.py`
 
 CI, REVIEW, FINDINGS, FRESH, WEAKENING = "ci", "review", "findings", "fresh", "weakening"
-EVIDENCE = "evidence"
+EVIDENCE, CLAIMS, LIMITS = "evidence", "claims", "limits"
+# Белый список общих документов условия 6: правка их — не выход за «Владения».
+SHARED = ("GLOSSARY.md", "docs/adr/")
 # Условия допуска по номеру спеки: (номер, имя, что проверяет).
 CONDITIONS = (
     (1, CI, "доверенный CI зелёный на этой версии, тесты ревьюера в его отчёте пройдены"),
@@ -78,7 +90,9 @@ CONDITIONS = (
     (3, FINDINGS, "подтверждённые находки закрыты, тесты ревьюера и конфиг тестов не тронуты"),
     (4, EVIDENCE, "доказательство /verify по каждому критерию, примеру и находке со сценарием"),
     (5, FRESH, "ветка свежая — в ней последняя основа"),
+    (6, CLAIMS, "чужих «Владений» нет, пути-ограничители — с разрешения владельца"),
     (7, WEAKENING, "нет ослабления защиты, которого тикет не просит"),
+    (8, LIMITS, "пределы денег и времени тикета и ролей не превышены"),
 )
 CODES = {
     "untested": "тесты-ревьюера-не-в-ci",  # 1
@@ -87,7 +101,10 @@ CODES = {
     "config_changed": "конфиг-тестов-изменён",  # 3
     "unproved": "нет-доказательства",  # 4
     "stale": "ветка-отстала",  # 5
+    "overlap": "чужие-владения",  # 6
+    "restricted": "путь-ограничитель",  # 6
     "weakening": "ослабление-защиты",  # 7
+    "over": "предел-превышен",  # 8
 }
 RESTORE_GO = "новая сессия вернёт файлы как в коммите «только тест», затем допуск заново"
 GO = {
@@ -104,8 +121,13 @@ GO = {
     "полный CI и ручной прогон `canon-mainline`)",
     "stale": "догон основы на сервере (конфликт — свежая сессия с заданием догона), затем "
     "полный CI и допуск заново",
+    "overlap": "снова допуск — отказ повторится, пока тот тикет идёт и файлы его «Владений» в "
+    "диффе",
+    "restricted": "вы разрешаете правку путей-ограничителей этого отказа, затем остальные условия "
+    "допуска; одобрение PR по CODEOWNERS на GitHub — по-прежнему ваше",
     "weakening": "снова допуск — отказ повторится, пока ослабление не решено: `agent:go` его не "
     "снимает; убрать — `agent:retry` или правкой отдельным тикетом",
+    "over": "вы принимаете превышение пределов этого отказа, затем остальные условия допуска",
 }
 # Раздел «Рекомендация и риск» отчёта об отказе (#347): что ставить и чем это грозит.
 RESTORE_ADVICE = (
@@ -128,9 +150,19 @@ ADVICE = {
     "`agent:retry`. **Риск:** слить без доказательства нельзя — критерий был бы принят на слово.",
     "stale": "`agent:go`: оркестратор догонит основу на сервере. **Риск:** конфликт с новой "
     "основой — задание свежей сессии; не сведёт — снова остановка.",
+    "overlap": "дождитесь слияния того тикета и поставьте `agent:go`, или `agent:retry`, если "
+    "правка его файлов этому тикету не нужна. **Риск:** два тикета правят один файл — второй "
+    "слитый затрёт или сломает первый.",
+    "restricted": "посмотрите правку путей-ограничителей в PR. Тикет её просит — `agent:go`; не "
+    "просит — `agent:retry`. **Риск `agent:go`:** пути-ограничители держат агента в рамках — "
+    "правка без нужды может снять защиту.",
     "weakening": "прочитайте ослабление в карточке PR. Тикет его не просит — `agent:retry` или "
     "отдельный тикет на ослабление. **Риск:** слияние сняло бы защиту, которую вы не "
     "отключали.",
+    "over": "посмотрите, какой запуск вышел за предел и что он сделал (журнал и карточка PR). "
+    "Работа сделана и проверена — `agent:go`; тикет обошёлся дороже, чем стоит, — `agent:retry` "
+    "или разрезать тикет. **Риск `agent:go`:** превышение принимается без пересчёта; пределы — "
+    "90-й процентиль, частые превышения — повод пересмотреть числа.",
 }
 RESTORE = ("test_changed", "config_changed")
 RESTORE_TASK = """Оркестратор: допуск тикета #{n} отказал — код `{code}`: {why}. Тесты ревьюера и
@@ -180,11 +212,14 @@ def text_flags(text: str) -> list[str]:
 
 class Gates:
     """Допуск пути v2 для оркестратора `orch`; `tools` — его помощники: `core`, `card`, `ci`,
-    `rtest`, `spot`, `start`, `send`, `say`, `stamp`, `seconds_since`, `CI_WAIT`."""
+    `rtest`, `spot`, `start`, `send`, `intake`, `say`, `stamp`, `seconds_since`, `CI_WAIT`."""
 
     def __init__(self, orch, tools):
         self.orch, self.t = orch, tools
         self.fx = orch.fixes()
+        self.restricted_files: list[str] = []  # файлы последнего отказа `restricted`
+        self.over_keys: list = []  # превышения последнего отказа `over` (#356)
+        self.diffs: dict[str, list[str]] = {}  # дифф PR против основы по head — раз за допуск
 
     # --- отказ ---
 
@@ -199,6 +234,10 @@ class Gates:
         said = f"код `{CODES[code]}`: {why}"
         reason = f"допуск: отказ — {said}"
         t["refused"] = {"code": code, "head": head, "reason": reason}
+        if code == "restricted":  # `agent:go` разрешает ровно эти файлы
+            t["refused"]["files"] = list(self.restricted_files or [])
+        if code == "over":  # `agent:go` принимает ровно эти превышения
+            t["refused"]["keys"] = list(self.over_keys or [])
         t.pop("admitted", None)
         try:
             o.sender().mark(n, t, self.t.card.ATTENTION, f"Отказ допуска — {said}", key="gates")
@@ -208,7 +247,7 @@ class Gates:
             raise
         return False
 
-    # --- условия 2, 3, 4, 5, 7: до перевода из черновика ---
+    # --- условия 2–8: до перевода из черновика ---
 
     def admit(self, n: int, t: dict, st, pr: dict) -> bool:
         """Условия до перевода PR из черновика. True — пройдены (на этом head — уже раньше, PR
@@ -228,10 +267,20 @@ class Gates:
             evidence.keep(n, t, st, head)
             evidence.mark(n, t, head)
             self.orch.sender().body(n, t, st, head)
+        if refused.get("head") == head and refused.get("code") == "restricted":
+            files = sorted({*(t.get("restricted_ok") or []), *(refused.get("files") or [])})
+            t["restricted_ok"] = files
+            shown = ", ".join(f"`{f}`" for f in refused.get("files") or [])
+            line = f"Владелец разрешил правку путей-ограничителей: {shown}"
+            self.orch.sender().mark(n, t, self.t.card.DONE, line, key="restricted", publish=False)
         if refused.get("head") == head and refused.get("code") == "unreviewed":
             t["accepted"] = head
             line = f"Владелец принял версию `{head[:7]}` без ревью изменений после ревью ошибок"
             self.orch.sender().mark(n, t, self.t.card.DONE, line, key="accepted", publish=False)
+        if refused.get("head") == head and refused.get("code") == "over":
+            self.t.limits.accept(t, refused.get("keys") or [])
+            line = f"Владелец принял превышение пределов: {refused['reason']}"
+            self.orch.sender().mark(n, t, self.t.card.DONE, line, key="over", publish=False)
         t.pop("refused", None)
         for code, why in self.failed(n, t, st, head):
             return self.refuse(n, t, st, head, code, why)
@@ -239,11 +288,9 @@ class Gates:
         send = self.orch.sender()
         send.mark(n, t, self.t.card.ATTENTION, None, key="gates", publish=False)
         send.mark(n, t, self.t.card.BEYOND, self.beyond(t, head), key="beyond", publish=False)
-        line = (
-            f"Допуск на `{head[:7]}`: условия 2, 3, 4, 5, 7 выполнены — PR из черновика, полный CI"
-        )
+        line = f"Допуск на `{head[:7]}`: условия 2–8 выполнены — PR из черновика, полный CI"
         send.mark(n, t, self.t.card.DONE, line, key=f"admit-{head}")
-        self.t.say(f"#{n}: допуск на {head[:7]} — условия 2, 3, 4, 5, 7 выполнены")
+        self.t.say(f"#{n}: допуск на {head[:7]} — условия 2–8 выполнены")
         return True
 
     def beyond(self, t: dict, head: str) -> str | None:
@@ -252,10 +299,11 @@ class Gates:
         paths = (t.get("snapshot") or {}).get("paths")
         if paths is None:
             return "в снимке тикета нет «Владений» (или снимка нет) — сверять не с чем"
-        res = self.orch.git("diff", "--name-only", "-z", "--no-renames", f"origin/main...{head}")
-        if res.returncode != 0:
+        try:
+            found = self.diff(head)
+        except self.t.core.Failure:
             return f"дифф `origin/main...{head[:7]}` не прочитан — выход за «Владения» не проверен"
-        files = sorted(f for f in res.stdout.split("\0") if f and not owned(f, paths))
+        files = [f for f in found if not owned(f, paths) and not owned(f, SHARED)]
         if not files:
             return None
         shown = ", ".join(f"`{f}`" for f in files[:20]) + (" и др." if len(files) > 20 else "")
@@ -275,8 +323,15 @@ class Gates:
         if why := self.stale(head):
             t["behind"] = True  # `agent:go` — догон на сервере (`catch_up`)
             yield "stale", why
+        files = self.diff(head)
+        if why := self.overlap(n, files):
+            yield "overlap", why
+        if why := self.restricted(n, t, files):
+            yield "restricted", why
         if why := self.weakened(n, st):
             yield "weakening", why
+        if why := self.over(n, t, st):
+            yield "over", why
 
     def unreviewed(self, n: int, t: dict, head: str) -> str | None:
         """Условие 2: ревью видело эту версию или её предка, а изменения после него не требуют
@@ -344,6 +399,67 @@ class Gates:
             return None
         base = o.git("rev-parse", "origin/main").stdout.strip()
         return f"в ветке нет последней основы `{base[:7]}`: основа ушла после догона"
+
+    def diff(self, head: str) -> list[str]:
+        """Файлы диффа PR против основы — раз на head за допуск. Не прочитан — сбой такта
+        (`Failure`, повтор на следующем), а не отказ: без диффа условие 6 не проверить."""
+        if head in self.diffs:
+            return self.diffs[head]
+        res = self.orch.git("diff", "--name-only", "-z", "--no-renames", f"origin/main...{head}")
+        if res.returncode != 0:
+            why = (res.stderr or "").strip()[-300:]
+            raise self.t.core.Failure(f"дифф `origin/main...{head[:7]}` не прочитан: {why}")
+        self.diffs[head] = sorted(f for f in res.stdout.split("\0") if f)
+        return self.diffs[head]
+
+    def overlap(self, n: int, files: list[str]) -> str | None:
+        """Условие 6: файл диффа — во «Владениях» идущего тикета (на месте или ждёт ответа
+        владельца; его снимок, а нет — бриф). Тикет без «Владений» идёт один — не сверяется."""
+        o = self.orch
+        for key, other in o.data["tickets"].items():
+            m = int(key)
+            if m == n or not o.holds(m):
+                continue
+            paths = (other.get("snapshot") or {}).get("paths")
+            if paths is None:
+                paths = (o.claims_of(m) or {}).get("paths")
+            if not paths:
+                continue
+            if hit := [f for f in files if owned(f, paths)]:
+                shown = ", ".join(f"`{f}`" for f in hit[:10]) + (" и др." if len(hit) > 10 else "")
+                return f"файлы {shown} — во «Владениях» идущего тикета #{m}"
+        return None
+
+    def restricted(self, n: int, t: dict, files: list[str]) -> str | None:
+        """Условие 6: путь-ограничитель (`CODEOWNERS` основы) — только с разрешения владельца:
+        `agent:as-is` на замечании проверки постановки о пути «Владений» или `agent:go` после
+        этого отказа (`restricted_ok`)."""
+        self.restricted_files = []
+        intake = self.t.intake
+        globs = self.orch.setup_check().restrictors()
+        allowed = list((t.get("intake") or {}).get("allowed") or [])
+        ok = set(t.get("restricted_ok") or [])
+        hit = [
+            f
+            for f in files
+            if intake.restricted(f, globs) and f not in ok and not owned(f, allowed)
+        ]
+        if not hit:
+            return None
+        self.restricted_files = hit
+        shown = ", ".join(f"`{f}`" for f in hit[:10]) + (" и др." if len(hit) > 10 else "")
+        return f"PR правит пути-ограничители {shown} без вашего разрешения"
+
+    def over(self, n: int, t: dict, st) -> str | None:
+        """Условие 8 (#356): расход попытки (как в пределе тикета), запуски ролей попытки по
+        журналу и `/verify` попытки по расходу маршрута — в пределах; превышения, принятые
+        владельцем, — не в счёт."""
+        o, tl = self.orch, self.t
+        events = tl.journal.read(o.dir, n, t.get("queued"))
+        spent = o.costs(t, st)["limit"]
+        route = tl.route_costs(st)  # `/verify` — по расходу маршрута: в журнал он не пишется
+        why, self.over_keys = tl.limits.over(t, events, spent, tl.TICKET_LIMIT, route)
+        return why or None
 
     def weakened(self, n: int, st) -> str | None:
         """Условие 7: ослабление защиты из ревью ошибок без решения разбора («ослабление — …»)

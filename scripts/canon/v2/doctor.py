@@ -102,6 +102,22 @@ def release(orch, n: int, t: dict) -> None:
         orch.clear_pause(PAUSE)
 
 
+def hold(orch, n: int, t: dict, why: str) -> None:
+    """Пауза очереди после остановки «среда» тикета `n` (отчёт уже в тикете). Пауза — общая для
+    тикетов, остановленных «средой»: снимет любой из них (`release`). Причина — по каждому
+    тикету: прежние остановки не теряются. Зовёт и проверка постановки (`v2/intake.py`, #355)."""
+    t[STOPPED] = True
+    old = orch.data["pauses"].get(PAUSE) or {}
+    whys = {k: v for k, v in (old.get("whys") or {}).items() if k != str(n)}
+    whys[str(n)] = why
+    listed = "; ".join(f"#{k}: {v}" for k, v in whys.items())
+    orch.set_pause(
+        PAUSE,
+        f"среда — {listed} — снимет `agent:go` или `agent:retry` на любом из этих тикетов",
+    )
+    orch.data["pauses"][PAUSE]["whys"] = whys
+
+
 class Environment:
     """«Доктор» и проверка в песочнице для оркестратора `orch`; `tools` — его помощники: `core`,
     `say`, `tail`, `now`, `local_now`, `snapshot_time`, `group_alive`, `Failure`, `TOKENS`,
@@ -301,18 +317,8 @@ class Environment:
         except BaseException:
             t["phase"] = phase  # следующий такт повторит разбор
             raise
-        # Пауза — общая для тикетов, остановленных «средой»: снимет любой из них (`release`).
-        # Причина — по каждому тикету: прежние остановки не теряются.
-        t[STOPPED] = True
-        old = orch.data["pauses"].get(PAUSE) or {}
-        whys = {k: v for k, v in (old.get("whys") or {}).items() if k != str(n)}
-        whys[str(n)] = why
-        listed = "; ".join(f"#{k}: {v}" for k, v in whys.items())
-        orch.set_pause(
-            PAUSE,
-            f"среда — {listed} — снимет `agent:go` или `agent:retry` на любом из этих тикетов",
-        )
-        orch.data["pauses"][PAUSE]["whys"] = whys
+        t["environment_stops"] = t.get("environment_stops", 0) + 1  # метрики тикета (#356)
+        hold(orch, n, t, why)
 
     # --- проверка в песочнице ---
 

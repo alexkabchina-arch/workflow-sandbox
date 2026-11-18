@@ -7,10 +7,12 @@
 Из корня проекта, на закоммиченной ветке. Встроенный `/verify` из сессии не вызвать — только
 дочерним процессом, поэтому скрипт запускает его обычным вызовом, не в фоне:
 
-    claude -p --model claude-opus-5-5 --max-budget-usd <предел> --output-format json \\
-        --json-schema <схема итога> --disallowedTools=Agent,Workflow,Monitor \\
-        --permission-mode auto \\
+    claude -p --model claude-opus-5-5 --effort medium --max-budget-usd <предел> \\
+        --output-format json --json-schema <схема итога> \\
+        --disallowedTools=Agent,Workflow,Monitor --permission-mode auto \\
         "/verify Проверь изменение ветки: дифф git diff <база>...HEAD. …"
+
+Модель и усилие — роль `verify` таблицы `v2/roles.py`, одной для `/start` и v2 (#469).
 
 Диапазон диффа — всегда явный: без него скилл берёт `@{u}..` или `origin/HEAD...` и на ветке без
 upstream проверит не тот код. Критерии тикета — из `--criteria-file` как есть: в задание они
@@ -411,7 +413,6 @@ def run_v2(args, criteria: str, listed: list[dict], root: Path) -> tuple[dict, s
     """`/verify` пути v2 по пунктам `listed`: роль `verify` из таблицы, инструмент и карта из
     основы во временном каталоге, «доктор», задание по пунктам и итог программой."""
     claude_run.set_aside(args.report)  # прошлый итог не остаётся, если до `claude` не дойдёт
-    os.environ[claude_run.roles.V2_ENV] = "1"  # модель и усилие — роль `verify` (`v2/roles.py`)
     config = tool_config(args.base, args.report)
     with tempfile.TemporaryDirectory(prefix="canon-verify-") as tmp:
         into = Path(tmp)
